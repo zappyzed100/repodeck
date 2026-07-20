@@ -318,3 +318,68 @@ fn switch_between_two_real_worksets_minimizes_the_non_current_one() {
     let state_b = placement::get_show_state(hwnd_b).expect("get_show_state(b) should succeed");
     assert_eq!(state_b, SavedShowState::Normal);
 }
+
+/// PLAN.md §13 Phase 7 completion criterion "ホットキー衝突を検出": occupies a
+/// combo on this thread first, then confirms `HotkeyThread` (registering the
+/// same combo on its own dedicated thread) observes
+/// `RegisterFailed(AlreadyRegistered)` — `RegisterHotKey` conflicts are
+/// system-wide regardless of which thread/process registered first, so this
+/// needs no Slint window at all, unlike the other tests in this file.
+#[test]
+#[ignore = "registers a real global hotkey; run manually, not in CI"]
+fn hotkey_thread_reports_already_registered_when_the_combo_is_taken() {
+    use std::sync::{Arc, Mutex};
+
+    use repodeck::domain::config::{HotkeyConfig, HotkeyModifier};
+    use repodeck::hotkey::win32_hotkey::{HotkeyEvent, HotkeyRegisterError, HotkeyThread};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
+    };
+
+    const OCCUPYING_HOTKEY_ID: i32 = 999;
+    // An obscure combo (all four modifiers + F24) rather than RepoDeck's own
+    // default Ctrl+Alt+R: a real running RepoDeck instance (or some other
+    // unrelated app) may already hold Ctrl+Alt+R on this machine, which would
+    // make this test's own "occupy the combo" setup step fail before it gets
+    // to the thing being tested.
+    const TEST_VK: u32 = 0x87; // VK_F24
+    let config = HotkeyConfig {
+        modifiers: vec![
+            HotkeyModifier::Control,
+            HotkeyModifier::Alt,
+            HotkeyModifier::Shift,
+            HotkeyModifier::Win,
+        ],
+        virtual_key: TEST_VK,
+    };
+
+    // Occupy the combo on this (test-runner) thread first.
+    let occupying_mods = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN | MOD_NOREPEAT;
+    unsafe { RegisterHotKey(None, OCCUPYING_HOTKEY_ID, occupying_mods, TEST_VK) }
+        .expect("failed to occupy the test hotkey combo");
+
+    let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_for_thread = events.clone();
+    let _hotkey_thread = HotkeyThread::spawn(config, move |event| {
+        let label = match event {
+            HotkeyEvent::Pressed => "pressed",
+            HotkeyEvent::Registered => "registered",
+            HotkeyEvent::RegisterFailed(HotkeyRegisterError::AlreadyRegistered) => {
+                "already_registered"
+            }
+            HotkeyEvent::RegisterFailed(HotkeyRegisterError::Other(_)) => "other_error",
+        };
+        events_for_thread.lock().unwrap().push(label);
+    });
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // SAFETY: `OCCUPYING_HOTKEY_ID` was registered on this same thread above.
+    let _ = unsafe { UnregisterHotKey(None, OCCUPYING_HOTKEY_ID) };
+
+    let events = events.lock().unwrap();
+    assert!(
+        events.contains(&"already_registered"),
+        "expected an already_registered event, got {events:?}"
+    );
+}

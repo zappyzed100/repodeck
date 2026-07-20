@@ -13,20 +13,27 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_YESNO, MessageBoxW};
 use windows::core::HSTRING;
 
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
+use crate::application::popup_placement;
+use crate::application::quick_switcher_service;
+use crate::application::switch_coordinator::{SwitchCoordinator, SwitchRequest};
 use crate::application::workset_service;
 use crate::diagnostics::logging;
-use crate::domain::config::AppConfig;
+use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier};
 use crate::domain::monitor::AutoSplit;
 use crate::domain::placement::SavedShowState;
-use crate::domain::workset::ManagedWindow;
-use crate::persistence::{clock, config_store};
+use crate::domain::workset::{ManagedWindow, ParkingPolicy};
+use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
+use crate::persistence::{clock, config_store, runtime_store};
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
 use crate::windowing::monitor::{self, MonitorInfo};
 use crate::windowing::placement as win_placement;
+use crate::windowing::popup_window;
+use crate::windowing::window_ops_impl::Win32WindowOps;
 
 slint::include_modules!();
 
@@ -1328,6 +1335,429 @@ fn wire_workset_manager(
     });
 }
 
+/// Rebuilds the Quick Switcher's row list from `config.worksets` (PLAN.md
+/// §3.3 "表示内容"), mirroring `refresh_workset_summaries`'s shape. No
+/// agent-status fields are populated — that data doesn't exist until Phase 8.
+fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    let current_workset_id = runtime_store::load(data_dir).current_workset_id;
+    let filter_text = switcher.get_filter_text().to_string();
+    let ordered = quick_switcher_service::sorted_and_filtered(
+        &config.worksets,
+        config.settings.sort_mode,
+        &filter_text,
+    );
+
+    let rows: Vec<QuickSwitcherRow> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, workset)| QuickSwitcherRow {
+            workset_id: workset.id.to_string().into(),
+            name: workset.name.clone().into(),
+            repository_name: workset
+                .repository_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| workset.repository_path.display().to_string())
+                .into(),
+            color: hex_to_color(&workset.color),
+            is_current: Some(workset.id) == current_workset_id,
+            is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
+            number_hint: if i < 9 {
+                i32::try_from(i + 1).unwrap_or(0)
+            } else {
+                0
+            },
+        })
+        .collect();
+
+    let row_count = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+    switcher.set_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    if row_count == 0 {
+        switcher.set_selected_index(0);
+    } else if switcher.get_selected_index() >= row_count {
+        switcher.set_selected_index(row_count - 1);
+    }
+}
+
+/// Positions and shows the Quick Switcher at the configured popup location
+/// (PLAN.md §3.3), refreshing its rows first and then forcing real OS input
+/// focus onto it (needed for a `WS_EX_TOOLWINDOW` popup, which doesn't
+/// reliably grab keyboard focus on `.show()` alone).
+fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    refresh_quick_switcher_rows(switcher, config, data_dir);
+
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let cursor = monitor::cursor_position().unwrap_or((0, 0));
+    let size = switcher.window().size();
+    let popup_size = (
+        i32::try_from(size.width).unwrap_or(480),
+        i32::try_from(size.height).unwrap_or(560),
+    );
+    let (x, y) = popup_placement::resolve_popup_position(
+        config.settings.popup_location,
+        cursor,
+        &live_monitors,
+        &config.main_monitor_ids,
+        popup_size,
+    );
+    switcher
+        .window()
+        .set_position(slint::WindowPosition::Physical(
+            slint::PhysicalPosition::new(x, y),
+        ));
+    let _ = switcher.show();
+    // Re-applied after every `.show()`, not just once at window creation:
+    // empirically, winit's own show-window path resets `WS_EX_APPWINDOW`
+    // back on regardless of what was set beforehand, so the exclusion only
+    // sticks if it's the *last* thing touching the style bits.
+    popup_window::exclude_from_taskbar_and_alt_tab(switcher.window());
+    popup_window::force_foreground(switcher.window());
+}
+
+/// PLAN.md §3.3/§3.4: the hotkey and tray-icon left-click both *toggle*
+/// visibility, while the tray menu's own "クイックスイッチャーを開く" always
+/// shows it fresh — see `TrayIcon`'s doc comment on `clicked` in
+/// `ui/app-window.slint`.
+fn toggle_quick_switcher(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    if switcher.window().is_visible() {
+        let _ = switcher.hide();
+    } else {
+        show_quick_switcher_at_cursor(switcher, config, data_dir);
+    }
+}
+
+fn wire_quick_switcher(
+    switcher: &QuickSwitcher,
+    data_dir: PathBuf,
+    config: Rc<RefCell<AppConfig>>,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
+    settings_window: slint::Weak<AppWindow>,
+) {
+    refresh_quick_switcher_rows(switcher, &config.borrow(), &data_dir);
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_key_text_input(move |text| {
+        let Some(switcher) = s.upgrade() else { return };
+        let mut filter = switcher.get_filter_text().to_string();
+        filter.push_str(&text);
+        switcher.set_filter_text(filter.into());
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_filter_backspace_requested(move || {
+        let Some(switcher) = s.upgrade() else { return };
+        let mut filter = switcher.get_filter_text().to_string();
+        filter.pop();
+        switcher.set_filter_text(filter.into());
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    let coord = coordinator.clone();
+    switcher.on_switch_requested(move |workset_id| {
+        let Some(switcher) = s.upgrade() else { return };
+        let Ok(target_workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+            return;
+        };
+
+        let close_after_switch = {
+            let config = c.borrow();
+            let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+
+            match coord.switch_to(SwitchRequest {
+                worksets: &config.worksets,
+                fixed_slots: &config.fixed_slots,
+                saved_monitors: &config.monitors,
+                main_monitor_ids: &config.main_monitor_ids,
+                live_monitors: &live_monitors,
+                live_windows: &live_windows,
+                target_workset_id,
+            }) {
+                Ok(_) => {
+                    switcher.set_status_text("".into());
+                    switcher.set_status_is_warning(false);
+                    config.settings.close_after_switch
+                }
+                Err(err) => {
+                    switcher.set_status_text(format!("切替に失敗しました: {err}").into());
+                    switcher.set_status_is_warning(true);
+                    false
+                }
+            }
+        };
+
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+        if close_after_switch {
+            let _ = switcher.hide();
+        }
+    });
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let coord = coordinator.clone();
+    switcher.on_recover_requested(move || {
+        let Some(switcher) = s.upgrade() else { return };
+        let config = c.borrow();
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        match coord.recover_all_windows(
+            &config.worksets,
+            &live_monitors,
+            &config.main_monitor_ids,
+            &live_windows,
+        ) {
+            Ok(report) => {
+                switcher.set_status_text(
+                    format!(
+                        "{}件のウィンドウをメイン画面へ回収しました。",
+                        report.recovered.len()
+                    )
+                    .into(),
+                );
+                switcher.set_status_is_warning(false);
+            }
+            Err(err) => {
+                switcher.set_status_text(format!("回収に失敗しました: {err}").into());
+                switcher.set_status_is_warning(true);
+            }
+        }
+    });
+
+    let s = switcher.as_weak();
+    let settings_for_open = settings_window;
+    switcher.on_settings_requested(move || {
+        if let Some(switcher) = s.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(settings) = settings_for_open.upgrade() {
+            let _ = settings.show();
+        }
+    });
+
+    let s = switcher.as_weak();
+    switcher.on_close_requested(move || {
+        if let Some(switcher) = s.upgrade() {
+            let _ = switcher.hide();
+        }
+    });
+}
+
+/// Populates the hotkey rebind form and wires its save handler, following
+/// the same mutate → `validate()` → `config_store::save()` →
+/// rollback-on-failure template used by every other config-saving handler in
+/// this file (PLAN.md §13 Phase 7 checklist item 4, "ホットキー設定UI").
+fn wire_settings(
+    window: &AppWindow,
+    data_dir: PathBuf,
+    config: Rc<RefCell<AppConfig>>,
+    hotkey_thread: Rc<HotkeyThread>,
+) {
+    let key_labels: Vec<String> = ('A'..='Z')
+        .map(|c| c.to_string())
+        .chain((0..=9).map(|n| n.to_string()))
+        .chain((1..=12).map(|n| format!("F{n}")))
+        .collect();
+    let key_choices: Vec<slint::SharedString> =
+        key_labels.iter().cloned().map(Into::into).collect();
+    window.set_hotkey_key_choices(std::rc::Rc::new(slint::VecModel::from(key_choices)).into());
+
+    {
+        let cfg = config.borrow();
+        let hotkey = &cfg.settings.quick_switcher_hotkey;
+        window.set_hotkey_ctrl(hotkey.modifiers.contains(&HotkeyModifier::Control));
+        window.set_hotkey_alt(hotkey.modifiers.contains(&HotkeyModifier::Alt));
+        window.set_hotkey_shift(hotkey.modifiers.contains(&HotkeyModifier::Shift));
+        window.set_hotkey_win(hotkey.modifiers.contains(&HotkeyModifier::Win));
+        if let Some(label) = win32_hotkey::virtual_key_to_label(hotkey.virtual_key) {
+            if let Some(index) = key_labels.iter().position(|l| l == &label) {
+                window.set_hotkey_key_index(i32::try_from(index).unwrap_or(0));
+            }
+            window.set_hotkey_key_choice(label.into());
+        }
+    }
+
+    let w = window.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    let ht = hotkey_thread;
+    window.on_hotkey_rebind_requested(move || {
+        let Some(window) = w.upgrade() else { return };
+
+        let mut modifiers = Vec::new();
+        if window.get_hotkey_ctrl() {
+            modifiers.push(HotkeyModifier::Control);
+        }
+        if window.get_hotkey_alt() {
+            modifiers.push(HotkeyModifier::Alt);
+        }
+        if window.get_hotkey_shift() {
+            modifiers.push(HotkeyModifier::Shift);
+        }
+        if window.get_hotkey_win() {
+            modifiers.push(HotkeyModifier::Win);
+        }
+
+        if modifiers.is_empty() {
+            window.set_hotkey_status_text("修飾キーを1つ以上選択してください。".into());
+            window.set_hotkey_status_is_warning(true);
+            return;
+        }
+        let Some(virtual_key) =
+            win32_hotkey::key_label_to_virtual_key(&window.get_hotkey_key_choice())
+        else {
+            window.set_hotkey_status_text("キーを選択してください。".into());
+            window.set_hotkey_status_is_warning(true);
+            return;
+        };
+
+        let candidate = HotkeyConfig {
+            modifiers,
+            virtual_key,
+        };
+        let mut cfg = c.borrow_mut();
+        let previous = cfg.settings.quick_switcher_hotkey.clone();
+        if previous == candidate {
+            drop(cfg);
+            window.set_hotkey_status_text("変更はありません。".into());
+            window.set_hotkey_status_is_warning(false);
+            return;
+        }
+        cfg.settings.quick_switcher_hotkey = candidate.clone();
+
+        let errors = cfg.validate();
+        if !errors.is_empty() {
+            cfg.settings.quick_switcher_hotkey = previous;
+            let message = errors
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            window.set_hotkey_status_text(format!("保存できません: {message}").into());
+            window.set_hotkey_status_is_warning(true);
+            return;
+        }
+
+        match config_store::save(&d, &cfg) {
+            Ok(()) => {
+                UI_CONTEXT.with(|cell| {
+                    if let Some(ctx) = &*cell.borrow() {
+                        *ctx.pending_hotkey_rollback.borrow_mut() = Some(previous);
+                    }
+                });
+                window.set_hotkey_status_text("保存しました。反映を確認しています…".into());
+                window.set_hotkey_status_is_warning(false);
+                ht.rebind(candidate);
+            }
+            Err(err) => {
+                cfg.settings.quick_switcher_hotkey = previous;
+                window.set_hotkey_status_text(format!("設定の保存に失敗しました: {err}").into());
+                window.set_hotkey_status_is_warning(true);
+            }
+        }
+    });
+}
+
+/// Native `MessageBoxW` confirmation for the tray's "全管理ウィンドウを回収" —
+/// a single click would otherwise move every window across every workset at
+/// once with no chance to back out.
+fn confirm_recover_all() -> bool {
+    let text = HSTRING::from("登録されている全ウィンドウをメイン画面へ回収しますか?");
+    let caption = HSTRING::from("RepoDeck");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    let result = unsafe { MessageBoxW(None, &text, &caption, MB_YESNO | MB_ICONWARNING) };
+    result == IDYES
+}
+
+fn hotkey_register_error_message(err: HotkeyRegisterError) -> String {
+    match err {
+        HotkeyRegisterError::AlreadyRegistered => {
+            "このホットキーは他のアプリと競合しています。元のホットキーに戻しました。".to_string()
+        }
+        HotkeyRegisterError::Other(e) => format!("ホットキーの登録に失敗しました: {e}"),
+    }
+}
+
+/// Send-safe projection of `hotkey::win32_hotkey::HotkeyEvent`, built on the
+/// hotkey thread and handled on the UI thread via
+/// `slint::invoke_from_event_loop`. Its `Rc`-based state (`AppConfig`, the
+/// pending hotkey rollback) can't cross threads directly — `Rc` isn't
+/// `Send` — so it lives in `UI_CONTEXT`, a UI-thread-local populated once in
+/// `run()` and only ever read back from a closure Slint guarantees runs on
+/// that same thread.
+enum HotkeyUiEvent {
+    Pressed,
+    Registered,
+    RegisterFailed(String),
+}
+
+struct CrossThreadUiContext {
+    config: Rc<RefCell<AppConfig>>,
+    data_dir: PathBuf,
+    pending_hotkey_rollback: RefCell<Option<HotkeyConfig>>,
+    settings_window: slint::Weak<AppWindow>,
+    quick_switcher: slint::Weak<QuickSwitcher>,
+}
+
+thread_local! {
+    static UI_CONTEXT: RefCell<Option<Rc<CrossThreadUiContext>>> = const { RefCell::new(None) };
+}
+
+fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    match event {
+        HotkeyUiEvent::Pressed => {
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                toggle_quick_switcher(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+            }
+        }
+        HotkeyUiEvent::Registered => {
+            ctx.pending_hotkey_rollback.borrow_mut().take();
+            if let Some(settings) = ctx.settings_window.upgrade() {
+                settings.set_hotkey_status_text("ホットキーを保存しました。".into());
+                settings.set_hotkey_status_is_warning(false);
+            }
+        }
+        HotkeyUiEvent::RegisterFailed(message) => {
+            if let Some(previous) = ctx.pending_hotkey_rollback.borrow_mut().take() {
+                let mut cfg = ctx.config.borrow_mut();
+                cfg.settings.quick_switcher_hotkey = previous;
+                let _ = config_store::save(&ctx.data_dir, &cfg);
+            }
+            if let Some(settings) = ctx.settings_window.upgrade() {
+                settings.set_hotkey_status_text(message.into());
+                settings.set_hotkey_status_is_warning(true);
+            }
+        }
+    }
+}
+
+/// Shows the Quick Switcher in response to a second `repodeck.exe` launch
+/// (PLAN.md §3.2), via the same `UI_CONTEXT` thread-local `handle_hotkey_ui_event`
+/// uses — the listener thread that calls this (via `invoke_from_event_loop`)
+/// is, like the hotkey thread, not the UI thread.
+fn show_quick_switcher_from_context() {
+    UI_CONTEXT.with(|cell| {
+        if let Some(ctx) = &*cell.borrow()
+            && let Some(switcher) = ctx.quick_switcher.upgrade()
+        {
+            show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+        }
+    });
+}
+
 pub fn run() -> Result<()> {
     set_app_user_model_id();
 
@@ -1357,7 +1787,10 @@ pub fn run() -> Result<()> {
     let layout_studio_state = Rc::new(RefCell::new(LayoutStudioState::new()));
     let workset_manager_state = Rc::new(RefCell::new(WorksetManagerState::new()));
 
-    let window = AppWindow::new().context("failed to create the RepoDeck main window")?;
+    // `window` is the repurposed settings surface (PLAN.md §13 Phase 7
+    // checklist item 4) — see the doc comment on `AppWindow` in
+    // `ui/app-window.slint` for why.
+    let window = AppWindow::new().context("failed to create the RepoDeck settings window")?;
     apply_glass_backdrop(window.window());
     let tray = TrayIcon::new().context("failed to create the RepoDeck tray icon")?;
     let layout_studio = LayoutStudio::new().context("failed to create the Layout Studio window")?;
@@ -1365,6 +1798,12 @@ pub fn run() -> Result<()> {
     let workset_manager =
         WorksetManager::new().context("failed to create the Workset Manager window")?;
     apply_glass_backdrop(workset_manager.window());
+    let quick_switcher =
+        QuickSwitcher::new().context("failed to create the Quick Switcher window")?;
+    apply_glass_backdrop(quick_switcher.window());
+    // Must run before the window's first `.show()` — Explorer's taskbar
+    // often needs a hide/show cycle to notice a style change otherwise.
+    popup_window::exclude_from_taskbar_and_alt_tab(quick_switcher.window());
 
     wire_layout_studio(
         &layout_studio,
@@ -1372,17 +1811,86 @@ pub fn run() -> Result<()> {
         config.clone(),
         layout_studio_state,
     );
-    wire_workset_manager(&workset_manager, data_dir, config, workset_manager_state);
+    wire_workset_manager(
+        &workset_manager,
+        data_dir.clone(),
+        config.clone(),
+        workset_manager_state,
+    );
 
-    // Left-click on the tray icon or "RepoDeckを開く" in its menu (both wired to
-    // `open-requested` in app-window.slint) bring the main window back. Closing
-    // the window (the X button) only hides it by default
-    // (`CloseRequestResponse::HideWindow`); the tray icon keeps the event loop
-    // alive, so the process stays resident until "RepoDeckを終了" is chosen.
-    let window_for_open = window.as_weak();
-    tray.on_open_requested(move || {
-        if let Some(window) = window_for_open.upgrade() {
-            let _ = window.show();
+    let coordinator = Rc::new(SwitchCoordinator::new(Win32WindowOps, data_dir.clone()));
+    wire_quick_switcher(
+        &quick_switcher,
+        data_dir.clone(),
+        config.clone(),
+        coordinator.clone(),
+        window.as_weak(),
+    );
+
+    // Populates the cross-thread context the hotkey thread and the
+    // second-instance listener thread reach `config`/`quick_switcher`
+    // through: neither can capture an `Rc` directly (it isn't `Send`), so
+    // both only ever call a plain-fn/zero-capture closure via
+    // `slint::invoke_from_event_loop`, which looks the real state up here —
+    // safe because Slint guarantees that closure runs on this same (UI)
+    // thread that populated it.
+    UI_CONTEXT.with(|cell| {
+        *cell.borrow_mut() = Some(Rc::new(CrossThreadUiContext {
+            config: config.clone(),
+            data_dir: data_dir.clone(),
+            pending_hotkey_rollback: RefCell::new(None),
+            settings_window: window.as_weak(),
+            quick_switcher: quick_switcher.as_weak(),
+        }));
+    });
+
+    let hotkey_thread = Rc::new(HotkeyThread::spawn(
+        config.borrow().settings.quick_switcher_hotkey.clone(),
+        move |event| {
+            let ui_event = match event {
+                HotkeyEvent::Pressed => HotkeyUiEvent::Pressed,
+                HotkeyEvent::Registered => HotkeyUiEvent::Registered,
+                HotkeyEvent::RegisterFailed(err) => {
+                    HotkeyUiEvent::RegisterFailed(hotkey_register_error_message(err))
+                }
+            };
+            let _ = slint::invoke_from_event_loop(move || handle_hotkey_ui_event(ui_event));
+        },
+    ));
+    wire_settings(&window, data_dir.clone(), config.clone(), hotkey_thread);
+
+    // PLAN.md §3.3's `close_on_focus_loss` setting: Slint has no public API
+    // for window-deactivation, so this reaches the popup's raw HWND
+    // directly. `WM_ACTIVATE` runs on the UI thread itself (unlike
+    // `WM_HOTKEY`), so this closure can capture `Rc`s normally.
+    let c = config.clone();
+    let s = quick_switcher.as_weak();
+    let _deactivation_watch =
+        popup_window::watch_deactivation(quick_switcher.window(), move || {
+            if !c.borrow().settings.close_on_focus_loss {
+                return;
+            }
+            if let Some(switcher) = s.upgrade() {
+                let _ = switcher.hide();
+            }
+        });
+
+    // --- Tray wiring (PLAN.md §3.4) ---
+    let switcher_for_tray = quick_switcher.as_weak();
+    let config_for_tray = config.clone();
+    let data_dir_for_tray = data_dir.clone();
+    tray.on_toggle_quick_switcher_requested(move || {
+        if let Some(switcher) = switcher_for_tray.upgrade() {
+            toggle_quick_switcher(&switcher, &config_for_tray.borrow(), &data_dir_for_tray);
+        }
+    });
+
+    let switcher_for_menu = quick_switcher.as_weak();
+    let config_for_menu = config.clone();
+    let data_dir_for_menu = data_dir.clone();
+    tray.on_quick_switcher_requested(move || {
+        if let Some(switcher) = switcher_for_menu.upgrade() {
+            show_quick_switcher_at_cursor(&switcher, &config_for_menu.borrow(), &data_dir_for_menu);
         }
     });
 
@@ -1393,15 +1901,69 @@ pub fn run() -> Result<()> {
         }
     });
 
-    let workset_manager_for_open = workset_manager.as_weak();
-    tray.on_workset_manager_requested(move || {
-        if let Some(workset_manager) = workset_manager_for_open.upgrade() {
+    let workset_manager_for_register = workset_manager.as_weak();
+    tray.on_register_workset_requested(move || {
+        if let Some(workset_manager) = workset_manager_for_register.upgrade() {
             let _ = workset_manager.show();
+            workset_manager.invoke_start_registration();
         }
     });
 
-    // The main window also carries its own shortcuts to the two secondary
-    // windows, mirroring the tray menu entries.
+    let layout_studio_for_empty = layout_studio.as_weak();
+    tray.on_empty_main_screen_requested(move || {
+        if let Some(layout_studio) = layout_studio_for_empty.upgrade() {
+            let _ = layout_studio.show();
+            layout_studio.invoke_empty_main_screen_requested();
+        }
+    });
+
+    let config_for_recover = config.clone();
+    let coordinator_for_recover = coordinator.clone();
+    tray.on_recover_all_requested(move || {
+        if !confirm_recover_all() {
+            return;
+        }
+        let config = config_for_recover.borrow();
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        match coordinator_for_recover.recover_all_windows(
+            &config.worksets,
+            &live_monitors,
+            &config.main_monitor_ids,
+            &live_windows,
+        ) {
+            Ok(report) => tracing::info!(
+                recovered = report.recovered.len(),
+                skipped = report.skipped.len(),
+                "recovered all managed windows from the tray menu"
+            ),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to persist runtime state after recovering all windows");
+            }
+        }
+    });
+
+    let window_for_settings = window.as_weak();
+    tray.on_settings_requested(move || {
+        if let Some(window) = window_for_settings.upgrade() {
+            let _ = window.show();
+        }
+    });
+
+    let data_dir_for_log = data_dir.clone();
+    tray.on_open_log_folder_requested(move || {
+        let log_dir = logging::log_dir(&data_dir_for_log);
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(&log_dir)
+            .spawn()
+        {
+            tracing::warn!(error = %err, path = %log_dir.display(), "failed to open the log folder");
+        }
+    });
+
+    // The settings window also carries its own shortcuts to the two
+    // secondary windows, mirroring the tray menu entries.
     let layout_studio_for_main_window = layout_studio.as_weak();
     window.on_open_layout_studio_requested(move || {
         if let Some(layout_studio) = layout_studio_for_main_window.upgrade() {
@@ -1418,9 +1980,9 @@ pub fn run() -> Result<()> {
     // Re-launching repodeck.exe while an instance is already running (e.g. a
     // taskbar-pinned icon click) signals this event instead of starting a second
     // process (PLAN.md §3.2). A dedicated thread blocks on it and marshals the
-    // show request onto the Slint UI thread.
+    // show request onto the Slint UI thread via the same `UI_CONTEXT` the
+    // hotkey thread uses.
     let show_request_event = SendHandle(open_show_request_event()?);
-    let window_for_show_request = window.as_weak();
     std::thread::spawn(move || {
         // Force the whole `SendHandle` to be captured, not just its `.0` field
         // (Rust 2021 disjoint closure capture would otherwise capture the bare,
@@ -1435,12 +1997,7 @@ pub fn run() -> Result<()> {
                 break;
             }
 
-            let window_for_show_request = window_for_show_request.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window_for_show_request.upgrade() {
-                    let _ = window.show();
-                }
-            });
+            let _ = slint::invoke_from_event_loop(show_quick_switcher_from_context);
         }
     });
 
@@ -1449,9 +2006,9 @@ pub fn run() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
-    window
-        .show()
-        .context("failed to show the RepoDeck main window")?;
+    // Unlike earlier phases, startup no longer force-shows any window (PLAN.md
+    // §13 Phase 7 completion condition "GUI非表示でもプロセス継続") — the tray
+    // icon alone keeps the process resident.
     tray.show()
         .context("failed to show the RepoDeck tray icon")?;
     if std::env::var_os("REPODECK_DEBUG_OPEN_LAYOUT_STUDIO").is_some() {
@@ -1463,6 +2020,14 @@ pub fn run() -> Result<()> {
         workset_manager
             .show()
             .context("failed to show Workset Manager")?;
+    }
+    if std::env::var_os("REPODECK_DEBUG_OPEN_QUICK_SWITCHER").is_some() {
+        quick_switcher
+            .show()
+            .context("failed to show the Quick Switcher")?;
+    }
+    if std::env::var_os("REPODECK_DEBUG_OPEN_SETTINGS").is_some() {
+        window.show().context("failed to show Settings")?;
     }
 
     slint::run_event_loop().context("RepoDeck event loop failed")?;

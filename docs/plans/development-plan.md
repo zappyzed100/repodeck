@@ -156,6 +156,65 @@
     （`#[ignore]`、実Notepad2枚を使い、非メインモニターを持たない構成に絞って
     実際に最小化されることを確認）を追加。
   - UI・ホットキー・クイックスイッチャーからの呼び出し経路は未配線（Phase 7の対象）。
+- **Phase 7（タスクトレイ・ホットキー・クイックスイッチャー）: 完了・実機検証済み。**
+  Phase 6で作った`SwitchCoordinator`を実際に呼び出す経路（グローバルホットキー・
+  クイックスイッチャーUI・トレイメニュー）を実装した。
+  - `hotkey::win32_hotkey`: `RegisterHotKey`/`UnregisterHotKey`を専用スレッド
+    （自前の`GetMessageW`ループ、Slint UIスレッドとは独立）で扱う`HotkeyThread`。
+    衝突検出は`acquire_single_instance`と同じ`GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED`
+    方式。リバインド失敗時は直前の組み合わせへ自己修復（呼び出し側は永続化済み設定の
+    ロールバックだけ行えばよい）。`MOD_NOREPEAT`を常時付与（押しっぱなしで
+    連続トグルするのを防止）。
+  - `windowing::popup_window`: Slintに公開APIが無い2点を生HWNDで補う——
+    `WS_EX_TOOLWINDOW`付与でタスクバー・Alt+Tabから除外（`exclude_from_taskbar_and_alt_tab`）、
+    `WM_ACTIVATE(WA_INACTIVE)`をWNDPROCサブクラス化で監視して`close_on_focus_loss`を
+    実装（`watch_deactivation`）。
+  - `application::popup_placement`／`application::quick_switcher_service`:
+    ポップアップ位置解決（カーソル/メインモニター中心＋フォールバック）と
+    ワークセット一覧の並び替え・絞り込みを、Win32/Slintに依存しない純粋関数として実装
+    （`main_placement`/`monitor_resolution`と同じ設計）。`SortMode::Recent`は
+    「最後に切り替えた時刻」を記録する場所がまだ無いため`Manual`と同一に扱う
+    （`sort_mode`自体のUIもまだ無い）。
+  - `ui/quick-switcher.slint`: 新規`QuickSwitcher`ウィンドウ（`no-frame`＋`always-on-top`）。
+    ↑/↓/Enter/Esc/Ctrl+,/数字キー1-9即切替/文字入力絞り込みを`FocusScope`で実装。
+    **実装上の発見**: `key-pressed`コールバック本文に単純な`if { ... return accept; }`を
+    12個前後並べただけで、このツールチェーンの`slint-build`（コンパイル時）が
+    スタックオーバーフローで異常終了する実バグを踏んだ（`else if`チェーンでも同様）。
+    回避策として、条件の後半を`function`に分割し1つのコールバック/関数あたりの
+    連続`if`文数を減らして解消（`ui/quick-switcher.slint`のコメント参照）。
+  - `ui/app-window.slint`の`AppWindow`を「設定」画面に転用（トレイ左クリックと
+    二重起動時の表示先が両方クイックスイッチャーに変わり、元の簡易ウィンドウが
+    どこからも開かれなくなったため）。ホットキー再設定UI（Ctrl/Alt/Shift/Winの
+    チェックボックス＋キー選択のComboBox）を追加。
+  - `src/app.rs`: `SwitchCoordinator<Win32WindowOps>`を`Rc`で保持し、クイックスイッチャーの
+    行クリック／Enter／数字キーから`switch_to`を実際に呼び出す。ホットキースレッドと
+    二重起動シグナル用スレッドは`Rc`を跨げない（`Rc`は`Send`ではない）ため、
+    `UI_CONTEXT`というUIスレッド専用の`thread_local!`にconfigの`Rc`を置き、
+    各スレッドは`slint::invoke_from_event_loop`経由でSend安全な小さいイベント値
+    （`HotkeyUiEvent`等）だけを渡してからUIスレッド側でその`thread_local`越しに
+    実体へアクセスする設計にした。起動時にウィンドウを強制表示しないよう変更
+    （完了条件「GUI非表示でもプロセス継続」）。「全管理ウィンドウを回収」は
+    `MessageBoxW`のYes/No確認を挟んでから実行。
+  - 実機確認で2件の実バグを発見・修正済み: (1) `ComboBox`の`current-value`を
+    Rustから`set_hotkey_key_choice(...)`で設定しても、`current-index`（既定0）由来の
+    表示と食い違い、保存済みのキー（例:「R」）ではなく`model[0]`（「A」）が
+    表示されてしまう問題 — `current-index`も明示的に同期する`hotkey-key-index`
+    プロパティを追加して解消。(2) `exclude_from_taskbar_and_alt_tab`を
+    ウィンドウ生成直後（初回`.show()`より前）に1度呼ぶだけでは、winit側の
+    `.show()`処理が`WS_EX_APPWINDOW`を再度付与してしまい`WS_EX_TOOLWINDOW`が
+    効かない — `.show()`のたびに再適用するよう修正して解消。両方とも
+    `PrintWindow`によるスクリーンショットと合成キー入力／マウスクリックによる
+    実機操作で発見・確認した。
+  - 手動確認: 起動直後は無表示でトレイのみ常駐／設定画面でのホットキー再設定
+    （実機に既存の競合と衝突→自動ロールバックのメッセージを実際に確認、
+    別の組み合わせへの再設定→成功）／新しいホットキーでクイックスイッチャーが
+    カーソルのあるモニター中央に正しく表示・同じホットキーで非表示（トグル）／
+    タスクバー・Alt+Tab非表示（`WS_EX_TOOLWINDOW`のビット確認）を実機で確認済み。
+    ワークセット未登録のため実際の切替・Esc閉じる・アウトフォーカスで閉じる・
+    トレイメニュー各項目のクリックは自動化テストと単体テストの範囲でのみ検証
+    （手動QAチェックリストとして残し、実機での網羅確認は次回以降）。
+  - エージェント状態表示・全設定画面（ホットキー以外）・初回セットアップ
+    ウィザードはPhase 7のチェックリスト外として意図的に対象外（Phase 8以降）。
 
 ### 実装メモ・既知の齟齬
 
@@ -164,9 +223,10 @@
   §7.2（domain型の正本）で定義される`PopupLocation` enumは`CursorMonitorCenter` /
   `MainMonitorCenter`の2種類のみで、`ForegroundMonitorCenter`と`FixedMonitor`が存在しない。
   §7.2は「次の型をdomain層の正本とする」と明記されているため、Phase 3の実装は§7.2の2種類を
-  正本として`src/domain/config.rs`に実装した。Phase 7（クイックスイッチャー）着手時に、
-  UI仕様の3種類（特にモニター指定を伴う`FixedMonitor`）を本当に実装するかどうかを再確認し、
-  必要なら§7.2の型定義自体をこのファイル側で更新してschema_versionを上げること。
+  正本として`src/domain/config.rs`に実装した。
+  **Phase 7で再確認済み**: `ForegroundMonitorCenter`/`FixedMonitor`は追加しないと決定した
+  （§13 Phase 7のチェックリストにこれらを要求する項目が無く、`popup_placement::resolve_popup_position`
+  は既存の2種類のみを実装）。将来追加する場合は§7.2の型定義とschema_versionの更新が必要。
 - **Windows 11パッケージ版Notepadのプロセス間接性**: `tests/windows_e2e.rs`実装中に判明。
   Windows 11では`notepad.exe`はApp Execution Aliasで、`std::process::Command::spawn()`が返す
   PIDは実際にウィンドウを所有するプロセスのPIDと一致しない（別プロセスへ委譲される）。

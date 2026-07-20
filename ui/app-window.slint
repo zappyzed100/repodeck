@@ -1,17 +1,48 @@
-import { GlassButton, Theme } from "theme.slint";
+import { ComboBox } from "std-widgets.slint";
+import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
 import { WorksetManager } from "workset-dialog.slint";
 export { WorksetManager }
+import { QuickSwitcher } from "quick-switcher.slint";
+export { QuickSwitcher }
 
+component SectionLabel inherits Text {
+    font-family: Theme.font-text;
+    font-size: 12px;
+    font-weight: 600;
+    color: Theme.text-secondary;
+    letter-spacing: 0.3px;
+}
+
+// Repurposed from a plain "RepoDeck is running" placeholder into the
+// settings surface (PLAN.md §13 Phase 7 checklist item 4, "ホットキー設定
+// UI"): once the tray's left-click and the second-instance signal both show
+// the Quick Switcher instead, this window had nothing left pointing at it.
 export component AppWindow inherits Window {
-    title: "RepoDeck";
+    title: "RepoDeck — 設定";
     icon: @image-url("../assets/repodeck-icon.svg");
     preferred-width: 420px;
-    preferred-height: 300px;
+    preferred-height: 440px;
     background: transparent;
     default-font-family: Theme.font-text;
 
+    in-out property <bool> hotkey-ctrl: true;
+    in-out property <bool> hotkey-alt: true;
+    in-out property <bool> hotkey-shift: false;
+    in-out property <bool> hotkey-win: false;
+    in property <[string]> hotkey-key-choices: [];
+    in-out property <string> hotkey-key-choice: "R";
+    // Kept in sync with `hotkey-key-choice` from Rust: `ComboBox`'s own
+    // `current-value: root.model[root.current-index]` default binding on
+    // `current-index` otherwise keeps winning over a plain `set_hotkey_key_choice(...)`
+    // call from the Rust side, visually showing `model[0]` instead of the
+    // value that was just set.
+    in-out property <int> hotkey-key-index: 0;
+    in property <string> hotkey-status-text: "";
+    in property <bool> hotkey-status-is-warning: false;
+
+    callback hotkey-rebind-requested();
     callback open-layout-studio-requested();
     callback open-workset-manager-requested();
 
@@ -26,7 +57,6 @@ export component AppWindow inherits Window {
         VerticalLayout {
             padding: Theme.space-lg;
             spacing: Theme.space-md;
-            alignment: center;
 
             HorizontalLayout {
                 alignment: center;
@@ -34,33 +64,75 @@ export component AppWindow inherits Window {
 
                 Image {
                     source: @image-url("../assets/repodeck-icon.svg");
-                    width: 40px;
-                    height: 40px;
+                    width: 32px;
+                    height: 32px;
                 }
 
-                VerticalLayout {
-                    alignment: center;
-                    Text {
-                        text: "RepoDeck";
-                        font-family: Theme.font-display;
-                        font-size: 26px;
-                        font-weight: 600;
-                        letter-spacing: -0.4px;
-                        color: Theme.text-primary;
-                    }
-                    Text {
-                        text: "常駐中";
-                        font-size: 12px;
-                        color: Theme.success;
-                    }
+                Text {
+                    text: "RepoDeck 設定";
+                    font-family: Theme.font-display;
+                    font-size: 22px;
+                    font-weight: 600;
+                    letter-spacing: -0.3px;
+                    color: Theme.text-primary;
                 }
             }
 
-            Text {
-                text: "タスクトレイのアイコンからいつでも呼び出せます。";
-                font-size: 13px;
-                color: Theme.text-secondary;
-                horizontal-alignment: center;
+            SectionLabel { text: "クイックスイッチャーのホットキー"; }
+
+            HorizontalLayout {
+                spacing: Theme.space-sm;
+
+                HorizontalLayout {
+                    spacing: 4px;
+                    GlassCheckbox {
+                        checked: root.hotkey-ctrl;
+                        toggled => { root.hotkey-ctrl = !root.hotkey-ctrl; }
+                    }
+                    Text { text: "Ctrl"; vertical-alignment: center; color: Theme.text-secondary; }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    GlassCheckbox {
+                        checked: root.hotkey-alt;
+                        toggled => { root.hotkey-alt = !root.hotkey-alt; }
+                    }
+                    Text { text: "Alt"; vertical-alignment: center; color: Theme.text-secondary; }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    GlassCheckbox {
+                        checked: root.hotkey-shift;
+                        toggled => { root.hotkey-shift = !root.hotkey-shift; }
+                    }
+                    Text { text: "Shift"; vertical-alignment: center; color: Theme.text-secondary; }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    GlassCheckbox {
+                        checked: root.hotkey-win;
+                        toggled => { root.hotkey-win = !root.hotkey-win; }
+                    }
+                    Text { text: "Win"; vertical-alignment: center; color: Theme.text-secondary; }
+                }
+
+                ComboBox {
+                    model: root.hotkey-key-choices;
+                    current-value <=> root.hotkey-key-choice;
+                    current-index <=> root.hotkey-key-index;
+                }
+            }
+
+            GlassButton {
+                text: "ホットキーを保存";
+                primary: true;
+                clicked => { root.hotkey-rebind-requested(); }
+            }
+
+            if root.hotkey-status-text != "": Text {
+                text: root.hotkey-status-text;
+                font-size: 12px;
+                color: root.hotkey-status-is-warning ? Theme.danger : Theme.success;
                 wrap: word-wrap;
             }
 
@@ -68,7 +140,6 @@ export component AppWindow inherits Window {
 
             GlassButton {
                 text: "レイアウトスタジオを開く";
-                primary: true;
                 clicked => { root.open-layout-studio-requested(); }
             }
 
@@ -86,8 +157,8 @@ export component TrayIcon inherits SystemTrayIcon {
 
     Menu {
         MenuItem {
-            title: "RepoDeckを開く";
-            activated => { root.open-requested(); }
+            title: "クイックスイッチャーを開く";
+            activated => { root.quick-switcher-requested(); }
         }
 
         MenuItem {
@@ -96,8 +167,30 @@ export component TrayIcon inherits SystemTrayIcon {
         }
 
         MenuItem {
-            title: "セット管理を開く";
-            activated => { root.workset-manager-requested(); }
+            title: "新しいセットを登録";
+            activated => { root.register-workset-requested(); }
+        }
+
+        MenuItem {
+            title: "メイン画面を空にする";
+            activated => { root.empty-main-screen-requested(); }
+        }
+
+        MenuItem {
+            title: "全管理ウィンドウを回収";
+            activated => { root.recover-all-requested(); }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: "設定";
+            activated => { root.settings-requested(); }
+        }
+
+        MenuItem {
+            title: "ログフォルダーを開く";
+            activated => { root.open-log-folder-requested(); }
         }
 
         MenuSeparator { }
@@ -108,12 +201,19 @@ export component TrayIcon inherits SystemTrayIcon {
         }
     }
 
-    callback open-requested();
+    callback toggle-quick-switcher-requested();
+    callback quick-switcher-requested();
     callback layout-studio-requested();
-    callback workset-manager-requested();
+    callback register-workset-requested();
+    callback empty-main-screen-requested();
+    callback recover-all-requested();
+    callback settings-requested();
+    callback open-log-folder-requested();
     callback quit-requested();
 
-    // Left-click on the icon (Windows) forwards to our own callback so the Rust
-    // side has a stable, always-generated binding to hook (`on_open_requested`).
-    clicked => { root.open-requested(); }
+    // Left-click on the tray icon toggles the Quick Switcher's visibility
+    // (PLAN.md §3.4); a menu click on "クイックスイッチャーを開く" always
+    // shows it (fresh position, never closes an already-open one) — those
+    // are deliberately different callbacks with different semantics.
+    clicked => { root.toggle-quick-switcher-requested(); }
 }

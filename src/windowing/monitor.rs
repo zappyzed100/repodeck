@@ -1,11 +1,11 @@
 //! Monitor enumeration: physical bounds, work area, DPI, device name (PLAN.md §2.2, Phase 2).
 
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY};
 use windows::core::BOOL;
 
 use crate::domain::placement::PixelRect;
@@ -98,6 +98,15 @@ fn describe_monitor(hmonitor: HMONITOR) -> Option<MonitorInfo> {
         dpi_y,
         is_primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
     })
+}
+
+/// Reads the current physical-pixel cursor position (PLAN.md §3.3's
+/// `CursorMonitorCenter` popup placement).
+pub fn cursor_position() -> Result<(i32, i32), WindowError> {
+    let mut point = POINT::default();
+    // SAFETY: `point` is a valid, correctly-sized `POINT` buffer.
+    unsafe { GetCursorPos(&mut point) }.map_err(|e| WindowError::win32("GetCursorPos", e))?;
+    Ok((point.x, point.y))
 }
 
 fn rect_to_pixel_rect(rect: RECT) -> PixelRect {

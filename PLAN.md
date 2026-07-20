@@ -95,7 +95,11 @@ repodeck/
    ジャーナル・ロールバック）、全ウィンドウ回収。UI（クイックスイッチャー・ホットキー）は
    Phase 7待ちのため、バックエンドAPIとして実装（詳細は`docs/plans/development-plan.md`
    冒頭の実装メモを参照）。
-7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（未着手）。
+7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（完了）: `RegisterHotKey`用の
+   専用スレッド（衝突検出・自己修復・設定画面からの再設定）、クイックスイッチャー
+   （検索・矢印/数字キー/Enter・タスクバー/Alt+Tab非表示・アウトフォーカスで閉じる）、
+   トレイメニュー刷新、`SwitchCoordinator`への実配線。エージェント状態表示はPhase 8待ち
+   （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
 8. **Phase 8 — Codex連携**（未着手）: 名前付きパイプ、`repodeck-hook.exe`、エージェント状態集約。
 9. **Phase 9 — 回復性・仕上げ**（未着手）: モニター変更監視、起動時復旧、配布物作成。
 
@@ -117,6 +121,6 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 4: レイアウトスタジオ
 - [x] Phase 5: ワークセット登録・照合
 - [x] Phase 6: 退避割当・切替Coordinator
-- [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー `next`
-- [ ] Phase 8: Codex連携
+- [x] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
+- [ ] Phase 8: Codex連携 `next`
 - [ ] Phase 9: 回復性・仕上げ
