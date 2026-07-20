@@ -86,7 +86,10 @@ repodeck/
 4. **Phase 4 — レイアウトスタジオ**（完了）: モニター縮小図、メイン画面選択、自動分割、
    メインを空にする＋Undo、設定保存。固定枠割当はワークセットが存在しないため表示のみで
    Phase 5待ち（詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
-5. **Phase 5 — ワークセット登録・照合**（未着手）: Gitルート検出、候補検出、matcher scoring、再バインドUI。
+5. **Phase 5 — ワークセット登録・照合**（完了）: フォルダーピッカー、Gitルート検出、候補検出、
+   matcher scoring、セット管理画面、再バインド（自動＋手動「このウィンドウを再登録」）。
+   曖昧候補の対話的な選択UIは簡略化し、最高スコア候補への手動再登録のみを提供
+   （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
 6. **Phase 6 — 退避割当・切替Coordinator**（未着手）: 自動枠割当、SwitchCoordinator、ジャーナル、ロールバック。
 7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（未着手）。
 8. **Phase 8 — Codex連携**（未着手）: 名前付きパイプ、`repodeck-hook.exe`、エージェント状態集約。
@@ -108,8 +111,8 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 2: Win32ウィンドウ・モニター基盤
 - [x] Phase 3: 設定とドメインモデル
 - [x] Phase 4: レイアウトスタジオ
-- [ ] Phase 5: ワークセット登録・照合 `next`
-- [ ] Phase 6: 退避割当・切替Coordinator
+- [x] Phase 5: ワークセット登録・照合
+- [ ] Phase 6: 退避割当・切替Coordinator `next`
 - [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
 - [ ] Phase 8: Codex連携
 - [ ] Phase 9: 回復性・仕上げ

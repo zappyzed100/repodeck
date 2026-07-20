@@ -1,5 +1,7 @@
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
+import { WorksetManager } from "workset-dialog.slint";
+export { WorksetManager }
 
 export component AppWindow inherits Window {
     title: "RepoDeck";
@@ -39,6 +41,11 @@ export component TrayIcon inherits SystemTrayIcon {
             activated => { root.layout-studio-requested(); }
         }
 
+        MenuItem {
+            title: "セット管理を開く";
+            activated => { root.workset-manager-requested(); }
+        }
+
         MenuSeparator { }
 
         MenuItem {
@@ -49,6 +56,7 @@ export component TrayIcon inherits SystemTrayIcon {
 
     callback open-requested();
     callback layout-studio-requested();
+    callback workset-manager-requested();
     callback quit-requested();
 
     // Left-click on the icon (Windows) forwards to our own callback so the Rust

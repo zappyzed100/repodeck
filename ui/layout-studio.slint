@@ -21,8 +21,12 @@ export struct MainScreenCandidate {
 export component LayoutStudio inherits Window {
     title: "RepoDeck — レイアウトスタジオ";
     icon: @image-url("../assets/repodeck-icon.svg");
-    preferred-width: 1000px;
-    preferred-height: 680px;
+    // Fixed (not just preferred) size: showing/hiding the "メインを空にする"
+    // confirmation panel changes the layout tree's natural content width, and
+    // Slint would otherwise shrink the whole OS window to fit whichever
+    // branch is narrower (see the same fix in workset-dialog.slint).
+    width: 1000px;
+    height: 680px;
 
     in property <[MonitorTile]> monitor-tiles: [];
     in property <bool> selecting-main: false;

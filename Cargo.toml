@@ -28,6 +28,7 @@ tracing-appender = "0.2"
 parking_lot = "0.12"
 raw-window-handle = "0.6"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
 
 [dependencies.windows]
 version = "0.62"

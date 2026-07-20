@@ -64,7 +64,29 @@
   アイコン欠落を解消、`#![windows_subsystem = "windows"]`でコンソール非表示化、常駐中に
   `repodeck.exe`を再度起動すると名前付きイベントで通知して既存ウィンドウを再表示、を実装・
   実機確認済み。グローバルホットキー登録とクイックスイッチャーUI自体はまだ未実装。
-- **Phase 5以降（ワークセット登録〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
+- **Phase 5（ワークセット登録・照合）: 完了・検証済み。** `src/windowing/matcher.rs`（タイトル正規化、
+  Levenshtein類似度、§5.5のスコアリング表通り、75点かつ次点との差20点以上で自動再バインド、
+  実行ファイルパス取得失敗時は高スコアでも自動再バインドしない）と
+  `src/application/workset_service.rs`（`.git`探索、`WindowMatcher`/`ManagedWindow`構築、
+  重複登録検出、複数ワークセットにまたがる貪欲な排他バインド`resolve_all_matches`）を実装。
+  `ui/workset-dialog.slint`の`WorksetManager`ウィンドウ（一覧＋登録＋再登録）を
+  `src/app.rs`の`wire_workset_manager`で配線し、タスクトレイに「セット管理を開く」を追加。
+  フォルダー選択は`rfd`クレート（ネイティブIFileDialog）を利用。
+  実機で「+現在の配置をセットとして登録」→実フォルダー(`C:\code\portfolio\repodeck`)を
+  ネイティブダイアログで選択→Gitリポジトリとして正しく解決→実候補ウィンドウ8個
+  （Brave・VS Code・ChatGPT・Chrome・エクスプローラー）を検出→登録→`config.json`への
+  正しい書き込み→一覧で「8/8件自動再バインド」表示、を対話的なマウス操作で最後まで確認済み
+  （検証後、テスト用ワークセットは削除済み）。曖昧候補（複数候補が近いスコア）を選ばせる
+  専用UIは実装しておらず、「このウィンドウを再登録」ボタンは常に最高スコアの候補へ
+  再バインドする簡略実装（§5.6の「ユーザーが明示選択できる」という要件を完全には満たさない）。
+  デバッグ用に環境変数`REPODECK_DEBUG_OPEN_WORKSET_MANAGER=1`で起動時にセット管理を
+  自動表示できる。
+  また、Slintの`if`条件分岐で表示切替する最上位パネルに明示的な`width`/`preferred-width`が
+  無いと、切り替え時にOSウィンドウ全体が狭い方のブランチの最小幅まで縮小してしまう実バグを
+  発見・修正した（`LayoutStudio`／`WorksetManager`とも`preferred-width`ではなく固定`width`/
+  `height`をWindow直下に指定することで解消。`width: parent.width`はVerticalLayout内で
+  バインディングループを起こすため使用不可）。
+- **Phase 6以降（退避割当・切替Coordinator〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
 
 ### 実装メモ・既知の齟齬
 
