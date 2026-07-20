@@ -83,7 +83,9 @@ repodeck/
    除外フィルター、配置取得・変更、`BeginDeferWindowPos`一括移動、geometry純粋関数の分離。
 3. **Phase 3 — 設定とドメインモデル**（完了）: domain型、config schema v1、原子的保存とbackup復旧、
    runtime store、switch journal、バリデーション、テストfixture。
-4. **Phase 4 — レイアウトスタジオ**（未着手）: メイン画面選択、自動分割、固定枠割当、Undo。
+4. **Phase 4 — レイアウトスタジオ**（完了）: モニター縮小図、メイン画面選択、自動分割、
+   メインを空にする＋Undo、設定保存。固定枠割当はワークセットが存在しないため表示のみで
+   Phase 5待ち（詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
 5. **Phase 5 — ワークセット登録・照合**（未着手）: Gitルート検出、候補検出、matcher scoring、再バインドUI。
 6. **Phase 6 — 退避割当・切替Coordinator**（未着手）: 自動枠割当、SwitchCoordinator、ジャーナル、ロールバック。
 7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（未着手）。
@@ -105,8 +107,8 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 1: プロジェクト基盤
 - [x] Phase 2: Win32ウィンドウ・モニター基盤
 - [x] Phase 3: 設定とドメインモデル
-- [ ] Phase 4: レイアウトスタジオ `next`
-- [ ] Phase 5: ワークセット登録・照合
+- [x] Phase 4: レイアウトスタジオ
+- [ ] Phase 5: ワークセット登録・照合 `next`
 - [ ] Phase 6: 退避割当・切替Coordinator
 - [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
 - [ ] Phase 8: Codex連携

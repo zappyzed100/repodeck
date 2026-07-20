@@ -37,7 +37,34 @@
   §7.5の原子的保存（backup→tmp書込→flush/sync→再検証→rename）、§10.4のbackup復旧・
   破損ファイルの日時付き退避、§7.6のスキーマバージョン必須化と未来バージョン拒否を実装。
   30件の自動テストが実データ（実モニター構成・実ファイルシステム）に対して green。
-- **Phase 4以降（レイアウトスタジオ〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
+- **Phase 4（レイアウトスタジオ）: 完了・検証済み。** `ui/layout-studio.slint`＋
+  `src/application/layout_service.rs`（正規化座標変換とは別の、モニター一覧をキャンバス上へ
+  縦横比を保って投影する純粋関数、1/2/4自動分割のセル計算、メイン画面上のウィンドウ検出、
+  Undoスナップショット型）と`src/app.rs`の`wire_layout_studio`で実装。
+  タスクトレイに「レイアウトスタジオを開く」を追加し、`AppConfig`は起動時に
+  `config_store::load`で読み込み・`Rc<RefCell<AppConfig>>`で共有するようにした。
+  実機7画面（負座標含む）に対して、`PrintWindow`によるスクリーンショットと
+  `SetForegroundWindow`／合成マウスクリックを使った実際のUI操作で
+  「モニター縮小図が正しい相対位置・縦横比で表示される」「メイン画面をクリックで選択し
+  MAIN 1/MAIN 2として適用できる」「設定を保存するとconfig.jsonへ正しく書き込まれる」
+  「プロセス再起動後に選択状態が復元される」ことを確認済み。
+  「メインを空にする」機能自体は実装済みだが、実行中の実ウィンドウ（VS Code等）を
+  最小化してしまうリスクがあるため対話的な実機テストは意図的に見送り、内部で使う
+  Win32操作（`get_show_state`/`get_normal_rect`/`minimize`/`restore`/`maximize`）は
+  Phase 2のNotepad実機E2Eテストで既に検証済みのものを再利用している。
+  固定枠割当（§3.7）は`FixedParkingSlot.assigned_workset_id`が必須のUuidであり
+  ワークセットが1件も存在しない現時点では作成不能なため、右パネルには
+  「ワークセット登録後に利用できます」という案内のみを表示し、実際の割当UIはPhase 5以降に
+  持ち越した。デバッグ用に環境変数`REPODECK_DEBUG_OPEN_LAYOUT_STUDIO=1`を設定すると
+  起動時にLayout Studioを自動表示できる（`src/app.rs`）。
+- **タスクトレイ・単一インスタンス関連（Phase 7の一部を先行実装）**: `SystemTrayIcon`
+  （開く／レイアウトスタジオを開く／終了のメニュー、左クリックで再表示）、ウィンドウを閉じても
+  トレイに常駐する既定動作（`CloseRequestResponse::HideWindow`）、`SetCurrentProcessExplicitAppUserModelID`
+  によるプロセス識別、`.ico`をビルド時に生成して実行ファイルへ埋め込みタスクバーピン留め時の
+  アイコン欠落を解消、`#![windows_subsystem = "windows"]`でコンソール非表示化、常駐中に
+  `repodeck.exe`を再度起動すると名前付きイベントで通知して既存ウィンドウを再表示、を実装・
+  実機確認済み。グローバルホットキー登録とクイックスイッチャーUI自体はまだ未実装。
+- **Phase 5以降（ワークセット登録〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
 
 ### 実装メモ・既知の齟齬
 
