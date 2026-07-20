@@ -38,6 +38,17 @@ impl PixelRect {
     pub fn bottom(&self) -> i32 {
         self.y + self.height
     }
+
+    pub fn center(&self) -> (i32, i32) {
+        (self.x + self.width / 2, self.y + self.height / 2)
+    }
+
+    /// Whether `(x, y)` falls inside this rect, per PLAN.md §3.6's candidate rule
+    /// ("ウィンドウ中心点がメイン画面のいずれかに存在"): left/top-inclusive,
+    /// right/bottom-exclusive, matching how Win32 rectangles are conventionally treated.
+    pub fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
 }
 
 /// A rectangle normalized against a monitor's work area, per PLAN.md §4.1.
@@ -126,6 +137,23 @@ pub fn affine_map(window: PixelRect, source: PixelRect, target: PixelRect) -> Pi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_point_is_left_top_inclusive_right_bottom_exclusive() {
+        let rect = PixelRect::new(-100, -50, 200, 100);
+
+        assert!(rect.contains_point(-100, -50));
+        assert!(rect.contains_point(99, 49));
+        assert!(!rect.contains_point(100, 0));
+        assert!(!rect.contains_point(0, 50));
+        assert!(!rect.contains_point(-101, 0));
+    }
+
+    #[test]
+    fn center_of_rect_is_offset_by_half_size() {
+        assert_eq!(PixelRect::new(0, 0, 100, 50).center(), (50, 25));
+        assert_eq!(PixelRect::new(-100, -50, 200, 100).center(), (0, 0));
+    }
 
     fn assert_round_trip_within_1px(window: PixelRect, work_area: PixelRect) {
         let normalized = normalize(window, work_area);

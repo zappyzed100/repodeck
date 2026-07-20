@@ -1,0 +1,264 @@
+//! Pure logic behind the Layout Studio screen: projecting monitors onto a
+//! canvas, computing auto-split grid cells, and finding which windows sit on
+//! the main screen (PLAN.md §3.5, §4.4, Phase 4).
+//!
+//! Functions here take already-fetched data (monitor lists, enumerated
+//! windows) rather than calling into `windowing` themselves, so the actual
+//! decision logic is testable without a real Win32 environment. The one
+//! pragmatic exception is [`TopLevelWindow`] itself: reusing it here (instead
+//! of a duplicate `application`-local struct) avoids ceremony for no real
+//! benefit, since nothing in this module needs to substitute a fake
+//! implementation of window enumeration — only the enumerated *data*.
+
+use crate::domain::monitor::AutoSplit;
+use crate::domain::placement::{PixelRect, SavedShowState, bounding_rect};
+use crate::windowing::enumerate::TopLevelWindow;
+
+/// A monitor's bounds mapped onto a canvas, in logical pixels, preserving the
+/// monitor's real aspect ratio (PLAN.md §15: "モニター図は実座標比率を維持").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanvasRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Projects `monitor_bounds` (physical pixels, may include negative
+/// coordinates) onto a `canvas_width` x `canvas_height` logical-pixel canvas,
+/// uniformly scaled (never stretched) and centered within `padding`.
+///
+/// Returns an empty vector for an empty input; the output is parallel to
+/// `monitor_bounds` (same length, same order).
+pub fn project_monitors_to_canvas(
+    monitor_bounds: &[PixelRect],
+    canvas_width: f64,
+    canvas_height: f64,
+    padding: f64,
+) -> Vec<CanvasRect> {
+    let Some(virtual_bounds) = bounding_rect(monitor_bounds) else {
+        return Vec::new();
+    };
+
+    let available_w = (canvas_width - 2.0 * padding).max(1.0);
+    let available_h = (canvas_height - 2.0 * padding).max(1.0);
+
+    let scale = (available_w / f64::from(virtual_bounds.width))
+        .min(available_h / f64::from(virtual_bounds.height));
+
+    let scaled_w = f64::from(virtual_bounds.width) * scale;
+    let scaled_h = f64::from(virtual_bounds.height) * scale;
+    let offset_x = padding + (available_w - scaled_w) / 2.0;
+    let offset_y = padding + (available_h - scaled_h) / 2.0;
+
+    monitor_bounds
+        .iter()
+        .map(|m| CanvasRect {
+            x: offset_x + f64::from(m.x - virtual_bounds.x) * scale,
+            y: offset_y + f64::from(m.y - virtual_bounds.y) * scale,
+            width: f64::from(m.width) * scale,
+            height: f64::from(m.height) * scale,
+        })
+        .collect()
+}
+
+/// Splits `work_area` into the grid cells implied by `split` (PLAN.md §4.4):
+/// `One` is the whole area, `TwoColumns` splits left/right, `FourGrid` splits
+/// into four quadrants. Cell order is stable (reading order: left-to-right,
+/// top-to-bottom) so a `cell_index` persisted in a [`FixedParkingSlot`]
+/// (`crate::domain::workset::FixedParkingSlot`) round-trips correctly.
+pub fn auto_split_cells(work_area: PixelRect, split: AutoSplit) -> Vec<PixelRect> {
+    match split {
+        AutoSplit::One => vec![work_area],
+        AutoSplit::TwoColumns => {
+            let left_width = work_area.width / 2;
+            vec![
+                PixelRect::new(work_area.x, work_area.y, left_width, work_area.height),
+                PixelRect::new(
+                    work_area.x + left_width,
+                    work_area.y,
+                    work_area.width - left_width,
+                    work_area.height,
+                ),
+            ]
+        }
+        AutoSplit::FourGrid => {
+            let left_width = work_area.width / 2;
+            let top_height = work_area.height / 2;
+            vec![
+                PixelRect::new(work_area.x, work_area.y, left_width, top_height),
+                PixelRect::new(
+                    work_area.x + left_width,
+                    work_area.y,
+                    work_area.width - left_width,
+                    top_height,
+                ),
+                PixelRect::new(
+                    work_area.x,
+                    work_area.y + top_height,
+                    left_width,
+                    work_area.height - top_height,
+                ),
+                PixelRect::new(
+                    work_area.x + left_width,
+                    work_area.y + top_height,
+                    work_area.width - left_width,
+                    work_area.height - top_height,
+                ),
+            ]
+        }
+    }
+}
+
+/// Selects the windows from `windows` whose center point falls on one of
+/// `main_monitor_bounds` (PLAN.md §3.6's candidate rule, reused here for
+/// "メインを空にする"'s "メイン画面と交差するトップレベルウィンドウを列挙").
+pub fn find_windows_on_main_screen(
+    windows: &[TopLevelWindow],
+    main_monitor_bounds: &[PixelRect],
+) -> Vec<TopLevelWindow> {
+    windows
+        .iter()
+        .filter(|window| {
+            let (cx, cy) = window.rect_px.center();
+            main_monitor_bounds
+                .iter()
+                .any(|bounds| bounds.contains_point(cx, cy))
+        })
+        .cloned()
+        .collect()
+}
+
+/// One window's placement before a destructive Layout Studio action, kept so
+/// [`UndoSnapshot`] can restore it (PLAN.md §3.5: "操作前配置をUndoスナップショット
+/// として保存").
+#[derive(Debug, Clone)]
+pub struct UndoEntry {
+    pub hwnd: isize,
+    pub process_id: u32,
+    pub before_rect: PixelRect,
+    pub before_show_state: SavedShowState,
+}
+
+/// A single rolling undo slot for "メインを空にする" (PLAN.md §3.5:
+/// "Undoスナップショットは次の破壊的でない操作まで保持する" — one snapshot, not a
+/// full history stack).
+#[derive(Debug, Clone, Default)]
+pub struct UndoSnapshot {
+    pub entries: Vec<UndoEntry>,
+}
+
+impl UndoSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_single_monitor_fills_canvas_minus_padding() {
+        let monitors = [PixelRect::new(0, 0, 1920, 1080)];
+        let projected = project_monitors_to_canvas(&monitors, 400.0, 300.0, 10.0);
+
+        assert_eq!(projected.len(), 1);
+        let r = projected[0];
+        // 1920x1080 into a 380x280 box, uniform scale -> width-limited.
+        assert!((r.width - 380.0).abs() < 0.01, "width={}", r.width);
+        assert!(r.height < 280.0);
+        assert!((r.x - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn project_preserves_relative_position_with_negative_coordinates() {
+        // Mirrors this machine's real layout: a monitor above-left of the primary,
+        // at negative coordinates.
+        let monitors = [
+            PixelRect::new(0, 0, 1920, 1080),
+            PixelRect::new(-1920, -1080, 1920, 1080),
+        ];
+        let projected = project_monitors_to_canvas(&monitors, 800.0, 600.0, 20.0);
+
+        let primary = projected[0];
+        let secondary = projected[1];
+
+        // The secondary monitor must render strictly above and to the left of
+        // the primary, matching its real relative position.
+        assert!(secondary.x < primary.x);
+        assert!(secondary.y < primary.y);
+        // Same physical size -> same canvas size (uniform scale).
+        assert!((secondary.width - primary.width).abs() < 0.01);
+        assert!((secondary.height - primary.height).abs() < 0.01);
+    }
+
+    #[test]
+    fn project_empty_input_returns_empty() {
+        assert!(project_monitors_to_canvas(&[], 400.0, 300.0, 10.0).is_empty());
+    }
+
+    #[test]
+    fn auto_split_one_is_the_whole_area() {
+        let area = PixelRect::new(1920, 0, 1920, 1080);
+        assert_eq!(auto_split_cells(area, AutoSplit::One), vec![area]);
+    }
+
+    #[test]
+    fn auto_split_two_columns_splits_left_right_without_gaps_or_overlap() {
+        let area = PixelRect::new(1920, 0, 1921, 1080);
+        let cells = auto_split_cells(area, AutoSplit::TwoColumns);
+
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            cells[0].right(),
+            cells[1].x,
+            "no gap or overlap between columns"
+        );
+        assert_eq!(cells[0].x, area.x);
+        assert_eq!(
+            cells[1].right(),
+            area.right(),
+            "odd width fully covered, remainder on the right cell"
+        );
+        assert_eq!(cells[0].height, area.height);
+        assert_eq!(cells[1].height, area.height);
+    }
+
+    #[test]
+    fn auto_split_four_grid_covers_area_in_four_quadrants() {
+        let area = PixelRect::new(0, 0, 2561, 1441);
+        let cells = auto_split_cells(area, AutoSplit::FourGrid);
+
+        assert_eq!(cells.len(), 4);
+        let bounds = bounding_rect(&cells).unwrap();
+        assert_eq!(bounds, area, "quadrants exactly tile the source area");
+    }
+
+    #[test]
+    fn find_windows_on_main_screen_filters_by_center_point() {
+        let main_bounds = [PixelRect::new(0, 0, 1920, 1080)];
+
+        let on_main = TopLevelWindow {
+            hwnd: 1,
+            process_id: 100,
+            executable_path: None,
+            window_class: "Notepad".to_string(),
+            title: "on main".to_string(),
+            rect_px: PixelRect::new(100, 100, 400, 300),
+        };
+        let off_main = TopLevelWindow {
+            hwnd: 2,
+            process_id: 200,
+            executable_path: None,
+            window_class: "Notepad".to_string(),
+            title: "off main".to_string(),
+            rect_px: PixelRect::new(2000, 100, 400, 300),
+        };
+
+        let found = find_windows_on_main_screen(&[on_main.clone(), off_main], &main_bounds);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].hwnd, on_main.hwnd);
+    }
+}

@@ -1,3 +1,6 @@
+import { LayoutStudio } from "layout-studio.slint";
+export { LayoutStudio }
+
 export component AppWindow inherits Window {
     title: "RepoDeck";
     icon: @image-url("../assets/repodeck-icon.svg");
@@ -31,6 +34,11 @@ export component TrayIcon inherits SystemTrayIcon {
             activated => { root.open-requested(); }
         }
 
+        MenuItem {
+            title: "レイアウトスタジオを開く";
+            activated => { root.layout-studio-requested(); }
+        }
+
         MenuSeparator { }
 
         MenuItem {
@@ -40,6 +48,7 @@ export component TrayIcon inherits SystemTrayIcon {
     }
 
     callback open-requested();
+    callback layout-studio-requested();
     callback quit-requested();
 
     // Left-click on the icon (Windows) forwards to our own callback so the Rust

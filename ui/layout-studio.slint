@@ -1,0 +1,270 @@
+import { Button, CheckBox, ScrollView } from "std-widgets.slint";
+
+export struct MonitorTile {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+    device-name: string,
+    detail-label: string,
+    role-label: string,
+    is-main: bool,
+    selected: bool,
+}
+
+export struct MainScreenCandidate {
+    title: string,
+    process-name: string,
+    checked: bool,
+}
+
+export component LayoutStudio inherits Window {
+    title: "RepoDeck — レイアウトスタジオ";
+    icon: @image-url("../assets/repodeck-icon.svg");
+    preferred-width: 1000px;
+    preferred-height: 680px;
+
+    in property <[MonitorTile]> monitor-tiles: [];
+    in property <bool> selecting-main: false;
+    in property <int> selected-monitor-index: -1;
+    in property <string> selected-monitor-detail: "モニターを選択してください";
+    in property <bool> selected-is-main: false;
+    in property <bool> selected-has-monitor: false;
+    in property <int> selected-auto-split: 1;
+
+    in property <string> status-text: "";
+    in property <bool> status-is-warning: false;
+    in property <bool> undo-available: false;
+
+    in property <bool> empty-screen-panel-visible: false;
+    in property <[MainScreenCandidate]> main-screen-candidates: [];
+
+    callback refresh-requested();
+    callback toggle-select-main-mode();
+    callback monitor-clicked(index: int);
+    callback apply-main-selection();
+    callback set-auto-split(monitor-index: int, split: int);
+    callback empty-main-screen-requested();
+    callback candidate-toggled(index: int);
+    callback confirm-empty-main-screen();
+    callback cancel-empty-main-screen();
+    callback undo-requested();
+    callback save-requested();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        // --- Toolbar ---
+        HorizontalLayout {
+            spacing: 8px;
+            height: 34px;
+
+            Button {
+                text: root.selecting-main ? "選択モードを終了" : "メイン画面を選択";
+                clicked => { root.toggle-select-main-mode(); }
+            }
+            Button {
+                text: "選択を適用";
+                enabled: root.selecting-main;
+                clicked => { root.apply-main-selection(); }
+            }
+            Button {
+                text: "モニター一覧を更新";
+                clicked => { root.refresh-requested(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "メイン画面を空にする";
+                clicked => { root.empty-main-screen-requested(); }
+            }
+            Button {
+                text: "元に戻す";
+                enabled: root.undo-available;
+                clicked => { root.undo-requested(); }
+            }
+            Button {
+                text: "設定を保存";
+                primary: true;
+                clicked => { root.save-requested(); }
+            }
+        }
+
+        // --- Main content: canvas + right pane ---
+        HorizontalLayout {
+            spacing: 10px;
+
+            // Monitor canvas
+            canvas-frame := Rectangle {
+                horizontal-stretch: 1;
+                background: #12151d;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #232838;
+
+                for tile[i] in root.monitor-tiles: Rectangle {
+                    x: tile.x;
+                    y: tile.y;
+                    width: tile.width;
+                    height: tile.height;
+                    background: tile.selected ? #2563eb : (tile.is-main ? #1d4ed8 : #334155);
+                    border-width: tile.selected ? 3px : 1px;
+                    border-color: tile.is-main ? #93c5fd : #64748b;
+                    border-radius: 4px;
+
+                    VerticalLayout {
+                        padding: 6px;
+                        alignment: start;
+                        Text {
+                            text: tile.role-label;
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: white;
+                        }
+                        Text {
+                            text: tile.device-name;
+                            font-size: 11px;
+                            color: #e2e8f0;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: tile.detail-label;
+                            font-size: 10px;
+                            color: #94a3b8;
+                        }
+                    }
+
+                    TouchArea {
+                        clicked => { root.monitor-clicked(i); }
+                    }
+                }
+            }
+
+            // Right property pane
+            Rectangle {
+                width: 260px;
+                background: #12151d;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #232838;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "プロパティ";
+                        font-size: 13px;
+                        font-weight: 700;
+                        color: #e7ebf3;
+                    }
+                    Text {
+                        text: root.selected-monitor-detail;
+                        font-size: 12px;
+                        color: #cbd5e1;
+                        wrap: word-wrap;
+                    }
+
+                    if root.selected-has-monitor && !root.selected-is-main: Rectangle {
+                        height: 90px;
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "自動分割";
+                                font-size: 12px;
+                                color: #e7ebf3;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Button {
+                                    text: "1分割";
+                                    primary: root.selected-auto-split == 1;
+                                    clicked => { root.set-auto-split(root.selected-monitor-index, 1); }
+                                }
+                                Button {
+                                    text: "2分割";
+                                    primary: root.selected-auto-split == 2;
+                                    clicked => { root.set-auto-split(root.selected-monitor-index, 2); }
+                                }
+                                Button {
+                                    text: "4分割";
+                                    primary: root.selected-auto-split == 4;
+                                    clicked => { root.set-auto-split(root.selected-monitor-index, 4); }
+                                }
+                            }
+                            Text {
+                                text: "固定枠の割当はワークセット登録後に利用できます。";
+                                font-size: 10px;
+                                color: #8992a4;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- "メインを空にする" confirmation panel ---
+        if root.empty-screen-panel-visible: Rectangle {
+            height: 180px;
+            background: #12151d;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #232838;
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 6px;
+
+                Text {
+                    text: "メイン画面上の未登録ウィンドウ — 最小化するものにチェックしてください";
+                    font-size: 12px;
+                    color: #e7ebf3;
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 2px;
+                        for candidate[i] in root.main-screen-candidates: HorizontalLayout {
+                            spacing: 8px;
+                            height: 24px;
+                            CheckBox {
+                                checked: candidate.checked;
+                                toggled => { root.candidate-toggled(i); }
+                            }
+                            Text {
+                                text: candidate.title + "  (" + candidate.process-name + ")";
+                                font-size: 12px;
+                                color: #cbd5e1;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "キャンセル";
+                        clicked => { root.cancel-empty-main-screen(); }
+                    }
+                    Button {
+                        text: "確定して最小化";
+                        primary: true;
+                        clicked => { root.confirm-empty-main-screen(); }
+                    }
+                }
+            }
+        }
+
+        // --- Status bar ---
+        Text {
+            text: root.status-text;
+            font-size: 12px;
+            color: root.status-is-warning ? #f87171 : #94a3b8;
+            wrap: word-wrap;
+        }
+    }
+}
