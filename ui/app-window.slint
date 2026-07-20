@@ -1,0 +1,48 @@
+export component AppWindow inherits Window {
+    title: "RepoDeck";
+    icon: @image-url("../assets/repodeck-icon.svg");
+    preferred-width: 480px;
+    preferred-height: 320px;
+
+    VerticalLayout {
+        alignment: center;
+
+        Text {
+            text: "RepoDeck";
+            font-size: 28px;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "常駐中 — タスクトレイのアイコンからも操作できます";
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export component TrayIcon inherits SystemTrayIcon {
+    icon: @image-url("../assets/repodeck-icon.svg");
+    tooltip: "RepoDeck";
+
+    Menu {
+        MenuItem {
+            title: "RepoDeckを開く";
+            activated => { root.open-requested(); }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: "RepoDeckを終了";
+            activated => { root.quit-requested(); }
+        }
+    }
+
+    callback open-requested();
+    callback quit-requested();
+
+    // Left-click on the icon (Windows) forwards to our own callback so the Rust
+    // side has a stable, always-generated binding to hook (`on_open_requested`).
+    clicked => { root.open-requested(); }
+}
