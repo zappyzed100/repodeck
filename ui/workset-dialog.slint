@@ -1,4 +1,5 @@
-import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 
 export struct WorksetSummary {
     name: string,
@@ -20,6 +21,21 @@ export struct RegistrationCandidate {
     checked: bool,
 }
 
+component GlassPanel inherits Rectangle {
+    background: Theme.glass-panel;
+    border-radius: Theme.radius-lg;
+    border-width: 1px;
+    border-color: Theme.hairline;
+}
+
+component SectionLabel inherits Text {
+    font-family: Theme.font-text;
+    font-size: 12px;
+    font-weight: 600;
+    color: Theme.text-secondary;
+    letter-spacing: 0.3px;
+}
+
 export component WorksetManager inherits Window {
     title: "RepoDeck — セット管理";
     icon: @image-url("../assets/repodeck-icon.svg");
@@ -29,6 +45,8 @@ export component WorksetManager inherits Window {
     // minimum size when it became active.
     width: 920px;
     height: 620px;
+    background: transparent;
+    default-font-family: Theme.font-text;
 
     in property <[WorksetSummary]> worksets: [];
     in property <int> selected-workset-index: -1;
@@ -38,8 +56,8 @@ export component WorksetManager inherits Window {
     in property <string> picked-folder-label: "（未選択）";
     in property <string> resolved-repo-label: "";
     in property <[RegistrationCandidate]> candidates: [];
-    in property <[color]> color-choices: [#2563eb, #16a34a, #d97706, #dc2626, #7c3aed, #0891b2];
-    in property <color> selected-color: #2563eb;
+    in property <[color]> color-choices: [#0a84ff, #30d158, #ff9f0a, #ff453a, #bf5af2, #64d2ff];
+    in property <color> selected-color: #0a84ff;
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
@@ -56,36 +74,32 @@ export component WorksetManager inherits Window {
     callback color-selected(color: color);
     callback register-requested(name: string);
 
+    backdrop := Rectangle {
+        background: Theme.glass-base;
+        border-width: 1px;
+        border-color: Theme.hairline-bright;
+    }
+
     VerticalLayout {
-        padding: 12px;
-        spacing: 10px;
+        padding: Theme.space-md;
+        spacing: Theme.space-sm;
 
         if !root.registering: HorizontalLayout {
-            spacing: 10px;
+            spacing: Theme.space-sm;
 
             // Left: workset list
-            Rectangle {
+            GlassPanel {
                 width: 300px;
-                background: #12151d;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #232838;
 
                 VerticalLayout {
-                    padding: 10px;
-                    spacing: 6px;
+                    padding: Theme.space-sm;
+                    spacing: Theme.space-xs;
 
                     HorizontalLayout {
-                        spacing: 6px;
-                        Text {
-                            text: "登録済みセット";
-                            font-size: 13px;
-                            font-weight: 700;
-                            color: #e7ebf3;
-                            vertical-alignment: center;
-                        }
+                        spacing: Theme.space-xs;
+                        SectionLabel { text: "登録済みセット"; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        Button {
+                        GlassButton {
                             text: "更新";
                             clicked => { root.refresh-requested(); }
                         }
@@ -93,19 +107,20 @@ export component WorksetManager inherits Window {
 
                     ScrollView {
                         VerticalLayout {
-                            spacing: 4px;
+                            spacing: Theme.space-xs;
                             for w[i] in root.worksets: Rectangle {
-                                height: 56px;
-                                background: root.selected-workset-index == i ? #1d4ed8 : #1a1f2b;
-                                border-radius: 6px;
+                                height: 58px;
+                                background: root.selected-workset-index == i ? Theme.glass-selected : Theme.glass-panel-soft;
+                                border-radius: Theme.radius-md;
                                 border-width: 2px;
                                 border-color: w.color;
+                                animate background { duration: Theme.duration-fast; easing: ease-out; }
 
                                 VerticalLayout {
-                                    padding: 6px;
-                                    Text { text: w.name; font-size: 12px; font-weight: 700; color: white; }
-                                    Text { text: w.repository_path; font-size: 10px; color: #94a3b8; wrap: no-wrap; overflow: elide; }
-                                    Text { text: w.status_label; font-size: 10px; color: #cbd5e1; }
+                                    padding: Theme.space-xs;
+                                    Text { text: w.name; font-size: 12px; font-weight: 700; color: Theme.text-primary; }
+                                    Text { text: w.repository_path; font-size: 10px; color: Theme.text-tertiary; wrap: no-wrap; overflow: elide; }
+                                    Text { text: w.status_label; font-size: 10px; color: Theme.text-secondary; }
                                 }
 
                                 TouchArea { clicked => { root.workset-selected(i); } }
@@ -113,7 +128,7 @@ export component WorksetManager inherits Window {
                         }
                     }
 
-                    Button {
+                    GlassButton {
                         text: "+ 現在の配置をセットとして登録";
                         primary: true;
                         clicked => { root.start-registration(); }
@@ -122,28 +137,18 @@ export component WorksetManager inherits Window {
             }
 
             // Right: selected workset detail
-            Rectangle {
+            GlassPanel {
                 horizontal-stretch: 1;
-                background: #12151d;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #232838;
 
                 VerticalLayout {
-                    padding: 10px;
-                    spacing: 6px;
+                    padding: Theme.space-sm;
+                    spacing: Theme.space-xs;
 
                     HorizontalLayout {
-                        spacing: 6px;
-                        Text {
-                            text: "ウィンドウ一覧";
-                            font-size: 13px;
-                            font-weight: 700;
-                            color: #e7ebf3;
-                            vertical-alignment: center;
-                        }
+                        spacing: Theme.space-xs;
+                        SectionLabel { text: "ウィンドウ一覧"; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        Button {
+                        GlassButton {
                             text: "このセットを削除";
                             enabled: root.selected-workset-index >= 0;
                             clicked => { root.delete-workset-requested(); }
@@ -152,25 +157,26 @@ export component WorksetManager inherits Window {
 
                     ScrollView {
                         VerticalLayout {
-                            spacing: 4px;
+                            spacing: Theme.space-xs;
                             for w[i] in root.selected-workset-windows: Rectangle {
-                                height: 44px;
-                                background: #1a1f2b;
-                                border-radius: 6px;
+                                height: 46px;
+                                background: Theme.glass-panel-soft;
+                                border-radius: Theme.radius-md;
 
                                 HorizontalLayout {
-                                    padding: 8px;
-                                    spacing: 8px;
+                                    padding: Theme.space-xs;
+                                    spacing: Theme.space-xs;
                                     VerticalLayout {
                                         horizontal-stretch: 1;
-                                        Text { text: w.title; font-size: 12px; color: #e7ebf3; }
+                                        alignment: center;
+                                        Text { text: w.title; font-size: 12px; color: Theme.text-primary; }
                                         Text {
                                             text: w.status_label;
                                             font-size: 10px;
-                                            color: w.status_is_warning ? #f87171 : #4ade80;
+                                            color: w.status_is_warning ? Theme.danger : Theme.success;
                                         }
                                     }
-                                    Button {
+                                    GlassButton {
                                         text: "このウィンドウを再登録";
                                         clicked => { root.rebind-requested(i); }
                                     }
@@ -182,61 +188,64 @@ export component WorksetManager inherits Window {
             }
         }
 
-        if root.registering: Rectangle {
-            background: #12151d;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #232838;
-
+        if root.registering: GlassPanel {
             VerticalLayout {
-                padding: 14px;
-                spacing: 10px;
+                padding: Theme.space-lg;
+                spacing: Theme.space-sm;
 
-                Text { text: "新しいワークセットを登録"; font-size: 15px; font-weight: 700; color: #e7ebf3; }
+                Text {
+                    text: "新しいワークセットを登録";
+                    font-family: Theme.font-display;
+                    font-size: 18px;
+                    font-weight: 600;
+                    letter-spacing: -0.2px;
+                    color: Theme.text-primary;
+                }
 
                 HorizontalLayout {
-                    spacing: 8px;
-                    Button {
+                    spacing: Theme.space-xs;
+                    GlassButton {
                         text: "リポジトリフォルダーを選択";
                         clicked => { root.pick-folder-requested(); }
                     }
-                    Text { text: root.picked-folder-label; font-size: 12px; color: #cbd5e1; vertical-alignment: center; }
+                    Text { text: root.picked-folder-label; font-size: 12px; color: Theme.text-secondary; vertical-alignment: center; }
                 }
-                Text { text: root.resolved-repo-label; font-size: 11px; color: #94a3b8; wrap: word-wrap; }
+                Text { text: root.resolved-repo-label; font-size: 11px; color: Theme.text-tertiary; wrap: word-wrap; }
 
-                Text { text: "名前"; font-size: 12px; color: #e7ebf3; }
+                SectionLabel { text: "名前"; }
                 name-input := LineEdit { placeholder-text: "ワークセット名"; }
 
-                Text { text: "色"; font-size: 12px; color: #e7ebf3; }
+                SectionLabel { text: "色"; }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: Theme.space-xs;
                     for c in root.color-choices: Rectangle {
-                        width: 28px;
-                        height: 28px;
-                        border-radius: 14px;
+                        width: 26px;
+                        height: 26px;
+                        border-radius: Theme.radius-pill;
                         background: c;
                         border-width: root.selected-color == c ? 3px : 0px;
-                        border-color: white;
+                        border-color: Theme.text-primary;
+                        animate border-width { duration: Theme.duration-fast; easing: ease-out; }
                         TouchArea { clicked => { root.color-selected(c); } }
                     }
                 }
 
-                Text { text: "候補ウィンドウ（メイン画面上で検出）"; font-size: 12px; color: #e7ebf3; }
+                SectionLabel { text: "候補ウィンドウ（メイン画面上で検出）"; }
                 ScrollView {
                     height: 160px;
                     VerticalLayout {
                         spacing: 2px;
                         for candidate[i] in root.candidates: HorizontalLayout {
-                            spacing: 8px;
-                            height: 24px;
-                            CheckBox {
+                            spacing: Theme.space-xs;
+                            height: 26px;
+                            GlassCheckbox {
                                 checked: candidate.checked;
                                 toggled => { root.candidate-toggled(i); }
                             }
                             Text {
                                 text: candidate.title + "  (" + candidate.process_name + ")";
                                 font-size: 12px;
-                                color: #cbd5e1;
+                                color: Theme.text-secondary;
                                 vertical-alignment: center;
                             }
                         }
@@ -244,13 +253,13 @@ export component WorksetManager inherits Window {
                 }
 
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: Theme.space-xs;
                     Rectangle { horizontal-stretch: 1; }
-                    Button {
+                    GlassButton {
                         text: "キャンセル";
                         clicked => { root.cancel-registration(); }
                     }
-                    Button {
+                    GlassButton {
                         text: "登録";
                         primary: true;
                         clicked => { root.register-requested(name-input.text); }
@@ -262,7 +271,7 @@ export component WorksetManager inherits Window {
         Text {
             text: root.status-text;
             font-size: 12px;
-            color: root.status-is-warning ? #f87171 : #94a3b8;
+            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
             wrap: word-wrap;
         }
     }

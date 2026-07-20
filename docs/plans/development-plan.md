@@ -86,6 +86,34 @@
   発見・修正した（`LayoutStudio`／`WorksetManager`とも`preferred-width`ではなく固定`width`/
   `height`をWindow直下に指定することで解消。`width: parent.width`はVerticalLayout内で
   バインディングループを起こすため使用不可）。
+- **UI全面刷新（「ダサい」フィードバックを受けての再設計）: 完了・実機検証済み。** ユーザー指定の
+  参考リポジトリ [zappyzed100/guardrails-workbench](https://github.com/zappyzed100/guardrails-workbench)
+  自体にはUIコードが無く、同README記載の設計参照元3点を実際に取得して適用した:
+  1. [voltagent/awesome-design-md](https://github.com/voltagent/awesome-design-md) の
+     74ブランドDESIGN.mdから「透過度が高いUI」に最も一致する`apple`（backdrop-filter/blur/
+     frosted/glass/vibrancy/translucentの言及数で他ブランドを比較し選定）を採用。
+  2. [emilkowalski/skills](https://github.com/emilkowalski/skills) の`apple-design`
+     （マテリアル階層・ヴァイブランシー・タイポグラフィのトラッキング等）と
+     `emil-design-eng`（押下フィードバック・easing・「頻繁に使うUIほどアニメーションさせない」
+     というRaycast由来の原則）を取得し適用。
+  3. `ui-ux-pro-max-skill`は具体的な追加知見が無かったため今回は不使用。
+  実装は`ui/theme.slint`に共有デザイントークン（Apple System Blue `#0a84ff`、ガラス面の
+  半透明色階層、pill形ボタン、ヒアラインボーダー、Segoe UI Variable、110–170msの
+  press feedback）と共有コンポーネント`GlassButton`/`GlassCheckbox`を集約し、
+  `AppWindow`／`LayoutStudio`／`WorksetManager`の3ウィンドウ全てに適用。
+  Rust側では`src/app.rs`の`apply_glass_backdrop()`が各ウィンドウの生HWNDを
+  （`slint`クレートの`raw-window-handle-06` feature経由で）取得し、
+  `DwmSetWindowAttribute`で`DWMWA_USE_IMMERSIVE_DARK_MODE`と
+  `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENTWINDOW`を設定、Slint側は
+  `background: transparent`としてWindows 11ネイティブの背景コンポジット（Mica/Acrylic系）を
+  そのまま活かす構成にした。`CopyFromScreen`による実画面キャプチャで、背後のVS Codeが
+  実際に透けて見えることを確認済み。
+  なお実機のWindows設定で「透明効果」(`HKCU\...\Themes\Personalize!EnableTransparency`)が
+  `0`（オフ）だったため、ぼかし(blur)は掛からずクリアな透過として見える。この設定はOS全体に
+  影響するためRepoDeck側からは変更していない。ユーザーがWindowsの設定でオンにすれば、
+  同じコードのままDWMがぼかし付きのAcrylic/Micaとして描画するはず（未検証）。
+  この修正の過程で、Slintの`Cargo.toml`に`raw-window-handle-06` feature（Phase 1で
+  「存在しない」と誤判定し外していたもの）を追加した。
 - **Phase 6以降（退避割当・切替Coordinator〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
 
 ### 実装メモ・既知の齟齬

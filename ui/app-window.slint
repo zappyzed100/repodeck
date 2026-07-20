@@ -1,3 +1,4 @@
+import { GlassButton, Theme } from "theme.slint";
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
 import { WorksetManager } from "workset-dialog.slint";
@@ -6,22 +7,75 @@ export { WorksetManager }
 export component AppWindow inherits Window {
     title: "RepoDeck";
     icon: @image-url("../assets/repodeck-icon.svg");
-    preferred-width: 480px;
-    preferred-height: 320px;
+    preferred-width: 420px;
+    preferred-height: 300px;
+    background: transparent;
+    default-font-family: Theme.font-text;
 
-    VerticalLayout {
-        alignment: center;
+    callback open-layout-studio-requested();
+    callback open-workset-manager-requested();
 
-        Text {
-            text: "RepoDeck";
-            font-size: 28px;
-            horizontal-alignment: center;
-        }
+    Rectangle {
+        // The glass card: everything visible sits on this translucent layer,
+        // so text stays legible whether or not the OS is compositing a real
+        // blur behind the (transparent) window.
+        background: Theme.glass-base;
+        border-width: 1px;
+        border-color: Theme.hairline-bright;
 
-        Text {
-            text: "常駐中 — タスクトレイのアイコンからも操作できます";
-            font-size: 14px;
-            horizontal-alignment: center;
+        VerticalLayout {
+            padding: Theme.space-lg;
+            spacing: Theme.space-md;
+            alignment: center;
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: Theme.space-sm;
+
+                Image {
+                    source: @image-url("../assets/repodeck-icon.svg");
+                    width: 40px;
+                    height: 40px;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "RepoDeck";
+                        font-family: Theme.font-display;
+                        font-size: 26px;
+                        font-weight: 600;
+                        letter-spacing: -0.4px;
+                        color: Theme.text-primary;
+                    }
+                    Text {
+                        text: "常駐中";
+                        font-size: 12px;
+                        color: Theme.success;
+                    }
+                }
+            }
+
+            Text {
+                text: "タスクトレイのアイコンからいつでも呼び出せます。";
+                font-size: 13px;
+                color: Theme.text-secondary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: Theme.space-sm; }
+
+            GlassButton {
+                text: "レイアウトスタジオを開く";
+                primary: true;
+                clicked => { root.open-layout-studio-requested(); }
+            }
+
+            GlassButton {
+                text: "セット管理を開く";
+                clicked => { root.open-workset-manager-requested(); }
+            }
         }
     }
 }

@@ -147,6 +147,51 @@ fn set_app_user_model_id() {
     }
 }
 
+/// Applies a dark title bar and a Windows 11 system backdrop (Mica/Acrylic
+/// family) to `window`, so its transparent Slint-rendered background shows
+/// the real desktop through it — the "glass" look every RepoDeck window uses
+/// (see `ui/theme.slint`). Best-effort: silently does nothing on Windows
+/// versions or handle types that don't support it. Whether the backdrop
+/// renders blurred or perfectly clear depends on the user's own Windows
+/// "transparency effects" setting (Settings > Personalization > Colors) —
+/// RepoDeck doesn't change that setting itself.
+fn apply_glass_backdrop(window: &slint::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Graphics::Dwm::{
+        DWM_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    };
+
+    let window_handle = window.window_handle();
+    let Ok(handle) = HasWindowHandle::window_handle(&window_handle) else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32_handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(isize::from(win32_handle.hwnd) as *mut std::ffi::c_void);
+
+    // SAFETY: `hwnd` came from a live Slint window's raw handle; the attribute
+    // buffers match the size Win32 expects for each attribute.
+    unsafe {
+        let dark_mode = windows::core::BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            std::ptr::from_ref(&dark_mode).cast(),
+            u32::try_from(std::mem::size_of_val(&dark_mode)).unwrap(),
+        );
+
+        let backdrop = DWMSBT_TRANSIENTWINDOW;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            std::ptr::from_ref(&backdrop).cast(),
+            u32::try_from(std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>()).unwrap(),
+        );
+    }
+}
+
 fn load_or_default_config(data_dir: &Path) -> AppConfig {
     match config_store::load(data_dir) {
         Ok(Some(result)) => {
@@ -1288,10 +1333,13 @@ pub fn run() -> Result<()> {
     let workset_manager_state = Rc::new(RefCell::new(WorksetManagerState::new()));
 
     let window = AppWindow::new().context("failed to create the RepoDeck main window")?;
+    apply_glass_backdrop(window.window());
     let tray = TrayIcon::new().context("failed to create the RepoDeck tray icon")?;
     let layout_studio = LayoutStudio::new().context("failed to create the Layout Studio window")?;
+    apply_glass_backdrop(layout_studio.window());
     let workset_manager =
         WorksetManager::new().context("failed to create the Workset Manager window")?;
+    apply_glass_backdrop(workset_manager.window());
 
     wire_layout_studio(
         &layout_studio,
@@ -1323,6 +1371,21 @@ pub fn run() -> Result<()> {
     let workset_manager_for_open = workset_manager.as_weak();
     tray.on_workset_manager_requested(move || {
         if let Some(workset_manager) = workset_manager_for_open.upgrade() {
+            let _ = workset_manager.show();
+        }
+    });
+
+    // The main window also carries its own shortcuts to the two secondary
+    // windows, mirroring the tray menu entries.
+    let layout_studio_for_main_window = layout_studio.as_weak();
+    window.on_open_layout_studio_requested(move || {
+        if let Some(layout_studio) = layout_studio_for_main_window.upgrade() {
+            let _ = layout_studio.show();
+        }
+    });
+    let workset_manager_for_main_window = workset_manager.as_weak();
+    window.on_open_workset_manager_requested(move || {
+        if let Some(workset_manager) = workset_manager_for_main_window.upgrade() {
             let _ = workset_manager.show();
         }
     });

@@ -1,0 +1,132 @@
+// RepoDeck "Glass" design tokens.
+//
+// Direction: Apple's frosted-material design language (Apple-design skill,
+// voltagent/awesome-design-md `apple` DESIGN.md), translated to a Windows 11
+// dark glass surface. The window itself is transparent and carries a native
+// DWM Mica/Acrylic backdrop (`app::apply_glass_backdrop`); everything below
+// is what's drawn *on top* of that backdrop, so contrast/legibility hold up
+// whether or not the user's system has "Transparency effects" enabled.
+export global Theme {
+    // --- Accent (Apple System Blue, dark-mode variant) ---
+    out property <color> accent: rgb(10, 132, 255);
+    out property <color> accent-pressed: rgb(0, 113, 227);
+    out property <color> accent-soft: rgba(10, 132, 255, 0.16);
+
+    // --- Glass surfaces ---
+    // Material weight encodes hierarchy: heavier/darker for structural chrome,
+    // lighter for interactive rows — never stack two light surfaces directly.
+    out property <color> glass-base: rgba(13, 13, 16, 0.74);
+    out property <color> glass-panel: rgba(22, 22, 27, 0.78);
+    out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
+    out property <color> glass-panel-strong: rgba(0, 0, 0, 0.30);
+    out property <color> glass-hover: rgba(255, 255, 255, 0.09);
+    out property <color> glass-selected: rgba(10, 132, 255, 0.24);
+
+    // --- Borders ---
+    out property <color> hairline: rgba(255, 255, 255, 0.10);
+    out property <color> hairline-bright: rgba(255, 255, 255, 0.20);
+
+    // --- Text ---
+    out property <color> text-primary: rgb(245, 245, 247);
+    out property <color> text-secondary: rgba(245, 245, 247, 0.64);
+    out property <color> text-tertiary: rgba(245, 245, 247, 0.40);
+    out property <color> text-on-accent: rgb(255, 255, 255);
+
+    // --- Semantic ---
+    out property <color> success: rgb(48, 209, 88);
+    out property <color> warning: rgb(255, 159, 10);
+    out property <color> danger: rgb(255, 69, 58);
+
+    // --- Shape ---
+    out property <length> radius-sm: 8px;
+    out property <length> radius-md: 12px;
+    out property <length> radius-lg: 16px;
+    out property <length> radius-pill: 9999px;
+
+    // --- Spacing (8px base unit) ---
+    out property <length> space-xs: 6px;
+    out property <length> space-sm: 10px;
+    out property <length> space-md: 16px;
+    out property <length> space-lg: 24px;
+
+    // --- Type ---
+    out property <string> font-display: "Segoe UI Variable Display";
+    out property <string> font-text: "Segoe UI Variable Text";
+
+    // --- Motion ---
+    // Response and Component Building Principles skills: press feedback is
+    // instant and brief; frequently-toggled surfaces (this app's tray/hotkey
+    // windows) intentionally carry *no* open/close animation.
+    out property <duration> duration-fast: 110ms;
+    out property <duration> duration-base: 170ms;
+}
+
+// Pill-shaped action button (Apple's `button-primary` signature radius,
+// translated to a glass surface). Shared by every RepoDeck window so button
+// styling never drifts between screens.
+export component GlassButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 36px;
+    border-radius: Theme.radius-pill;
+    opacity: root.enabled ? 1.0 : 0.42;
+    background: primary ? (touch.pressed ? Theme.accent-pressed : Theme.accent) : (touch.pressed ? Theme.glass-hover : Theme.glass-panel-soft);
+    border-width: primary ? 0px : 1px;
+    border-color: Theme.hairline;
+
+    // Component Building Principles skill: press feedback is instant and
+    // brief (100-160ms); this app never animates the frequently-toggled
+    // window show/hide itself, only these small in-place interactions.
+    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+    HorizontalLayout {
+        padding-left: Theme.space-md;
+        padding-right: Theme.space-md;
+        alignment: center;
+
+        Text {
+            text: root.text;
+            font-family: Theme.font-text;
+            font-size: 13px;
+            font-weight: 600;
+            color: primary ? Theme.text-on-accent : Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Small glass checkbox used in candidate/window lists.
+export component GlassCheckbox inherits Rectangle {
+    in property <bool> checked: false;
+    callback toggled();
+
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: checked ? Theme.accent : Theme.glass-panel-soft;
+    border-width: 1px;
+    border-color: checked ? Theme.accent : Theme.hairline-bright;
+    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+    if checked: Text {
+        text: "✓";
+        font-size: 12px;
+        font-weight: 700;
+        color: Theme.text-on-accent;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.toggled(); }
+    }
+}
