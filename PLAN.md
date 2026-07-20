@@ -90,7 +90,11 @@ repodeck/
    matcher scoring、セット管理画面、再バインド（自動＋手動「このウィンドウを再登録」）。
    曖昧候補の対話的な選択UIは簡略化し、最高スコア候補への手動再登録のみを提供
    （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
-6. **Phase 6 — 退避割当・切替Coordinator**（未着手）: 自動枠割当、SwitchCoordinator、ジャーナル、ロールバック。
+6. **Phase 6 — 退避割当・切替Coordinator**（完了）: 自動枠割当（First Fit＋前回割当維持）、
+   固定枠優先、枠内縮小配置、枠不足時の最小化、`SwitchCoordinator`（12ステップ切替・
+   ジャーナル・ロールバック）、全ウィンドウ回収。UI（クイックスイッチャー・ホットキー）は
+   Phase 7待ちのため、バックエンドAPIとして実装（詳細は`docs/plans/development-plan.md`
+   冒頭の実装メモを参照）。
 7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（未着手）。
 8. **Phase 8 — Codex連携**（未着手）: 名前付きパイプ、`repodeck-hook.exe`、エージェント状態集約。
 9. **Phase 9 — 回復性・仕上げ**（未着手）: モニター変更監視、起動時復旧、配布物作成。
@@ -112,7 +116,7 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 3: 設定とドメインモデル
 - [x] Phase 4: レイアウトスタジオ
 - [x] Phase 5: ワークセット登録・照合
-- [ ] Phase 6: 退避割当・切替Coordinator `next`
-- [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
+- [x] Phase 6: 退避割当・切替Coordinator
+- [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー `next`
 - [ ] Phase 8: Codex連携
 - [ ] Phase 9: 回復性・仕上げ

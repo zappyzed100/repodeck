@@ -3,9 +3,10 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, HDWP, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-    SWP_NOZORDER, SetWindowPos, ShowWindow, WINDOWPLACEMENT,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, HDWP, HWND_TOP,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+    ShowWindow, WINDOWPLACEMENT,
 };
 
 use crate::domain::placement::{PixelRect, SavedShowState};
@@ -88,6 +89,34 @@ pub fn maximize(hwnd: HWND) {
 pub fn minimize(hwnd: HWND) {
     // SAFETY: see `restore`.
     let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+}
+
+/// Moves `hwnd` directly above `insert_after` in Z order without moving or
+/// resizing it, or activating it (PLAN.md §3.8 step 7). `None` places it at
+/// the top of its own Z-order group (`HWND_TOP`).
+pub fn set_z_order_after(hwnd: HWND, insert_after: Option<HWND>) {
+    // SAFETY: `hwnd` and `insert_after` (when present) are live handles;
+    // `SWP_NOMOVE | SWP_NOSIZE` makes the position/size arguments ignored.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(insert_after.unwrap_or(HWND_TOP)),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// Best-effort foreground focus (PLAN.md §3.8 step 8, §4.5: "フォーカスは
+/// `SetForegroundWindow`のベストエフォートとする"). Win32 may refuse this
+/// request depending on foreground-lock rules; there is nothing actionable
+/// to do with a failure here.
+pub fn set_foreground_best_effort(hwnd: HWND) {
+    // SAFETY: `hwnd` is a live handle.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
 }
 
 /// A single `BeginDeferWindowPos`/`DeferWindowPos*`/`EndDeferWindowPos` batch

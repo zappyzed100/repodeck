@@ -1,0 +1,200 @@
+//! The Win32 window-movement surface `SwitchCoordinator` needs, abstracted
+//! behind a trait so its orchestration logic is unit-testable without a real
+//! desktop (PLAN.md §4.5, §9.3's "`application`は`domain`とtraitへ依存").
+//!
+//! `windowing::window_ops_impl::Win32WindowOps` is the real implementation;
+//! it adds no new Win32 logic beyond what `windowing::placement` already has.
+
+use crate::domain::placement::{PixelRect, SavedShowState};
+use crate::windowing::win32_error::WindowError;
+
+pub trait WindowOps {
+    fn get_show_state(&self, hwnd: isize) -> Result<SavedShowState, WindowError>;
+    fn get_normal_rect(&self, hwnd: isize) -> Result<PixelRect, WindowError>;
+    fn restore(&self, hwnd: isize);
+    fn maximize(&self, hwnd: isize);
+    fn minimize(&self, hwnd: isize);
+
+    /// Atomic batch move (PLAN.md §4.5). Implementations fall back to
+    /// per-window moves if the atomic path fails, per §4.5's documented
+    /// policy; this returns `Err` only if that fallback also fails.
+    fn batch_move(&self, moves: &[(isize, PixelRect)]) -> Result<(), WindowOpsError>;
+
+    /// Z-order-only move, placing `hwnd` directly above `insert_after`
+    /// (`None` leaves Z-order untouched).
+    fn set_z_order_after(&self, hwnd: isize, insert_after: Option<isize>);
+
+    /// Best-effort; never fatal to a switch (PLAN.md §3.8 step 8).
+    fn set_foreground(&self, hwnd: isize);
+
+    /// Whether `hwnd` still refers to a live top-level window — used to
+    /// detect a window that closed mid-switch.
+    fn is_window_alive(&self, hwnd: isize) -> bool;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WindowOpsError {
+    #[error("batch move failed for hwnd {hwnd}: {source}")]
+    PerWindowFailed {
+        hwnd: isize,
+        #[source]
+        source: WindowError,
+    },
+}
+
+/// An in-memory `WindowOps` fake with failure-injection hooks, used by
+/// `switch_coordinator`'s and `recovery_service`'s unit tests to exercise
+/// paths (a mid-switch window close, an `EndDeferWindowPos` failure) that
+/// aren't sanely reproducible against real Win32.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use super::{WindowOps, WindowOpsError};
+    use crate::domain::placement::{PixelRect, SavedShowState};
+    use crate::windowing::win32_error::WindowError;
+
+    #[derive(Clone)]
+    struct FakeState {
+        rect: PixelRect,
+        show_state: SavedShowState,
+        alive: bool,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakeWindowOps {
+        windows: RefCell<HashMap<isize, FakeState>>,
+        fail_next_batch_move: RefCell<bool>,
+        fail_per_window_fallback_for: RefCell<Vec<isize>>,
+        foreground_history: RefCell<Vec<isize>>,
+    }
+
+    impl FakeWindowOps {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(crate) fn seed_window(&self, hwnd: isize, rect: PixelRect, show_state: SavedShowState) {
+            self.windows.borrow_mut().insert(
+                hwnd,
+                FakeState {
+                    rect,
+                    show_state,
+                    alive: true,
+                },
+            );
+        }
+
+        /// Simulates the window closing mid-switch.
+        pub(crate) fn kill_window(&self, hwnd: isize) {
+            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                state.alive = false;
+            }
+        }
+
+        /// The next `batch_move` call falls back to the per-window path,
+        /// simulating an `EndDeferWindowPos` failure.
+        pub(crate) fn fail_next_batch_move(&self) {
+            *self.fail_next_batch_move.borrow_mut() = true;
+        }
+
+        /// The per-window fallback also fails for `hwnd` (simulating
+        /// `SetWindowPos` itself failing once the batch path already has).
+        pub(crate) fn fail_per_window_fallback_for(&self, hwnd: isize) {
+            self.fail_per_window_fallback_for.borrow_mut().push(hwnd);
+        }
+
+        pub(crate) fn rect_of(&self, hwnd: isize) -> Option<PixelRect> {
+            self.windows.borrow().get(&hwnd).map(|s| s.rect)
+        }
+
+        pub(crate) fn show_state_of(&self, hwnd: isize) -> Option<SavedShowState> {
+            self.windows.borrow().get(&hwnd).map(|s| s.show_state)
+        }
+
+        pub(crate) fn foreground_history(&self) -> Vec<isize> {
+            self.foreground_history.borrow().clone()
+        }
+    }
+
+    impl WindowOps for FakeWindowOps {
+        fn get_show_state(&self, hwnd: isize) -> Result<SavedShowState, WindowError> {
+            self.windows
+                .borrow()
+                .get(&hwnd)
+                .map(|s| s.show_state)
+                .ok_or_else(|| WindowError::no_detail("GetWindowPlacement"))
+        }
+
+        fn get_normal_rect(&self, hwnd: isize) -> Result<PixelRect, WindowError> {
+            self.windows
+                .borrow()
+                .get(&hwnd)
+                .map(|s| s.rect)
+                .ok_or_else(|| WindowError::no_detail("GetWindowPlacement"))
+        }
+
+        fn restore(&self, hwnd: isize) {
+            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                state.show_state = SavedShowState::Normal;
+            }
+        }
+
+        fn maximize(&self, hwnd: isize) {
+            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                state.show_state = SavedShowState::Maximized;
+            }
+        }
+
+        fn minimize(&self, hwnd: isize) {
+            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                state.show_state = SavedShowState::Minimized;
+            }
+        }
+
+        fn batch_move(&self, moves: &[(isize, PixelRect)]) -> Result<(), WindowOpsError> {
+            let use_fallback = self.fail_next_batch_move.replace(false);
+
+            if !use_fallback {
+                // Models `BeginDeferWindowPos`/`EndDeferWindowPos`: nothing
+                // takes effect until the whole batch commits.
+                for &(hwnd, rect) in moves {
+                    if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                        state.rect = rect;
+                    }
+                }
+                return Ok(());
+            }
+
+            // Fallback path: apply moves one at a time, stopping at the first
+            // failure — mirrors the real per-window `SetWindowPos` loop, where
+            // windows before the failing one have already moved.
+            let fallback_failures = self.fail_per_window_fallback_for.borrow().clone();
+            for &(hwnd, rect) in moves {
+                if fallback_failures.contains(&hwnd) || !self.is_window_alive(hwnd) {
+                    return Err(WindowOpsError::PerWindowFailed {
+                        hwnd,
+                        source: WindowError::no_detail("SetWindowPos"),
+                    });
+                }
+                if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                    state.rect = rect;
+                }
+            }
+            Ok(())
+        }
+
+        fn set_z_order_after(&self, _hwnd: isize, _insert_after: Option<isize>) {
+            // Z-order isn't modeled by the fake; nothing to assert against yet.
+        }
+
+        fn set_foreground(&self, hwnd: isize) {
+            self.foreground_history.borrow_mut().push(hwnd);
+        }
+
+        fn is_window_alive(&self, hwnd: isize) -> bool {
+            self.windows.borrow().get(&hwnd).is_some_and(|s| s.alive)
+        }
+    }
+}

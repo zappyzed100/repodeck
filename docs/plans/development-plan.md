@@ -114,7 +114,48 @@
   同じコードのままDWMがぼかし付きのAcrylic/Micaとして描画するはず（未検証）。
   この修正の過程で、Slintの`Cargo.toml`に`raw-window-handle-06` feature（Phase 1で
   「存在しない」と誤判定し外していたもの）を追加した。
-- **Phase 6以降（退避割当・切替Coordinator〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
+- **Phase 6（退避割当・切替Coordinator）: バックエンド完了・単体テスト検証済み。** 既存の
+  純粋な幾何計算（`domain::placement::{normalize, denormalize, bounding_rect, affine_map}`）と
+  永続化層（`journal_store`／`runtime_store`、いずれもPhase 2/3で実装済み）を土台に、
+  新規オーケストレーション層のみを追加した（スキーマ変更なし）。
+  - `application::parking_allocator`（§4.4／§3.7）: `ParkingSlotId`（`"{monitor_id}::{cell_index}"`
+    で`RuntimeState.auto_slot_assignments`にエンコード）、固定枠を独立に先処理（対象モニター
+    消失時は最小化）、非メインモニターを`monitor_resolution::sort_monitors_reading_order`で
+    読み順に並べ`layout_service::auto_split_cells`のセルを列挙、固定枠を除外した上で
+    `sort_order`順のワークセットに対し「前回割当を維持→残りをFirst Fit→溢れは最小化」を実装。
+  - `application::parking_placement`（§4.3）: `bounding_rect`/`affine_map`を組み合わせ、
+    8px内側余白・最小120×68pxを下回る場合はセット全体を最小化（部分的な退避＋最小化の
+    混在は作らない）。
+  - `application::main_placement`（§4.2）: `denormalize`を土台に、インデックス範囲外→
+    先頭メインモニターへのフォールバック、160×90px下限、画面外クランプ、
+    最大化／最小化の復元規則を実装。
+  - `application::window_ops::WindowOps`トレイト（§9.3の「applicationはdomainとtraitへ依存」
+    方針に対応）と、実装を`windowing::window_ops_impl::Win32WindowOps`
+    （既存`windowing::placement`への薄いラッパー）、テスト専用の`fake::FakeWindowOps`
+    （`EndDeferWindowPos`失敗・ウィンドウ消失を注入可能なインメモリ実装）の2系統に分離。
+    `windowing::placement`には`set_z_order_after`／`set_foreground_best_effort`を追加。
+  - `application::switch_coordinator::SwitchCoordinator<W: WindowOps>`: §3.8の12ステップ
+    （排他ロック→現在セットなら再フォーカスのみ→`workset_service::resolve_all_matches`で
+    再解決→ジャーナル保存→現在セット退避→対象セットのメイン復元→Z順復元→フォーカス→
+    `current_workset_id`更新→ジャーナルclear）を実装。失敗時はジャーナルから
+    ロールバックし、生存確認できないウィンドウを`unrecoverable_hwnds`として返す。
+    `current_workset_id`は成功時のみ更新。全ウィンドウ回収（§10.2）用に
+    `recover_all_windows`（`application::recovery_service`、退避ロックを取らず常時呼び出し可能）
+    も実装。
+  - **スレッド化は意図的に後回し**: §9.1の「Coordinatorスレッド」は、実際に別スレッドから
+    呼ぶ相手（ホットキースレッド・クイックスイッチャーUI）がPhase 7まで存在しないため、
+    今回は同期的に直接呼べるAPI＋`AtomicBool`の排他ガードのみを実装し、スレッド／
+    チャネル配線はPhase 7に持ち越した。
+  - テスト: `parking_allocator`／`parking_placement`／`main_placement`／`monitor_resolution`／
+    `recovery_service`の純粋ロジック単体テストに加え、`switch_coordinator`は
+    `FakeWindowOps`を使い「3セットを100回切替えて画面外ウィンドウ0」「固定セットが
+    常に指定枠へ戻る」「`EndDeferWindowPos`相当の失敗からフォールバックで復帰」
+    「フォールバックも失敗した場合のロールバック」「切替途中でウィンドウが消えた場合の
+    部分ロールバック」を実機なしで決定的に検証。`tests/windows_e2e.rs`に
+    `switch_between_two_real_worksets_minimizes_the_non_current_one`
+    （`#[ignore]`、実Notepad2枚を使い、非メインモニターを持たない構成に絞って
+    実際に最小化されることを確認）を追加。
+  - UI・ホットキー・クイックスイッチャーからの呼び出し経路は未配線（Phase 7の対象）。
 
 ### 実装メモ・既知の齟齬
 

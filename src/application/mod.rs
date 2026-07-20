@@ -1,2 +1,9 @@
 pub mod layout_service;
+pub mod main_placement;
+pub mod monitor_resolution;
+pub mod parking_allocator;
+pub mod parking_placement;
+pub mod recovery_service;
+pub mod switch_coordinator;
+pub mod window_ops;
 pub mod workset_service;
