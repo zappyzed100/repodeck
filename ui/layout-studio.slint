@@ -37,12 +37,18 @@ component SectionLabel inherits Text {
 export component LayoutStudio inherits Window {
     title: "RepoDeck — レイアウトスタジオ";
     icon: @image-url("../assets/repodeck-icon.svg");
-    // Fixed (not just preferred) size: showing/hiding the "メインを空にする"
-    // confirmation panel changes the layout tree's natural content width, and
-    // Slint would otherwise shrink the whole OS window to fit whichever
-    // branch is narrower (see the same fix in workset-dialog.slint).
-    width: 1000px;
-    height: 680px;
+    // A *preferred* (not fixed) size: unlike workset-dialog.slint, every
+    // branch that used to change this window's natural content size (the
+    // "メインを空にする" confirmation panel, the auto-split box below) has
+    // been pulled out of the layout flow — as a floating overlay and a
+    // fixed-height reservation respectively — so nothing left changes the
+    // preferred size at runtime. Leaving this as a preferred size (rather
+    // than a fixed one) matters: a fixed size makes Slint ignore the OS
+    // window's real size after a user resize/maximize, so `canvas-frame`
+    // below (and everything else) stays pinned at 1000x680 in a corner of
+    // the larger OS window instead of actually filling it.
+    preferred-width: 1000px;
+    preferred-height: 680px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -72,6 +78,10 @@ export component LayoutStudio inherits Window {
     callback cancel-empty-main-screen();
     callback undo-requested();
     callback save-requested();
+    // Fires whenever the canvas card's actual on-screen size changes (first
+    // layout pass, or a window resize), so Rust can project monitor tiles
+    // onto the card's real bounds instead of a guessed constant.
+    callback canvas-resized(width: length, height: length);
 
     backdrop := Rectangle {
         x: 0;
@@ -131,6 +141,9 @@ export component LayoutStudio inherits Window {
             canvas-frame := GlassPanel {
                 horizontal-stretch: 1;
 
+                changed width => { root.canvas-resized(self.width, self.height); }
+                changed height => { root.canvas-resized(self.width, self.height); }
+
                 for tile[i] in root.monitor-tiles: Rectangle {
                     x: tile.x;
                     y: tile.y;
@@ -187,9 +200,16 @@ export component LayoutStudio inherits Window {
                         wrap: word-wrap;
                     }
 
-                    if root.selected-has-monitor && !root.selected-is-main: Rectangle {
+                    // Always reserves this height, whether or not the auto-split
+                    // controls are showing: letting this row's natural height
+                    // change with `selected-has-monitor`/`selected-is-main` would
+                    // feed back into the window's preferred size (now that it's
+                    // `preferred-width`/`preferred-height`, not a fixed size —
+                    // see the comment on `LayoutStudio` above), so the window
+                    // would visibly resize every time the selection changes.
+                    Rectangle {
                         height: 100px;
-                        VerticalLayout {
+                        if root.selected-has-monitor && !root.selected-is-main: VerticalLayout {
                             spacing: Theme.space-xs;
                             SectionLabel { text: "自動分割"; }
                             HorizontalLayout {

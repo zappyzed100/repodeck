@@ -44,10 +44,14 @@ const SHOW_REQUEST_EVENT_NAME: &str = r"Local\RepoDeck.ShowRequested.v1";
 /// icon is created.
 const APP_USER_MODEL_ID: &str = "RepoDeck.App";
 
-/// Logical-pixel size assumed for the monitor canvas projection (PLAN.md §15's
-/// "モニター図は実座標比率を維持"). This matches `layout-studio.slint`'s default
-/// window size; it is not recomputed if the user resizes the window, so very
-/// large/small windows will show the canvas letterboxed rather than filling it.
+/// Fallback logical-pixel size for the monitor canvas projection (PLAN.md
+/// §15's "モニター図は実座標比率を維持"), used only for the very first tile
+/// refresh — before the window has ever been shown, `canvas-frame` (the card
+/// the tiles are drawn into) hasn't been laid out yet, so its real size isn't
+/// known. Once `layout-studio.slint`'s `canvas-resized` callback reports the
+/// card's actual size, `LayoutStudioState::canvas_width/height` are updated to
+/// match and every subsequent projection uses the real bounds instead of this
+/// guess.
 const CANVAS_WIDTH: f64 = 700.0;
 const CANVAS_HEIGHT: f64 = 480.0;
 const CANVAS_PADDING: f64 = 12.0;
@@ -225,6 +229,10 @@ struct LayoutStudioState {
     selected_index: Option<usize>,
     undo_snapshot: UndoSnapshot,
     pending_candidates: Vec<TopLevelWindow>,
+    /// The canvas card's real on-screen size, kept in sync with
+    /// `canvas-resized` (see `CANVAS_WIDTH`/`CANVAS_HEIGHT`'s doc comment).
+    canvas_width: f64,
+    canvas_height: f64,
 }
 
 impl LayoutStudioState {
@@ -237,6 +245,8 @@ impl LayoutStudioState {
             selected_index: None,
             undo_snapshot: UndoSnapshot::default(),
             pending_candidates: Vec::new(),
+            canvas_width: CANVAS_WIDTH,
+            canvas_height: CANVAS_HEIGHT,
         }
     }
 
@@ -286,8 +296,8 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
     let bounds: Vec<_> = monitors.iter().map(|m| m.bounds_px).collect();
     let canvas_rects = layout_service::project_monitors_to_canvas(
         &bounds,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT,
+        state.canvas_width,
+        state.canvas_height,
         CANVAS_PADDING,
     );
 
@@ -422,6 +432,21 @@ fn wire_layout_studio(
         let mut state = state.borrow_mut();
         refresh_monitor_tiles(layout, &config.borrow(), &mut state);
     }
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_canvas_resized(move |width, height| {
+        let (width, height) = (width as f64, height as f64);
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let Some(layout) = l.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        state.canvas_width = width;
+        state.canvas_height = height;
+        refresh_monitor_tiles(&layout, &c.borrow(), &mut state);
+    });
 
     let l = layout.as_weak();
     let c = config.clone();
