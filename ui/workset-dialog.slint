@@ -75,6 +75,10 @@ export component WorksetManager inherits Window {
     callback register-requested(name: string);
 
     backdrop := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         background: Theme.glass-base;
         border-width: 1px;
         border-color: Theme.hairline-bright;

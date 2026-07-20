@@ -15,10 +15,22 @@ export global Theme {
     // --- Glass surfaces ---
     // Material weight encodes hierarchy: heavier/darker for structural chrome,
     // lighter for interactive rows — never stack two light surfaces directly.
-    out property <color> glass-base: rgba(13, 13, 16, 0.74);
-    out property <color> glass-panel: rgba(22, 22, 27, 0.78);
+    //
+    // glass-base/glass-panel are fully opaque on purpose. DWM's system
+    // backdrop only *blurs* what's behind a window when the user's own
+    // "Transparency effects" setting is on; with it off (the default for
+    // many users), any alpha < 1.0 here just alpha-blends whatever
+    // unblurred content is behind the window (other RepoDeck windows, VS
+    // Code, the desktop) straight through, sharp and legible — even a
+    // couple percent was enough to read as ghosted, overlapping text.
+    // Verified empirically: 0.96 still leaked readable text, 1.0 doesn't.
+    // The glass character now comes from the hairline borders, the lighter
+    // translucent overlays below, and the DWM backdrop blur itself where
+    // the user has that setting on — not from seeing through the cards.
+    out property <color> glass-base: rgba(13, 13, 16, 1.0);
+    out property <color> glass-panel: rgba(22, 22, 27, 1.0);
     out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
-    out property <color> glass-panel-strong: rgba(0, 0, 0, 0.30);
+    out property <color> glass-panel-strong: rgba(0, 0, 0, 0.90);
     out property <color> glass-hover: rgba(255, 255, 255, 0.09);
     out property <color> glass-selected: rgba(10, 132, 255, 0.24);
 

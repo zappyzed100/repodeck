@@ -74,6 +74,10 @@ export component LayoutStudio inherits Window {
     callback save-requested();
 
     backdrop := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         background: Theme.glass-base;
         border-width: 1px;
         border-color: Theme.hairline-bright;
@@ -218,18 +222,46 @@ export component LayoutStudio inherits Window {
             }
         }
 
-        // --- "メインを空にする" confirmation panel ---
-        if root.empty-screen-panel-visible: GlassPanel {
-            height: 180px;
+        // --- Status bar ---
+        Text {
+            text: root.status-text;
+            font-size: 12px;
+            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
+            wrap: word-wrap;
+        }
+    }
+
+    // --- "メインを空にする" confirmation modal ---
+    // A floating overlay rather than a row in the main VerticalLayout: inserting
+    // it into that flow stole height from the monitor canvas above, and since
+    // the canvas's monitor tiles are positioned in fixed logical pixels (sized
+    // for the full canvas — see `CANVAS_WIDTH`/`CANVAS_HEIGHT` in app.rs), a
+    // shrunk canvas made the lower tiles overflow past the frame and render
+    // underneath this panel. Floating it leaves the canvas untouched.
+    if root.empty-screen-panel-visible: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(0, 0, 0, 0.55);
+
+        TouchArea { }
+
+        GlassPanel {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: 360px;
 
             VerticalLayout {
-                padding: Theme.space-sm;
-                spacing: Theme.space-xs;
+                padding: Theme.space-md;
+                spacing: Theme.space-sm;
 
                 Text {
                     text: "メイン画面上の未登録ウィンドウ — 最小化するものにチェックしてください";
-                    font-size: 12px;
+                    font-size: 13px;
                     color: Theme.text-primary;
+                    wrap: word-wrap;
                 }
 
                 ScrollView {
@@ -247,6 +279,7 @@ export component LayoutStudio inherits Window {
                                 font-size: 12px;
                                 color: Theme.text-secondary;
                                 vertical-alignment: center;
+                                overflow: elide;
                             }
                         }
                     }
@@ -266,14 +299,6 @@ export component LayoutStudio inherits Window {
                     }
                 }
             }
-        }
-
-        // --- Status bar ---
-        Text {
-            text: root.status-text;
-            font-size: 12px;
-            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
-            wrap: word-wrap;
         }
     }
 }

@@ -16,9 +16,9 @@ export component AppWindow inherits Window {
     callback open-workset-manager-requested();
 
     Rectangle {
-        // The glass card: everything visible sits on this translucent layer,
-        // so text stays legible whether or not the OS is compositing a real
-        // blur behind the (transparent) window.
+        // The glass card: everything visible sits on this opaque layer, so
+        // text stays legible whether or not the OS is compositing a real
+        // blur behind the (transparent) window (see Theme.glass-base).
         background: Theme.glass-base;
         border-width: 1px;
         border-color: Theme.hairline-bright;
