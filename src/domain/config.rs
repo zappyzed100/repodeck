@@ -49,7 +49,9 @@ impl AppConfig {
             errors.push(ConfigValidationError::NoMainMonitor);
         }
 
-        if self.settings.quick_switcher_hotkey.modifiers.is_empty() {
+        if self.settings.quick_switcher_hotkey.modifiers.is_empty()
+            && !self.settings.quick_switcher_hotkey.allows_empty_modifiers()
+        {
             errors.push(ConfigValidationError::HotkeyMissingModifier {
                 context: "settings.quick_switcher_hotkey".to_string(),
             });
@@ -71,7 +73,11 @@ impl AppConfig {
                 });
             }
 
-            if !workset.repository_path.is_absolute() {
+            // An empty path means "no repository" (worksets can be registered
+            // without one); only a non-empty path must be absolute.
+            if !workset.repository_path.as_os_str().is_empty()
+                && !workset.repository_path.is_absolute()
+            {
                 errors.push(ConfigValidationError::RepositoryPathNotAbsolute {
                     path: workset.repository_path.clone(),
                 });
@@ -79,6 +85,7 @@ impl AppConfig {
 
             if let Some(hotkey) = &workset.direct_hotkey
                 && hotkey.modifiers.is_empty()
+                && !hotkey.allows_empty_modifiers()
             {
                 errors.push(ConfigValidationError::HotkeyMissingModifier {
                     context: format!("workset {} direct_hotkey", workset.id),
@@ -165,6 +172,19 @@ pub struct UserSettings {
     pub notify_needs_input: bool,
     pub notify_ready: bool,
     pub start_with_windows: bool,
+    /// When `true` (default), RepoDeck automatically attempts a software display
+    /// re-detect after a resume-from-sleep if saved monitors are missing from the
+    /// live topology (PLAN.md §4.6, Phase 9 resilience). The manual tray trigger
+    /// ("モニターを再検出") works regardless of this flag. `#[serde(default)]` keeps
+    /// configs written before this field was added loadable.
+    #[serde(default = "default_auto_display_recovery")]
+    pub auto_display_recovery: bool,
+}
+
+/// serde default for [`UserSettings::auto_display_recovery`]: auto-recovery is ON
+/// unless a config explicitly disables it.
+fn default_auto_display_recovery() -> bool {
+    true
 }
 
 impl Default for UserSettings {
@@ -173,7 +193,7 @@ impl Default for UserSettings {
         Self {
             quick_switcher_hotkey: HotkeyConfig {
                 modifiers: vec![HotkeyModifier::Control, HotkeyModifier::Alt],
-                virtual_key: u32::from(b'R'),
+                virtual_key: u32::from(b'W'),
             },
             popup_location: PopupLocation::CursorMonitorCenter,
             close_on_focus_loss: true,
@@ -183,6 +203,7 @@ impl Default for UserSettings {
             notify_needs_input: true,
             notify_ready: true,
             start_with_windows: false,
+            auto_display_recovery: default_auto_display_recovery(),
         }
     }
 }
@@ -191,6 +212,17 @@ impl Default for UserSettings {
 pub struct HotkeyConfig {
     pub modifiers: Vec<HotkeyModifier>,
     pub virtual_key: u32,
+}
+
+impl HotkeyConfig {
+    /// Whether this hotkey is valid with an empty `modifiers` list. Only
+    /// function keys (`VK_F1`..`VK_F24`, `0x70..=0x87`) qualify: registering
+    /// a bare letter/digit/arrow/space system-wide would steal that key from
+    /// normal typing in every application, while F13-F24 (and unused
+    /// F1-F12) exist precisely for dedicated bindings.
+    pub fn allows_empty_modifiers(&self) -> bool {
+        (0x70..=0x87).contains(&self.virtual_key)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +301,7 @@ pub enum ConfigValidationError {
         #[source]
         source: regex::Error,
     },
-    #[error("hotkey must have at least one modifier ({context})")]
+    #[error("hotkey must have at least one modifier unless the key is a function key ({context})")]
     HotkeyMissingModifier { context: String },
 }
 
@@ -307,5 +339,40 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ConfigValidationError::HotkeyMissingModifier { .. }))
         );
+    }
+
+    #[test]
+    fn function_key_hotkey_without_modifiers_is_accepted() {
+        let mut config = AppConfig::new_empty();
+        config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        config.settings.quick_switcher_hotkey.modifiers.clear();
+
+        for vk in [0x70, 0x7B, 0x7C, 0x87] {
+            // VK_F1, VK_F12, VK_F13, VK_F24.
+            config.settings.quick_switcher_hotkey.virtual_key = vk;
+            assert!(
+                config.validate().is_empty(),
+                "VK 0x{vk:02X} should be registrable without modifiers"
+            );
+        }
+    }
+
+    #[test]
+    fn non_function_key_hotkey_without_modifiers_is_rejected() {
+        let mut config = AppConfig::new_empty();
+        config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        config.settings.quick_switcher_hotkey.modifiers.clear();
+
+        for vk in [0x26, 0x6F, 0x88] {
+            // VK_UP, VK_DIVIDE (just below VK_F1), one past VK_F24.
+            config.settings.quick_switcher_hotkey.virtual_key = vk;
+            let errors = config.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ConfigValidationError::HotkeyMissingModifier { .. })),
+                "VK 0x{vk:02X} should require a modifier"
+            );
+        }
     }
 }

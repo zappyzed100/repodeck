@@ -148,6 +148,7 @@ pub fn build_workset(
         sort_order,
         direct_hotkey: None,
         parking_policy: ParkingPolicy::Auto,
+        fullscreen_when_parked: false,
         windows,
         created_at: now.clone(),
         updated_at: now,

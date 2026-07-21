@@ -115,6 +115,10 @@ repodeck/
 
 MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本とする。
 
+MVP完成後のUX改修（既定ホットキーの`Ctrl+Alt+W`化、クイックスイッチャーの✕ボタン・透過表示、
+レイアウトスタジオの選択モード廃止・自動分割「自動」・モニター除外、ホットキーの自由登録）は
+`docs/plans/development-plan.md` 冒頭の「MVP後のUX改修」を正本とする。
+
 ## タスク（機械可読 — Phase進捗を正規表現で読める記法）
 
 書式:

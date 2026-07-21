@@ -188,6 +188,7 @@ mod tests {
             sort_order: 0,
             direct_hotkey: None,
             parking_policy: ParkingPolicy::Auto,
+            fullscreen_when_parked: false,
             windows,
             created_at: "2026-07-21T00:00:00Z".to_string(),
             updated_at: "2026-07-21T00:00:00Z".to_string(),

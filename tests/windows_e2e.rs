@@ -338,8 +338,8 @@ fn hotkey_thread_reports_already_registered_when_the_combo_is_taken() {
 
     const OCCUPYING_HOTKEY_ID: i32 = 999;
     // An obscure combo (all four modifiers + F24) rather than RepoDeck's own
-    // default Ctrl+Alt+R: a real running RepoDeck instance (or some other
-    // unrelated app) may already hold Ctrl+Alt+R on this machine, which would
+    // default Ctrl+Alt+W: a real running RepoDeck instance (or some other
+    // unrelated app) may already hold Ctrl+Alt+W on this machine, which would
     // make this test's own "occupy the combo" setup step fail before it gets
     // to the thing being tested.
     const TEST_VK: u32 = 0x87; // VK_F24
@@ -363,6 +363,7 @@ fn hotkey_thread_reports_already_registered_when_the_combo_is_taken() {
     let _hotkey_thread = HotkeyThread::spawn(config, move |event| {
         let label = match event {
             HotkeyEvent::Pressed => "pressed",
+            HotkeyEvent::CyclePressed { .. } => "cycle",
             HotkeyEvent::Registered => "registered",
             HotkeyEvent::RegisterFailed(HotkeyRegisterError::AlreadyRegistered) => {
                 "already_registered"

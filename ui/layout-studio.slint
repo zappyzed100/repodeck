@@ -10,6 +10,7 @@ export struct MonitorTile {
     detail-label: string,
     role-label: string,
     is-main: bool,
+    is-excluded: bool,
     selected: bool,
 }
 
@@ -47,18 +48,21 @@ export component LayoutStudio inherits Window {
     // window's real size after a user resize/maximize, so `canvas-frame`
     // below (and everything else) stays pinned at 1000x680 in a corner of
     // the larger OS window instead of actually filling it.
-    preferred-width: 1000px;
-    preferred-height: 680px;
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    min-width: 900px;
+    min-height: 640px;
     background: transparent;
     default-font-family: Theme.font-text;
 
     in property <[MonitorTile]> monitor-tiles: [];
-    in property <bool> selecting-main: false;
     in property <int> selected-monitor-index: -1;
     in property <string> selected-monitor-detail: "モニターを選択してください";
     in property <bool> selected-is-main: false;
+    in property <bool> selected-excluded: false;
     in property <bool> selected-has-monitor: false;
-    in property <int> selected-auto-split: 1;
+    // 0 = 自動 (the app picks from the monitor's work area); 1/2/4 = manual.
+    in property <int> selected-auto-split: 0;
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
@@ -68,9 +72,9 @@ export component LayoutStudio inherits Window {
     in property <[MainScreenCandidate]> main-screen-candidates: [];
 
     callback refresh-requested();
-    callback toggle-select-main-mode();
     callback monitor-clicked(index: int);
-    callback apply-main-selection();
+    callback toggle-main-requested();
+    callback toggle-excluded-requested();
     callback set-auto-split(monitor-index: int, split: int);
     callback empty-main-screen-requested();
     callback candidate-toggled(index: int);
@@ -103,29 +107,10 @@ export component LayoutStudio inherits Window {
             height: 36px;
 
             GlassButton {
-                text: root.selecting-main ? "選択モードを終了" : "メイン画面を選択";
-                clicked => { root.toggle-select-main-mode(); }
-            }
-            GlassButton {
-                text: "選択を適用";
-                primary: root.selecting-main;
-                enabled: root.selecting-main;
-                clicked => { root.apply-main-selection(); }
-            }
-            GlassButton {
                 text: "モニター一覧を更新";
                 clicked => { root.refresh-requested(); }
             }
             Rectangle { horizontal-stretch: 1; }
-            GlassButton {
-                text: "メイン画面を空にする";
-                clicked => { root.empty-main-screen-requested(); }
-            }
-            GlassButton {
-                text: "元に戻す";
-                enabled: root.undo-available;
-                clicked => { root.undo-requested(); }
-            }
             GlassButton {
                 text: "設定を保存";
                 primary: true;
@@ -149,11 +134,15 @@ export component LayoutStudio inherits Window {
                     y: tile.y;
                     width: tile.width;
                     height: tile.height;
+                    // Clip so a small tile's labels can't spill over neighbouring
+                    // tiles (with many monitors the projected tiles get small).
+                    clip: true;
                     background: tile.selected ? Theme.glass-selected : (tile.is-main ? Theme.accent-soft : Theme.glass-panel-soft);
                     border-width: tile.selected ? 2px : 1px;
                     border-color: tile.is-main ? Theme.accent : Theme.hairline-bright;
                     border-radius: Theme.radius-sm;
-                    animate background, border-color { duration: Theme.duration-base; easing: ease-out; }
+                    opacity: tile.is-excluded ? 0.45 : 1.0;
+                    animate background, border-color, opacity { duration: Theme.duration-base; easing: ease-out; }
 
                     VerticalLayout {
                         padding: Theme.space-xs;
@@ -162,7 +151,7 @@ export component LayoutStudio inherits Window {
                             text: tile.role-label;
                             font-size: 12px;
                             font-weight: 700;
-                            color: tile.is-main ? Theme.accent : Theme.text-primary;
+                            color: tile.is-main ? Theme.accent : (tile.is-excluded ? Theme.text-tertiary : Theme.text-primary);
                         }
                         Text {
                             text: tile.device-name;
@@ -200,7 +189,7 @@ export component LayoutStudio inherits Window {
                         wrap: word-wrap;
                     }
 
-                    // Always reserves this height, whether or not the auto-split
+                    // Always reserves this height, whether or not the per-monitor
                     // controls are showing: letting this row's natural height
                     // change with `selected-has-monitor`/`selected-is-main` would
                     // feed back into the window's preferred size (now that it's
@@ -208,33 +197,66 @@ export component LayoutStudio inherits Window {
                     // see the comment on `LayoutStudio` above), so the window
                     // would visibly resize every time the selection changes.
                     Rectangle {
-                        height: 100px;
-                        if root.selected-has-monitor && !root.selected-is-main: VerticalLayout {
-                            spacing: Theme.space-xs;
-                            SectionLabel { text: "自動分割"; }
+                        height: 230px;
+                        if root.selected-has-monitor: VerticalLayout {
+                            spacing: Theme.space-sm;
+                            alignment: start;
+
+                            GlassButton {
+                                text: root.selected-is-main ? "メイン画面から外す" : "メイン画面に登録する";
+                                primary: !root.selected-is-main && !root.selected-excluded;
+                                enabled: !root.selected-excluded;
+                                clicked => { root.toggle-main-requested(); }
+                            }
+
                             HorizontalLayout {
                                 spacing: Theme.space-xs;
-                                GlassButton {
-                                    text: "1分割";
-                                    primary: root.selected-auto-split == 1;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 1); }
+                                GlassCheckbox {
+                                    checked: root.selected-excluded;
+                                    enabled: !root.selected-is-main;
+                                    toggled => { root.toggle-excluded-requested(); }
                                 }
-                                GlassButton {
-                                    text: "2分割";
-                                    primary: root.selected-auto-split == 2;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 2); }
-                                }
-                                GlassButton {
-                                    text: "4分割";
-                                    primary: root.selected-auto-split == 4;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 4); }
+                                Text {
+                                    text: "RepoDeckの操作対象にしない";
+                                    font-size: 12px;
+                                    color: root.selected-is-main ? Theme.text-tertiary : Theme.text-secondary;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
                                 }
                             }
-                            Text {
-                                text: "固定枠の割当はワークセット登録後に利用できます。";
-                                font-size: 10px;
-                                color: Theme.text-tertiary;
-                                wrap: word-wrap;
+
+                            if !root.selected-is-main && !root.selected-excluded: VerticalLayout {
+                                spacing: Theme.space-xs;
+                                SectionLabel { text: "自動分割"; }
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    GlassButton {
+                                        text: "自動";
+                                        primary: root.selected-auto-split == 0;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 0); }
+                                    }
+                                    GlassButton {
+                                        text: "1";
+                                        primary: root.selected-auto-split == 1;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 1); }
+                                    }
+                                    GlassButton {
+                                        text: "2";
+                                        primary: root.selected-auto-split == 2;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 2); }
+                                    }
+                                    GlassButton {
+                                        text: "4";
+                                        primary: root.selected-auto-split == 4;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 4); }
+                                    }
+                                }
+                                Text {
+                                    text: "「自動」は解像度から分割数を決めます。固定枠の割当はワークセット登録後に利用できます。";
+                                    font-size: 10px;
+                                    color: Theme.text-tertiary;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }

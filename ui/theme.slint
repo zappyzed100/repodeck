@@ -28,6 +28,13 @@ export global Theme {
     // translucent overlays below, and the DWM backdrop blur itself where
     // the user has that setting on — not from seeing through the cards.
     out property <color> glass-base: rgba(13, 13, 16, 1.0);
+    // Quick Switcher backdrop variant, used only while Windows' own
+    // "Transparency effects" setting is on (checked at startup in
+    // `app::transparency_effects_enabled`): DWM then blurs everything behind
+    // the window, so alpha < 1.0 reads as frosted glass rather than the
+    // ghosted, overlapping text documented above. With the setting off the
+    // window falls back to the opaque glass-base.
+    out property <color> glass-base-translucent: rgba(13, 13, 16, 0.60);
     out property <color> glass-panel: rgba(22, 22, 27, 1.0);
     out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
     out property <color> glass-panel-strong: rgba(0, 0, 0, 0.90);
@@ -119,6 +126,7 @@ export component GlassButton inherits Rectangle {
 // Small glass checkbox used in candidate/window lists.
 export component GlassCheckbox inherits Rectangle {
     in property <bool> checked: false;
+    in property <bool> enabled: true;
     callback toggled();
 
     width: 18px;
@@ -127,6 +135,7 @@ export component GlassCheckbox inherits Rectangle {
     background: checked ? Theme.accent : Theme.glass-panel-soft;
     border-width: 1px;
     border-color: checked ? Theme.accent : Theme.hairline-bright;
+    opacity: root.enabled ? 1.0 : 0.42;
     animate background { duration: Theme.duration-fast; easing: ease-out; }
 
     if checked: Text {
@@ -139,6 +148,7 @@ export component GlassCheckbox inherits Rectangle {
     }
 
     TouchArea {
+        enabled: root.enabled;
         clicked => { root.toggled(); }
     }
 }

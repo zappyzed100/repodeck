@@ -8,7 +8,7 @@ use crate::application::layout_service::auto_split_cells;
 use crate::application::monitor_resolution::{
     find_live_monitor_by_stable_id, sort_monitors_reading_order,
 };
-use crate::domain::monitor::{AutoSplit, SavedMonitor};
+use crate::domain::monitor::SavedMonitor;
 use crate::domain::placement::PixelRect;
 use crate::domain::workset::{FixedParkingSlot, ParkingPolicy, Workset};
 use crate::windowing::monitor::MonitorInfo;
@@ -108,8 +108,15 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         };
         fixed_cells.insert(parking_slot_id.clone());
 
+        // An excluded monitor is treated like a missing one (PLAN.md §4.6's
+        // 「固定先モニター切断」): the workset is minimized, never parked there.
+        let slot_monitor_excluded = input
+            .saved_monitors
+            .iter()
+            .any(|s| s.stable_id == slot.monitor_id && s.excluded);
         let assignment = match find_live_monitor_by_stable_id(input.live_monitors, &slot.monitor_id)
         {
+            _ if slot_monitor_excluded => ParkAssignment::Minimized,
             None => ParkAssignment::Minimized,
             Some(monitor) => {
                 let cells = auto_split_cells(monitor.work_area_px, slot.grid);
@@ -125,11 +132,18 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         assignments.insert(workset.id, assignment);
     }
 
-    // Cell enumeration (§4.4 steps 1-2): non-main monitors, reading order.
+    // Cell enumeration (§4.4 steps 1-2): non-main, non-excluded monitors,
+    // reading order.
     let mut non_main_monitors: Vec<MonitorInfo> = input
         .live_monitors
         .iter()
         .filter(|m| !input.main_monitor_ids.iter().any(|id| id == &m.device_name))
+        .filter(|m| {
+            !input
+                .saved_monitors
+                .iter()
+                .any(|s| s.stable_id == m.device_name && s.excluded)
+        })
         .cloned()
         .collect();
     sort_monitors_reading_order(&mut non_main_monitors);
@@ -140,8 +154,10 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
             .saved_monitors
             .iter()
             .find(|s| s.stable_id == monitor.device_name)
-            .map(|s| s.auto_split)
-            .unwrap_or(AutoSplit::One);
+            .and_then(|s| s.auto_split)
+            .unwrap_or_else(|| {
+                crate::application::layout_service::resolve_auto_split(monitor.work_area_px)
+            });
         for (cell_index, rect) in auto_split_cells(monitor.work_area_px, split)
             .into_iter()
             .enumerate()
@@ -228,6 +244,7 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::monitor::AutoSplit;
 
     fn monitor(device_name: &str, x: i32, work_width: i32) -> MonitorInfo {
         MonitorInfo {
@@ -251,7 +268,8 @@ mod tests {
             work_area_px: PixelRect::new(0, 0, 1920, 1080),
             dpi_x: 96,
             dpi_y: 96,
-            auto_split: split,
+            auto_split: Some(split),
+            excluded: false,
         }
     }
 
@@ -266,6 +284,7 @@ mod tests {
             sort_order,
             direct_hotkey: None,
             parking_policy: ParkingPolicy::Auto,
+            fullscreen_when_parked: false,
             windows: Vec::new(),
             created_at: "2026-07-20T00:00:00Z".to_string(),
             updated_at: "2026-07-20T00:00:00Z".to_string(),

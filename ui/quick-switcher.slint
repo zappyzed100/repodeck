@@ -31,6 +31,9 @@ export component QuickSwitcher inherits Window {
     in property <string> filter-text: "";
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
+    // True only while Windows' "Transparency effects" setting is on — see
+    // `glass-base-translucent` in theme.slint for why this is gated.
+    in property <bool> translucent: false;
 
     callback key-text-input(text: string);
     callback filter-backspace-requested();
@@ -44,7 +47,7 @@ export component QuickSwitcher inherits Window {
         y: 0;
         width: root.width;
         height: root.height;
-        background: Theme.glass-base;
+        background: root.translucent ? Theme.glass-base-translucent : Theme.glass-base;
         border-width: 1px;
         border-color: Theme.hairline-bright;
         border-radius: Theme.radius-lg;
@@ -106,6 +109,30 @@ export component QuickSwitcher inherits Window {
                             font-size: 13px;
                             vertical-alignment: center;
                         }
+                    }
+                }
+
+                close-button := Rectangle {
+                    width: 32px;
+                    border-radius: Theme.radius-md;
+                    background: close-touch.pressed || close-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                    // Uses "×" (U+00D7), which Segoe UI Variable Text includes,
+                    // rather than "✕" (U+2715) which the font lacks and renders as
+                    // a tofu box.
+                    Text {
+                        text: "×";
+                        color: Theme.text-secondary;
+                        font-size: 20px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    close-touch := TouchArea {
+                        clicked => { root.close-requested(); }
                     }
                 }
             }

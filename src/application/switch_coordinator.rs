@@ -338,7 +338,17 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                             .collect();
                         self.window_ops
                             .batch_move(&moves)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        // "退避後に全画面表示": maximize each window on the parking
+                        // monitor it was just placed on (PLAN.md §2.4 extension).
+                        // The batch_move above put each window's center on the
+                        // parking monitor, so `maximize` fills that monitor.
+                        if workset.fullscreen_when_parked {
+                            for w in resolved {
+                                self.window_ops.maximize(w.hwnd);
+                            }
+                        }
+                        Ok(())
                     }
                 }
             }
@@ -514,6 +524,7 @@ mod tests {
             sort_order,
             direct_hotkey: None,
             parking_policy,
+            fullscreen_when_parked: false,
             windows,
             created_at: "2026-07-20T00:00:00Z".to_string(),
             updated_at: "2026-07-20T00:00:00Z".to_string(),
@@ -624,7 +635,8 @@ mod tests {
             work_area_px: side.work_area_px,
             dpi_x: 96,
             dpi_y: 96,
-            auto_split: AutoSplit::One,
+            auto_split: Some(AutoSplit::One),
+            excluded: false,
         }];
         let main_monitor_ids = vec!["MAIN".to_string()];
 
@@ -952,7 +964,8 @@ mod tests {
             work_area_px: side.work_area_px,
             dpi_x: 96,
             dpi_y: 96,
-            auto_split: AutoSplit::TwoColumns,
+            auto_split: Some(AutoSplit::TwoColumns),
+            excluded: false,
         }];
         let main_monitor_ids = vec!["MAIN".to_string()];
 

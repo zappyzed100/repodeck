@@ -27,6 +27,12 @@ pub struct Workset {
     pub sort_order: i32,
     pub direct_hotkey: Option<HotkeyConfig>,
     pub parking_policy: ParkingPolicy,
+    /// When `true`, this workset's windows are maximized on their parking
+    /// monitor after being parked (PLAN.md §2.4 extension) — e.g. a video kept
+    /// full-screen on a secondary monitor while another set is on the main
+    /// screen. `#[serde(default)]` keeps pre-existing configs loadable.
+    #[serde(default)]
+    pub fullscreen_when_parked: bool,
     pub windows: Vec<ManagedWindow>,
     /// RFC 3339 UTC timestamp.
     pub created_at: String,

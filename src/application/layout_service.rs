@@ -62,6 +62,20 @@ pub fn project_monitors_to_canvas(
         .collect()
 }
 
+/// Picks a concrete split for a monitor whose `auto_split` is unset —
+/// 「自動」, the default for newly seen monitors: 4K-class work areas take
+/// four parked windows comfortably, wide QHD-class areas two columns, and
+/// anything smaller (or portrait) stays whole.
+pub fn resolve_auto_split(work_area: PixelRect) -> AutoSplit {
+    if work_area.width >= 3400 && work_area.height >= 1700 {
+        AutoSplit::FourGrid
+    } else if work_area.width >= 2200 && work_area.width > work_area.height {
+        AutoSplit::TwoColumns
+    } else {
+        AutoSplit::One
+    }
+}
+
 /// Splits `work_area` into the grid cells implied by `split` (PLAN.md §4.4):
 /// `One` is the whole area, `TwoColumns` splits left/right, `FourGrid` splits
 /// into four quadrants. Cell order is stable (reading order: left-to-right,
@@ -233,6 +247,26 @@ mod tests {
         assert_eq!(cells.len(), 4);
         let bounds = bounding_rect(&cells).unwrap();
         assert_eq!(bounds, area, "quadrants exactly tile the source area");
+    }
+
+    #[test]
+    fn resolve_auto_split_picks_split_by_work_area_size() {
+        let cases = [
+            (PixelRect::new(0, 0, 3840, 2160), AutoSplit::FourGrid),
+            (PixelRect::new(0, 0, 2560, 1440), AutoSplit::TwoColumns),
+            (PixelRect::new(0, 0, 1920, 1080), AutoSplit::One),
+            // Portrait stays whole even at high resolution.
+            (PixelRect::new(0, 0, 1440, 2560), AutoSplit::One),
+        ];
+        for (area, expected) in cases {
+            assert_eq!(
+                resolve_auto_split(area),
+                expected,
+                "work area {}x{}",
+                area.width,
+                area.height
+            );
+        }
     }
 
     #[test]

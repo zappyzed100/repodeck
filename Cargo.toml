@@ -38,6 +38,7 @@ resvg = "0.47"
 [dependencies.windows]
 version = "0.62"
 features = [
+  "Win32_Devices_Display",
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
@@ -48,6 +49,7 @@ features = [
   "Win32_System_IO",
   "Win32_System_Memory",
   "Win32_System_Pipes",
+  "Win32_System_Power",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",

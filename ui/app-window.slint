@@ -1,4 +1,4 @@
-import { ComboBox, ScrollView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
@@ -27,18 +27,14 @@ export component AppWindow inherits Window {
     background: transparent;
     default-font-family: Theme.font-text;
 
-    in-out property <bool> hotkey-ctrl: true;
-    in-out property <bool> hotkey-alt: true;
-    in-out property <bool> hotkey-shift: false;
-    in-out property <bool> hotkey-win: false;
-    in property <[string]> hotkey-key-choices: [];
-    in-out property <string> hotkey-key-choice: "R";
-    // Kept in sync with `hotkey-key-choice` from Rust: `ComboBox`'s own
-    // `current-value: root.model[root.current-index]` default binding on
-    // `current-index` otherwise keeps winning over a plain `set_hotkey_key_choice(...)`
-    // call from the Rust side, visually showing `model[0]` instead of the
-    // value that was just set.
-    in-out property <int> hotkey-key-index: 0;
+    // 現在のホットキーの読み取り専用表示 ("Ctrl+Alt+W" など)。保存済み
+    // 設定からRust側が組み立てて渡す。
+    in property <string> hotkey-display: "";
+    // キャプチャモード。「キーを入力して登録」ボタンで開始し、Escなら
+    // Slint側が、登録成功ならRust側がfalseへ戻す。無効な入力 (修飾キー
+    // なしの通常キーなど) のときはRust側が警告表示だけしてtrueのまま
+    // 維持し、続けて入力し直せる。
+    in-out property <bool> hotkey-capturing: false;
     in property <string> hotkey-status-text: "";
     in property <bool> hotkey-status-is-warning: false;
 
@@ -57,7 +53,12 @@ export component AppWindow inherits Window {
     in property <string> autostart-status-text: "";
     in property <bool> autostart-status-is-warning: false;
 
-    callback hotkey-rebind-requested();
+    // キャプチャ開始 (Rust側は前回のステータス表示をクリアするだけ)。
+    callback hotkey-capture-started();
+    // キャプチャ中に修飾キー以外のキーが押された。押下時点で保持されて
+    // いた修飾キーとともにRust側で検証し、従来どおりの保存→登録→
+    // ロールバック経路 (PLAN.md §13 Phase 7 checklist item 4) に流す。
+    callback hotkey-captured(ctrl: bool, alt: bool, shift: bool, meta: bool, key-text: string);
     callback open-layout-studio-requested();
     callback open-workset-manager-requested();
     callback codex-check-hook-exe-requested();
@@ -67,6 +68,16 @@ export component AppWindow inherits Window {
     callback open-third-party-notices-requested();
     callback start-with-windows-toggled(bool);
 
+    // 修飾キー単独の押下 (Ctrl/Alt/Shift/Win いずれかのキー自体) か。
+    // キャプチャ中はこれらを無視して「修飾キー以外のキー」を待つ。
+    pure function is-modifier-key(text: string) -> bool {
+        return text == Key.Shift || text == Key.ShiftR
+            || text == Key.Control || text == Key.ControlR
+            || text == Key.Alt || text == Key.AltGr
+            || text == Key.Meta || text == Key.MetaR
+            || text == Key.CapsLock;
+    }
+
     Rectangle {
         // The glass card: everything visible sits on this opaque layer, so
         // text stays legible whether or not the OS is compositing a real
@@ -74,6 +85,46 @@ export component AppWindow inherits Window {
         background: Theme.glass-base;
         border-width: 1px;
         border-color: Theme.hairline-bright;
+
+        // ホットキーのキャプチャ用 (PLAN.md §13 Phase 7 checklist item 4,
+        // "ホットキー設定UI")。画面上には何も描画せず、キャプチャモード中
+        // だけフォーカスを持ってキーイベントを消費する。
+        hotkey-capture-scope := FocusScope {
+            x: 0;
+            y: 0;
+            width: 0;
+            height: 0;
+            enabled: root.hotkey-capturing;
+
+            // フォーカスが外れたまま「入力待ち…」で固まらないよう、
+            // フォーカス喪失はキャンセル扱いにする。
+            focus-changed-event => {
+                if (!self.has-focus && root.hotkey-capturing) {
+                    root.hotkey-capturing = false;
+                }
+            }
+
+            key-pressed(event) => {
+                if (!root.hotkey-capturing) {
+                    return reject;
+                }
+                if (event.text == Key.Escape) {
+                    root.hotkey-capturing = false;
+                    return accept;
+                }
+                if (root.is-modifier-key(event.text)) {
+                    // 修飾キーだけではまだ組み合わせが決まらない。
+                    return accept;
+                }
+                root.hotkey-captured(
+                    event.modifiers.control,
+                    event.modifiers.alt,
+                    event.modifiers.shift,
+                    event.modifiers.meta,
+                    event.text);
+                return accept;
+            }
+        }
 
         VerticalLayout {
             padding: Theme.space-lg;
@@ -101,53 +152,22 @@ export component AppWindow inherits Window {
 
             SectionLabel { text: "クイックスイッチャーのホットキー"; }
 
-            HorizontalLayout {
-                spacing: Theme.space-sm;
-
-                HorizontalLayout {
-                    spacing: 4px;
-                    GlassCheckbox {
-                        checked: root.hotkey-ctrl;
-                        toggled => { root.hotkey-ctrl = !root.hotkey-ctrl; }
-                    }
-                    Text { text: "Ctrl"; vertical-alignment: center; color: Theme.text-secondary; }
-                }
-                HorizontalLayout {
-                    spacing: 4px;
-                    GlassCheckbox {
-                        checked: root.hotkey-alt;
-                        toggled => { root.hotkey-alt = !root.hotkey-alt; }
-                    }
-                    Text { text: "Alt"; vertical-alignment: center; color: Theme.text-secondary; }
-                }
-                HorizontalLayout {
-                    spacing: 4px;
-                    GlassCheckbox {
-                        checked: root.hotkey-shift;
-                        toggled => { root.hotkey-shift = !root.hotkey-shift; }
-                    }
-                    Text { text: "Shift"; vertical-alignment: center; color: Theme.text-secondary; }
-                }
-                HorizontalLayout {
-                    spacing: 4px;
-                    GlassCheckbox {
-                        checked: root.hotkey-win;
-                        toggled => { root.hotkey-win = !root.hotkey-win; }
-                    }
-                    Text { text: "Win"; vertical-alignment: center; color: Theme.text-secondary; }
-                }
-
-                ComboBox {
-                    model: root.hotkey-key-choices;
-                    current-value <=> root.hotkey-key-choice;
-                    current-index <=> root.hotkey-key-index;
-                }
+            Text {
+                text: "現在のホットキー: " + root.hotkey-display;
+                font-size: 12px;
+                color: Theme.text-secondary;
             }
 
             GlassButton {
-                text: "ホットキーを保存";
+                text: root.hotkey-capturing ? "入力待ち… (Escでキャンセル)" : "キーを入力して登録";
                 primary: true;
-                clicked => { root.hotkey-rebind-requested(); }
+                clicked => {
+                    if (!root.hotkey-capturing) {
+                        root.hotkey-capturing = true;
+                        hotkey-capture-scope.focus();
+                        root.hotkey-capture-started();
+                    }
+                }
             }
 
             if root.hotkey-status-text != "": Text {
@@ -323,6 +343,11 @@ export component TrayIcon inherits SystemTrayIcon {
             activated => { root.recover-all-requested(); }
         }
 
+        MenuItem {
+            title: "モニターを再検出";
+            activated => { root.reconnect-monitors-requested(); }
+        }
+
         MenuSeparator { }
 
         MenuItem {
@@ -349,6 +374,7 @@ export component TrayIcon inherits SystemTrayIcon {
     callback register-workset-requested();
     callback empty-main-screen-requested();
     callback recover-all-requested();
+    callback reconnect-monitors-requested();
     callback settings-requested();
     callback open-log-folder-requested();
     callback quit-requested();

@@ -28,7 +28,7 @@ Code extension lifecycle hooks to show each workset's Codex agent status
 2. Right-click the tray icon → "新しいセットを登録" (Register a new workset) to
    register the folder/windows you currently have open as a workset
 3. Register a second workset the same way, from a different folder
-4. Press `Ctrl+Alt+R` (the default hotkey) to open the Quick Switcher
+4. Press `Ctrl+Alt+W` (the default hotkey) to open the Quick Switcher
 5. Both registered worksets are listed — click one, or press a number key
    (`1`, `2`, ...) to switch. The windows of whichever workset isn't selected
    are automatically parked (minimized or moved to a reserved slot)
@@ -47,19 +47,33 @@ maximized state) is captured.
 
 ### Quick Switcher
 
-- Default hotkey: `Ctrl+Alt+R` (changeable in Settings)
+- Default hotkey: `Ctrl+Alt+W` (changeable in Settings)
 - Toggle visibility with the hotkey or a left-click on the tray icon
 - Type to filter by workset name or repository path
 - Up/Down + Enter, number keys (`1`-`9`) for direct switching, or click a row
-- Esc closes it; it can also be set to close automatically on focus loss
+- **Hold-to-switch (Alt+Tab style)**: hold the hotkey's modifiers and tap
+  `Up`/`Down` to open the switcher and move the selection; release the
+  modifiers to switch to the selected workset and close (by default, hold
+  `Ctrl+Alt` and tap `Up`/`Down`)
+- Esc or the ✕ button closes it; it can also close automatically on focus loss
+
+### Monitor auto-reconnect
+
+If a monitor isn't recognized after the PC resumes from sleep, RepoDeck attempts a
+software display re-detect (on by default). Trigger it manually any time from the
+tray menu's "モニターを再検出". It never requests admin rights and, on failure,
+restores the display configuration it captured beforehand.
 
 ### Settings window
 
 Open it from the tray menu's "設定" (Settings).
 
-- **Hotkey**: pick modifier keys (Ctrl/Alt/Shift/Win) and a key, then save. If
-  it conflicts with another app, RepoDeck automatically rolls back to the
-  previous hotkey and tells you so
+- **Hotkey**: defaults to `Ctrl+Alt+W`. Click "キーを入力して登録" (press a key
+  to record) and simply press the combination you want — any mix of modifiers
+  (Ctrl/Alt/Shift/Win) with letters, digits, function keys, arrows and more
+  (function keys may also be registered on their own). If it conflicts with
+  another app, RepoDeck automatically rolls back to the previous hotkey and
+  tells you so
 - **Codex連携** (Codex integration): see below
 - **起動設定** (Startup): toggle whether RepoDeck starts automatically with
   Windows

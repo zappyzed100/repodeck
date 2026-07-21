@@ -36,5 +36,15 @@ pub struct SavedMonitor {
     pub work_area_px: PixelRect,
     pub dpi_x: u32,
     pub dpi_y: u32,
-    pub auto_split: AutoSplit,
+    /// `None` means 「自動」: the split is picked from the monitor's work
+    /// area at allocation time (`layout_service::resolve_auto_split`).
+    /// Pre-existing configs with a concrete value keep behaving as an
+    /// explicit manual choice.
+    #[serde(default)]
+    pub auto_split: Option<AutoSplit>,
+    /// 「RepoDeckの操作対象にしない」: an excluded monitor is never used as
+    /// a parking target and cannot be a main monitor. Defaults to `false`
+    /// so configs saved before this field existed keep their behavior.
+    #[serde(default)]
+    pub excluded: bool,
 }
