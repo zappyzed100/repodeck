@@ -14,6 +14,9 @@ use crate::domain::placement::SavedPlacement;
 pub enum RepositoryKind {
     Git,
     Directory,
+    /// A VS Code multi-root workspace file (`*.code-workspace`); the
+    /// `repository_path` points at the file itself.
+    Workspace,
 }
 
 /// One repository/project's set of managed top-level windows (PLAN.md §2.1).

@@ -1,5 +1,5 @@
 import { ScrollView, LineEdit } from "std-widgets.slint";
-import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
+import { GlassButton, GlassCheckbox, StatusBanner, Theme } from "theme.slint";
 
 export struct MonitorTile {
     x: length,
@@ -328,11 +328,9 @@ export component LayoutStudio inherits Window {
         }
 
         // --- Status bar ---
-        Text {
+        StatusBanner {
             text: root.status-text;
-            font-size: 12px;
-            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
-            wrap: word-wrap;
+            is-warning: root.status-is-warning;
         }
     }
 

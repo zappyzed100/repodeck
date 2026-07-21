@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::domain::placement::{PixelRect, SavedPlacement, SavedShowState, normalize};
@@ -38,6 +39,70 @@ pub fn resolve_repository(picked_folder: &Path) -> (PathBuf, RepositoryKind) {
         Some(git_root) => (git_root, RepositoryKind::Git),
         None => (picked_folder.to_path_buf(), RepositoryKind::Directory),
     }
+}
+
+/// Just the piece of a VS Code `.code-workspace` file (its multi-root
+/// workspace format) this module needs: the listed folders' `path` entries.
+/// Other top-level keys (`settings`, `extensions`, ...) are ignored by
+/// serde's default behavior.
+#[derive(Deserialize)]
+struct CodeWorkspaceFile {
+    folders: Vec<CodeWorkspaceFolder>,
+}
+
+#[derive(Deserialize)]
+struct CodeWorkspaceFolder {
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceFileError {
+    #[error("ワークスペースファイルを読み込めません")]
+    ReadFailed,
+    #[error("ワークスペースファイルの形式が不正です（.code-workspaceのJSONとして解釈できません）")]
+    ParseFailed,
+    #[error("ワークスペースファイルにフォルダーが1つも定義されていません")]
+    NoFolders,
+}
+
+/// Resolves a `.code-workspace` file's first listed folder to an absolute
+/// path (PLAN.md §3.6 workspace-file support). A relative `path` entry is
+/// resolved against the workspace file's own parent directory, matching VS
+/// Code's own resolution rule. Multi-root workspaces with more than one
+/// folder use only the first — a workset tracks one repository, not a set.
+pub fn resolve_workspace_file(workspace_path: &Path) -> Result<PathBuf, WorkspaceFileError> {
+    let contents =
+        std::fs::read_to_string(workspace_path).map_err(|_| WorkspaceFileError::ReadFailed)?;
+    let parsed: CodeWorkspaceFile =
+        serde_json::from_str(&contents).map_err(|_| WorkspaceFileError::ParseFailed)?;
+    let first = parsed
+        .folders
+        .first()
+        .ok_or(WorkspaceFileError::NoFolders)?;
+    let folder_path = PathBuf::from(&first.path);
+    if folder_path.is_absolute() {
+        Ok(folder_path)
+    } else {
+        let parent = workspace_path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(parent.join(folder_path))
+    }
+}
+
+/// Resolves the directory a workset should be matched against for agent
+/// cwd-correlation (`agent_status_service::map_event_to_workset`,
+/// PLAN.md §6.6). A `RepositoryKind::Workspace` workset's `repository_path`
+/// points at the `.code-workspace` file itself (not a directory it could be
+/// compared against a hook's `cwd`), so its first folder entry is parsed out
+/// here. If the file can no longer be read (moved/deleted since
+/// registration), falls back to the literal `repository_path` — matching
+/// then simply never succeeds rather than panicking.
+pub fn resolve_match_path(repository_path: &Path, repository_kind: RepositoryKind) -> PathBuf {
+    if repository_kind == RepositoryKind::Workspace
+        && let Ok(folder) = resolve_workspace_file(repository_path)
+    {
+        return folder;
+    }
+    repository_path.to_path_buf()
 }
 
 /// Whether `candidate_path` is already registered under an existing workset
@@ -230,6 +295,120 @@ mod tests {
         let (path, kind) = resolve_repository(&plain);
         assert_eq!(path, plain);
         assert_eq!(kind, RepositoryKind::Directory);
+    }
+
+    #[test]
+    fn resolve_workspace_file_reads_the_first_folders_absolute_path() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(
+            &ws_path,
+            format!(
+                r#"{{"folders": [{{"name": "proj", "path": "{}"}}], "settings": {{}}}}"#,
+                repo.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_workspace_file(&ws_path).unwrap(), repo);
+    }
+
+    #[test]
+    fn resolve_workspace_file_resolves_a_relative_path_against_its_own_parent() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": [{"path": "repo"}]}"#).unwrap();
+
+        assert_eq!(resolve_workspace_file(&ws_path).unwrap(), repo);
+    }
+
+    #[test]
+    fn resolve_workspace_file_uses_only_the_first_of_multiple_folders() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(
+            &ws_path,
+            r#"{"folders": [{"path": "first"}, {"path": "second"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path).unwrap(),
+            dir.path().join("first")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_a_workspace_with_no_folders() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("empty.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": []}"#).unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path),
+            Err(WorkspaceFileError::NoFolders)
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_invalid_json() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("broken.code-workspace");
+        std::fs::write(&ws_path, "not json at all").unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path),
+            Err(WorkspaceFileError::ParseFailed)
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.code-workspace");
+
+        assert_eq!(
+            resolve_workspace_file(&missing),
+            Err(WorkspaceFileError::ReadFailed)
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_resolves_a_workspace_kind_to_its_underlying_folder() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": [{"path": "repo"}]}"#).unwrap();
+
+        assert_eq!(
+            resolve_match_path(&ws_path, RepositoryKind::Workspace),
+            repo
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_falls_back_to_the_literal_path_when_the_workspace_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.code-workspace");
+
+        assert_eq!(
+            resolve_match_path(&missing, RepositoryKind::Workspace),
+            missing
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_returns_non_workspace_kinds_unchanged() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+
+        assert_eq!(resolve_match_path(&repo, RepositoryKind::Git), repo);
+        assert_eq!(resolve_match_path(&repo, RepositoryKind::Directory), repo);
     }
 
     fn monitor(device_name: &str, bounds: PixelRect) -> MonitorInfo {

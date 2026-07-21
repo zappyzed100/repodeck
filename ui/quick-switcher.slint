@@ -28,15 +28,17 @@ export component QuickSwitcher inherits Window {
 
     in property <[QuickSwitcherRow]> rows: [];
     in-out property <int> selected-index: 0;
-    in property <string> filter-text: "";
+    in-out property <string> filter-text: "";
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
     // True only while Windows' "Transparency effects" setting is on — see
     // `glass-base-translucent` in theme.slint for why this is gated.
     in property <bool> translucent: false;
 
-    callback key-text-input(text: string);
-    callback filter-backspace-requested();
+    // Fires on every edit of the search field, including IME (Japanese) commits —
+    // a real `TextInput` is used instead of manual key capture precisely so
+    // composed input works.
+    callback filter-changed(text: string);
     callback switch-requested(workset-id: string);
     callback recover-requested();
     callback settings-requested();
@@ -53,40 +55,9 @@ export component QuickSwitcher inherits Window {
         border-radius: Theme.radius-lg;
     }
 
-    forward-focus: key-handler;
+    forward-focus: search-input;
 
-    key-handler := FocusScope {
-        key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                root.close-requested();
-                return accept;
-            }
-            if (event.text == Key.UpArrow) {
-                root.selected-index = Math.max(0, root.selected-index - 1);
-                return accept;
-            }
-            if (event.text == Key.DownArrow) {
-                root.selected-index = Math.min(root.rows.length - 1, root.selected-index + 1);
-                return accept;
-            }
-            if (event.text == Key.Return) {
-                if (root.rows.length > 0) {
-                    root.switch-requested(root.rows[root.selected-index].workset-id);
-                }
-                return accept;
-            }
-            if (event.modifiers.control && event.text == ",") {
-                root.settings-requested();
-                return accept;
-            }
-            if (event.text == Key.Backspace) {
-                root.filter-backspace-requested();
-                return accept;
-            }
-            return root.key-jump-or-filter(event);
-        }
-
-        VerticalLayout {
+    VerticalLayout {
             padding: Theme.space-md;
             spacing: Theme.space-sm;
 
@@ -98,16 +69,54 @@ export component QuickSwitcher inherits Window {
                     background: Theme.glass-panel-soft;
                     border-width: 1px;
                     border-color: Theme.hairline;
+                    clip: true;
 
-                    HorizontalLayout {
-                        padding-left: Theme.space-sm;
-                        padding-right: Theme.space-sm;
-                        alignment: start;
-                        Text {
-                            text: root.filter-text == "" ? "検索…" : root.filter-text;
-                            color: root.filter-text == "" ? Theme.text-tertiary : Theme.text-primary;
-                            font-size: 13px;
-                            vertical-alignment: center;
+                    // Placeholder shown behind the input when it's empty.
+                    if root.filter-text == "": Text {
+                        x: Theme.space-sm;
+                        text: "検索…";
+                        color: Theme.text-tertiary;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    // A real `TextInput` (not manual key capture) so IME /
+                    // Japanese input works. Navigation keys are intercepted in
+                    // `key-pressed`; everything else falls through to normal
+                    // editing and composition.
+                    search-input := TextInput {
+                        x: Theme.space-sm;
+                        width: parent.width - 2 * Theme.space-sm;
+                        text <=> root.filter-text;
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        single-line: true;
+                        edited => { root.filter-changed(self.text); }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.close-requested();
+                                return accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                root.selected-index = Math.max(0, root.selected-index - 1);
+                                return accept;
+                            }
+                            if (event.text == Key.DownArrow) {
+                                root.selected-index = Math.min(root.rows.length - 1, root.selected-index + 1);
+                                return accept;
+                            }
+                            if (event.text == Key.Return) {
+                                if (root.rows.length > 0) {
+                                    root.switch-requested(root.rows[root.selected-index].workset-id);
+                                }
+                                return accept;
+                            }
+                            if (event.modifiers.control && event.text == ",") {
+                                root.settings-requested();
+                                return accept;
+                            }
+                            return reject;
                         }
                     }
                 }
@@ -248,33 +257,5 @@ export component QuickSwitcher inherits Window {
                     clicked => { root.recover-requested(); }
                 }
             }
-        }
-    }
-
-    // Split out from `key-pressed` above: Slint's compiler blows its own
-    // stack on a `key-pressed` body with too many sequential top-level `if`
-    // statements (empirically confirmed around 12+ on this toolchain, filed
-    // as a real compiler limitation rather than a bug in this code) — moving
-    // the digit-jump/text-filter branch into its own `function` keeps each
-    // individual callback/function body short enough to compile.
-    function key-jump-or-filter(event: KeyEvent) -> EventResult {
-        if (event.text == "1" && root.rows.length >= 1) { root.switch-requested(root.rows[0].workset-id); return accept; }
-        if (event.text == "2" && root.rows.length >= 2) { root.switch-requested(root.rows[1].workset-id); return accept; }
-        if (event.text == "3" && root.rows.length >= 3) { root.switch-requested(root.rows[2].workset-id); return accept; }
-        if (event.text == "4" && root.rows.length >= 4) { root.switch-requested(root.rows[3].workset-id); return accept; }
-        if (event.text == "5" && root.rows.length >= 5) { root.switch-requested(root.rows[4].workset-id); return accept; }
-        return root.key-jump-or-filter-2(event);
-    }
-
-    function key-jump-or-filter-2(event: KeyEvent) -> EventResult {
-        if (event.text == "6" && root.rows.length >= 6) { root.switch-requested(root.rows[5].workset-id); return accept; }
-        if (event.text == "7" && root.rows.length >= 7) { root.switch-requested(root.rows[6].workset-id); return accept; }
-        if (event.text == "8" && root.rows.length >= 8) { root.switch-requested(root.rows[7].workset-id); return accept; }
-        if (event.text == "9" && root.rows.length >= 9) { root.switch-requested(root.rows[8].workset-id); return accept; }
-        if (event.text.character-count == 1 && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta) {
-            root.key-text-input(event.text);
-            return accept;
-        }
-        return reject;
     }
 }

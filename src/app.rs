@@ -1061,6 +1061,54 @@ impl WorksetManagerState {
     }
 }
 
+/// Distinct workset colors offered at registration. A workset's color is its
+/// at-a-glance identity, so already-used ones are filtered out of the choices.
+const WORKSET_PALETTE: [&str; 16] = [
+    "#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#db2777", "#65a30d",
+    "#ea580c", "#4f46e5", "#0d9488", "#9333ea", "#ca8a04", "#e11d48", "#0ea5e9", "#f43f5e",
+];
+
+/// Sets the registration color swatches to the palette colors not already used
+/// by an existing workset, and selects the first available one. Falls back to
+/// the full palette if every color is somehow taken.
+fn refresh_color_choices(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &mut WorksetManagerState,
+) {
+    let used: std::collections::HashSet<String> = config
+        .worksets
+        .iter()
+        .map(|w| w.color.to_ascii_lowercase())
+        .collect();
+    let available: Vec<&str> = WORKSET_PALETTE
+        .iter()
+        .copied()
+        .filter(|c| !used.contains(&c.to_ascii_lowercase()))
+        .collect();
+    let list: Vec<&str> = if available.is_empty() {
+        WORKSET_PALETTE.to_vec()
+    } else {
+        available
+    };
+    if let Some(first) = list.first() {
+        state.selected_color = hex_to_color(first);
+    }
+    let colors: Vec<slint::Color> = list.iter().map(|c| hex_to_color(c)).collect();
+    manager.set_color_choices(std::rc::Rc::new(slint::VecModel::from(colors)).into());
+    manager.set_selected_color(state.selected_color);
+}
+
+/// Japanese label for a repository kind, shown in the registration screen.
+fn repository_kind_label(kind: crate::domain::workset::RepositoryKind) -> &'static str {
+    use crate::domain::workset::RepositoryKind;
+    match kind {
+        RepositoryKind::Git => "Gitリポジトリ",
+        RepositoryKind::Directory => "通常フォルダー",
+        RepositoryKind::Workspace => "ワークスペース",
+    }
+}
+
 /// Populates the registration screen's 退避先 sub-screen chips from the current
 /// config, clamping the selection back to 自動 if it's out of range.
 fn refresh_parking_subs(
@@ -1208,17 +1256,7 @@ fn wire_workset_manager(
     {
         let mut state = state.borrow_mut();
         refresh_workset_summaries(manager, &config.borrow(), &mut state);
-        manager.set_color_choices(
-            std::rc::Rc::new(slint::VecModel::from(
-                [
-                    "#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2",
-                ]
-                .map(hex_to_color)
-                .to_vec(),
-            ))
-            .into(),
-        );
-        manager.set_selected_color(state.selected_color);
+        refresh_color_choices(manager, &config.borrow(), &mut state);
     }
 
     let m = manager.as_weak();
@@ -1295,6 +1333,8 @@ fn wire_workset_manager(
         // Reset the 退避先 picker to 自動 and refresh the sub-screen chips.
         state.parking_selected_sub = -1;
         refresh_parking_subs(&manager, &config, &mut state);
+        // Offer only colors not already taken by an existing workset.
+        refresh_color_choices(&manager, &config, &mut state);
         manager.set_picked_folder_label("（未選択）".into());
         manager.set_resolved_repo_label("".into());
         manager.set_registering(true);
@@ -1521,18 +1561,63 @@ fn wire_workset_manager(
         }
 
         manager.set_picked_folder_label(folder.display().to_string().into());
-        let kind_label = match repository_kind {
-            crate::domain::workset::RepositoryKind::Git => "Gitリポジトリ",
-            crate::domain::workset::RepositoryKind::Directory => "通常フォルダー",
-        };
         manager.set_resolved_repo_label(
             format!(
-                "{kind_label}として登録されます: {}",
+                "{}として登録されます: {}",
+                repository_kind_label(repository_kind),
                 repository_path.display()
             )
             .into(),
         );
         s.borrow_mut().picked_repository = Some((repository_path, repository_kind));
+        manager.set_status_text("".into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_pick_workspace_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let Some(file) = rfd::FileDialog::new()
+            .add_filter("VS Code ワークスペース", &["code-workspace"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        // Parsed eagerly (not just stored) so a malformed/empty workspace
+        // file is rejected at registration time — otherwise agent cwd
+        // matching (`agent_status_service::map_event_to_workset`) would
+        // silently never succeed for this workset instead of failing loudly
+        // here.
+        let folder = match workset_service::resolve_workspace_file(&file) {
+            Ok(folder) => folder,
+            Err(err) => {
+                manager.set_status_text(err.to_string().into());
+                manager.set_status_is_warning(true);
+                return;
+            }
+        };
+
+        let repository_kind = crate::domain::workset::RepositoryKind::Workspace;
+        if workset_service::is_duplicate_repository(&c.borrow().worksets, &file) {
+            manager.set_status_text("このワークスペースは既に登録されています。".into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        manager.set_picked_folder_label(file.display().to_string().into());
+        manager.set_resolved_repo_label(
+            format!(
+                "{}として登録されます: {}（フォルダー: {}）",
+                repository_kind_label(repository_kind),
+                file.display(),
+                folder.display()
+            )
+            .into(),
+        );
+        s.borrow_mut().picked_repository = Some((file, repository_kind));
         manager.set_status_text("".into());
         manager.set_status_is_warning(false);
     });
@@ -2040,22 +2125,10 @@ fn wire_quick_switcher(
     let s = switcher.as_weak();
     let c = config.clone();
     let d = data_dir.clone();
-    switcher.on_key_text_input(move |text| {
+    switcher.on_filter_changed(move |_text| {
         let Some(switcher) = s.upgrade() else { return };
-        let mut filter = switcher.get_filter_text().to_string();
-        filter.push_str(&text);
-        switcher.set_filter_text(filter.into());
-        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
-    });
-
-    let s = switcher.as_weak();
-    let c = config.clone();
-    let d = data_dir.clone();
-    switcher.on_filter_backspace_requested(move || {
-        let Some(switcher) = s.upgrade() else { return };
-        let mut filter = switcher.get_filter_text().to_string();
-        filter.pop();
-        switcher.set_filter_text(filter.into());
+        // `filter-text` is two-way bound to the TextInput, so it already holds
+        // the new value (including IME-composed text); just re-filter.
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
     });
 

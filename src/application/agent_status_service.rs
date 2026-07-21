@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::application::workset_service::find_git_root;
+use crate::application::workset_service::{self, find_git_root};
 use crate::domain::agent::{AgentRun, AgentState, aggregate_state};
 use crate::domain::workset::Workset;
 use crate::ipc::protocol::{NormalizedEvent, NormalizedEventKind};
@@ -33,19 +33,30 @@ pub struct UnmatchedAgentEvent {
 
 /// Resolves a Codex hook event's `cwd` to a registered workset (PLAN.md
 /// §6.6): an exact match on the git root wins first, then "`event_cwd` is a
-/// subdirectory of a workset's `repository_path`" — checked against the
-/// original `event_cwd`, not just the resolved git root, so a
-/// `RepositoryKind::Directory` workset (no `.git` of its own) still matches.
+/// subdirectory of a workset's match path" — checked against the original
+/// `event_cwd`, not just the resolved git root, so a `RepositoryKind::
+/// Directory` workset (no `.git` of its own) still matches. Both branches
+/// compare against `resolve_match_path`, not the raw `repository_path`,
+/// since a `RepositoryKind::Workspace` workset's `repository_path` points at
+/// its `.code-workspace` file rather than a directory a `cwd` could ever be
+/// "under".
 pub fn map_event_to_workset(worksets: &[Workset], event_cwd: &Path) -> Option<Uuid> {
     if let Some(git_root) = find_git_root(event_cwd)
-        && let Some(workset) = worksets.iter().find(|w| w.repository_path == git_root)
+        && let Some(workset) = worksets.iter().find(|w| {
+            workset_service::resolve_match_path(&w.repository_path, w.repository_kind) == git_root
+        })
     {
         return Some(workset.id);
     }
 
     worksets
         .iter()
-        .find(|w| event_cwd.starts_with(&w.repository_path))
+        .find(|w| {
+            event_cwd.starts_with(workset_service::resolve_match_path(
+                &w.repository_path,
+                w.repository_kind,
+            ))
+        })
         .map(|w| w.id)
 }
 
@@ -251,6 +262,61 @@ mod tests {
         let worksets = [workset_at(&PathBuf::from(r"D:\repos\a"))];
         assert_eq!(
             map_event_to_workset(&worksets, &PathBuf::from(r"D:\repos\b")),
+            None
+        );
+    }
+
+    /// A `RepositoryKind::Workspace` workset's `repository_path` is the
+    /// `.code-workspace` file itself, not a directory — this guards against
+    /// regressing back to comparing `event_cwd` against that literal file
+    /// path (which could never match, since a directory can't "start with" a
+    /// file — the bug this test was added to catch).
+    #[test]
+    fn map_event_to_workset_matches_a_workspace_kind_via_its_underlying_folder() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": [{"path": "repo"}]}"#).unwrap();
+
+        let workset = crate::application::workset_service::build_workset(
+            "test".to_string(),
+            "#fff".to_string(),
+            ws_path,
+            RepositoryKind::Workspace,
+            0,
+            Vec::new(),
+        );
+        let sub = repo.join("src");
+
+        assert_eq!(
+            map_event_to_workset(std::slice::from_ref(&workset), &repo),
+            Some(workset.id)
+        );
+        assert_eq!(
+            map_event_to_workset(std::slice::from_ref(&workset), &sub),
+            Some(workset.id)
+        );
+    }
+
+    #[test]
+    fn map_event_to_workset_ignores_a_workspace_kind_whose_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("gone.code-workspace");
+        let workset = crate::application::workset_service::build_workset(
+            "test".to_string(),
+            "#fff".to_string(),
+            ws_path.clone(),
+            RepositoryKind::Workspace,
+            0,
+            Vec::new(),
+        );
+
+        // Falls back to matching against the literal (non-directory) file
+        // path, which no real cwd can ever be "under" — so this degrades to
+        // "never matches" rather than panicking or matching everything.
+        assert_eq!(
+            map_event_to_workset(&[workset], &dir.path().join("repo")),
             None
         );
     }

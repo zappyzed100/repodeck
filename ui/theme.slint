@@ -152,3 +152,47 @@ export component GlassCheckbox inherits Rectangle {
         clicked => { root.toggled(); }
     }
 }
+
+// Prominent, unmissable action feedback ("保存しました" / "登録しました" / errors).
+// A colored pill (green success / red warning) with a leading status dot —
+// glyph-free so it renders in every font. Collapses to zero height when empty.
+export component StatusBanner inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-warning: false;
+
+    visible: root.text != "";
+    height: root.text != "" ? 34px : 0px;
+    border-radius: Theme.radius-md;
+    background: root.is-warning ? rgba(255, 69, 58, 0.16) : rgba(48, 209, 88, 0.16);
+    border-width: 1px;
+    border-color: root.is-warning ? Theme.danger : Theme.success;
+    animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
+
+    HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        spacing: Theme.space-sm;
+        alignment: start;
+
+        Rectangle {
+            width: 10px;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 5px;
+                background: root.is-warning ? Theme.danger : Theme.success;
+            }
+        }
+        Text {
+            text: root.text;
+            font-family: Theme.font-text;
+            font-size: 13px;
+            font-weight: 600;
+            color: root.is-warning ? Theme.danger : Theme.success;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+}
