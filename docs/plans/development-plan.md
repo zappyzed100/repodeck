@@ -283,6 +283,81 @@
     エージェント状態変化での自動ワークセット切替は、PLAN.mdの対象外リストの通り
     意図的にスコープ外（v0.2以降）。
 
+- **Phase 9（回復性・仕上げ）: 完了・実機検証済み。MVP全9 Phase完了。**
+  - **事前調査で判明した既実装/未実装の切り分け**: config backup復旧（項目3）は
+    Phase 3で既に完全実装・検証済み（`config_store.rs`の`corrupt_primary_recovers_from_backup`
+    等）で追加作業不要と確認。ログローテーション（項目4）は`tracing_appender::rolling::daily`
+    による日次ローテーションのみ既存で、保持期間（7日／50MB上限）は未実装だった。
+    起動時ジャーナル復旧（項目2）は`journal_store`の保存・クリアは`switch_coordinator.rs`
+    が既に行っていたが、`journal_store::load`を呼ぶコードが起動経路のどこにも無く、
+    起動時復旧処理そのものが丸ごと未実装だった。
+  - `application::monitor_watch_service`: `compute_fingerprint`（モニター構成の
+    安定・順序非依存なフィンガープリント、`RuntimeState.last_seen_monitor_fingerprint`
+    ―既存だが書き込み先が無く死んでいたフィールド―の実利用先）と
+    `find_now_offscreen_windows`（登録済みウィンドウのうち現在のライブ矩形が
+    どのモニターとも重ならないものだけを検出）。ユーザーとの相談の結果、
+    モニター変更時の自動復旧は「画面外になったウィンドウだけ最小化する」という
+    最小介入方針を採用（Phase 6の`parking_allocator`が既に持つ「配置不能なら
+    最小化」という方針と一貫させるため）。`recover_all_windows`（登録済み全ウィンドウを
+    強制的にメイン画面へ集約する既存の緊急操作）を自動トリガーにする案は、
+    無関係なセットの配置まで乱すため不採用とした。
+  - `src/domain/placement.rs`に`PixelRect::overlaps`を追加（`monitor_watch_service`が
+    使う唯一の新規ジオメトリ演算）。
+  - `application::crash_recovery`: `already_succeeded`（`switch_coordinator.rs`が
+    自身のコメントで明記していた「crashが`runtime.current_workset_id`更新後・
+    journal clear前で発生した場合、切替自体は成功しているので復旧不要」という
+    ケースの判定）と`restore_original_placement`。後者は`SwitchCoordinator::rollback`
+    （同一プロセス内でのロールバック）とは異なり、ジャーナルの生の`hwnd`を信用せず
+    `managed_window_id`を`workset_service::resolve_all_matches`で再解決してから
+    復元する（§7.4「HWNDは当該トランザクション内だけで使用し、再起動後は
+    プロセスIDと現在属性を再検証する」に対応、クラッシュとこの起動の間に対象
+    アプリが再起動されHWNDが変わっていても正しく追跡できる）。
+  - `src/windowing/popup_window.rs`: 既存の`watch_deactivation`（`WM_ACTIVATE`監視）と
+    並行する独立した第二のWNDPROCサブクラス機構`watch_display_changes`
+    （`WM_DISPLAYCHANGE`監視）を追加。共有リファクタリングではなく既存の
+    動作中コードへの影響を避けるための並行実装とし、常駐する設定ウィンドウ
+    （クイックスイッチャーと違いユーザーが閉じられない）をサブクラス対象とした。
+  - `src/windowing/autostart.rs`: `HKEY_CURRENT_USER\...\CurrentVersion\Run`への
+    レジストリ書き込みのみ（管理者権限不要、PLAN.md §11準拠）。`RegSetValueExW`等は
+    `WIN32_ERROR`を直接返す（`GetLastError`方式ではない）ため、`HRESULT_FROM_WIN32`相当の
+    変換を自前実装。
+  - `src/app.rs`の起動時クラッシュ復旧はPLAN.md §10.3の手順（検証→HWND再検証→
+    ダイアログ→3択提示→選択後に解決）をそのまま実装。ユーザーとの相談の結果、
+    復旧UIはSlintの専用ダイアログではなくネイティブ`MessageBoxW`
+    （`MB_YESNOCANCEL`、はい＝元の配置に戻す／いいえ＝全てメインへ回収／
+    キャンセル＝何もしない）を採用——ボタンラベルはWin32側で固定のため、
+    本文でそれぞれの意味を明記する形にした。
+  - **実機確認で判明したテスト治具側の問題**（RepoDeck自体のバグではない）:
+    手動検証用に`switch-journal.json`をPowerShellの`ConvertTo-Json`/`Set-Content -Encoding utf8`
+    で直接作成したところ、UTF-8 BOM（`EF BB BF`）が先頭に付与され、
+    `serde_json::from_str`が本物のBOM付きファイルに対してのみ解析失敗し、
+    復旧ダイアログが一切表示されない状態になった（同じ内容をBOM無しの文字列
+    リテラルとして直接パースする単体テストは成功していたため、原因の切り分けに
+    時間を要した）。RepoDeck自身の`journal_store::save`はBOMを一切書き込まないため
+    実運用では発生しない問題と判断し、プロダクションコードは変更せず、
+    治具側をBOM無しで書き直すことで解決。
+  - 実機確認: 設定画面の「起動設定」チェックボックスで実際のレジストリ値の
+    作成・削除を確認（`HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\RepoDeck`）。
+    「バージョン情報」セクションの表示とサードパーティ表示ボタン（実際に
+    `THIRD_PARTY_NOTICES.md`を開くことを確認）。起動時クラッシュ復旧は3つの
+    選択肢（元の配置に戻す／全てメインへ回収／何もしない）すべてを実際の
+    ダイアログクリックとログ出力で確認済み（それぞれ
+    `restored original placement after an interrupted switch` /
+    `recovered all windows after an interrupted switch` /
+    ジャーナルファイルが削除されずに残ることを確認）。モニター切断の実機確認は
+    このマシンの実モニター構成を変更するリスクを避けるため、単体テスト
+    （合成モニター／ウィンドウ矩形）でのみ検証。
+  - **配布物**: `.github/workflows/ci.yml`（development-plan.md §14.5の仕様通り。
+    GitHub Actions自体はこの環境から実行トリガーできないため、YAML構文の
+    手動レビューのみで検証）、`scripts/package.ps1`（実際に`cargo build --release`から
+    `RepoDeck-v0.1.0-windows-x64.zip`＋`.sha256`まで生成し、zipを展開して
+    `repodeck.exe`を独立ディレクトリから実際に起動できることを確認——「clean
+    Windows環境でZIPから起動」の完全な代替ではないが、この環境で可能な最も近い検証）、
+    `README.md`（日本語）／`README.en.md`（英語、相互リンク）。デモ用の実機
+    スクリーンショットは`docs/screenshots/`に格納し、実際の動画/GIF撮影は
+    この環境では不可能なためテキスト手順のみとした（ユーザーとの事前相談で
+    合意済み）。
+
 ### 実装メモ・既知の齟齬
 
 - **`PopupLocation`の記法齟齬**: §3.3（クイックスイッチャー表示位置のUI仕様）は

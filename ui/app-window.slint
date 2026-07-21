@@ -23,7 +23,7 @@ export component AppWindow inherits Window {
     title: "RepoDeck — 設定";
     icon: @image-url("../assets/repodeck-icon.svg");
     preferred-width: 420px;
-    preferred-height: 640px;
+    preferred-height: 860px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -49,6 +49,14 @@ export component AppWindow inherits Window {
     in property <bool> codex-status-is-warning: false;
     in property <bool> codex-send-test-event-enabled: false;
 
+    // バージョン情報 (Phase 9).
+    in property <string> app-version: "";
+
+    // 起動設定 (Phase 9).
+    in-out property <bool> start-with-windows: false;
+    in property <string> autostart-status-text: "";
+    in property <bool> autostart-status-is-warning: false;
+
     callback hotkey-rebind-requested();
     callback open-layout-studio-requested();
     callback open-workset-manager-requested();
@@ -56,6 +64,8 @@ export component AppWindow inherits Window {
     callback codex-copy-snippet-requested();
     callback codex-open-config-folder-requested();
     callback codex-send-test-event-requested();
+    callback open-third-party-notices-requested();
+    callback start-with-windows-toggled(bool);
 
     Rectangle {
         // The glass card: everything visible sits on this opaque layer, so
@@ -220,6 +230,56 @@ export component AppWindow inherits Window {
                 font-size: 11px;
                 color: Theme.text-tertiary;
                 wrap: word-wrap;
+            }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "起動設定"; }
+
+            HorizontalLayout {
+                spacing: 4px;
+                GlassCheckbox {
+                    checked: root.start-with-windows;
+                    toggled => {
+                        root.start-with-windows = !root.start-with-windows;
+                        root.start-with-windows-toggled(root.start-with-windows);
+                    }
+                }
+                Text {
+                    text: "Windows起動時にRepoDeckを自動起動する";
+                    vertical-alignment: center;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+            }
+
+            if root.autostart-status-text != "": Text {
+                text: root.autostart-status-text;
+                font-size: 12px;
+                color: root.autostart-status-is-warning ? Theme.danger : Theme.success;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "バージョン情報"; }
+
+            Text {
+                text: "RepoDeck " + root.app-version;
+                font-size: 12px;
+                color: Theme.text-secondary;
+            }
+
+            Text {
+                text: "UIは Slint (https://slint.rs) で構築されています。Slint Royalty-free Desktop Licenseの下で利用しており、Slint自体は再配布していません。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            GlassButton {
+                text: "サードパーティ表示";
+                clicked => { root.open-third-party-notices-requested(); }
             }
         }
     }

@@ -49,6 +49,16 @@ impl PixelRect {
     pub fn contains_point(&self, x: i32, y: i32) -> bool {
         x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
     }
+
+    /// Whether this rect shares any area with `other`. Used by monitor-change
+    /// recovery to decide "offscreen": a window only counts as offscreen if it
+    /// overlaps *no* live monitor at all (Phase 9).
+    pub fn overlaps(&self, other: &PixelRect) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
 }
 
 /// A rectangle normalized against a monitor's work area, per PLAN.md §4.1.

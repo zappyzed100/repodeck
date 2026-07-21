@@ -13,14 +13,19 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_YESNO, MessageBoxW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IDNO, IDYES, MB_ICONWARNING, MB_YESNO, MB_YESNOCANCEL, MessageBoxW,
+};
 use windows::core::HSTRING;
 
 use crate::application::agent_status_service;
+use crate::application::crash_recovery::{self, JournalRecoveryChoice};
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
+use crate::application::monitor_watch_service;
 use crate::application::popup_placement;
 use crate::application::quick_switcher_service;
 use crate::application::switch_coordinator::{SwitchCoordinator, SwitchRequest};
+use crate::application::window_ops::WindowOps;
 use crate::application::workset_service;
 use crate::diagnostics::logging;
 use crate::domain::agent::{
@@ -33,7 +38,8 @@ use crate::domain::workset::{ManagedWindow, ParkingPolicy};
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
 use crate::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
-use crate::persistence::{clock, config_store, runtime_store};
+use crate::persistence::{clock, config_store, journal_store, runtime_store};
+use crate::windowing::autostart;
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
 use crate::windowing::monitor::{self, MonitorInfo};
@@ -2084,6 +2090,63 @@ fn copy_text_to_clipboard(text: &str) -> windows::core::Result<()> {
     result
 }
 
+/// Wires the settings window's "バージョン情報"/"起動設定" sections (Phase 9).
+/// The registry (`windowing::autostart`) is the source of truth for whether
+/// autostart is actually enabled — `AppConfig.settings.start_with_windows` is
+/// only kept in sync as a secondary record, updated on every successful
+/// toggle here, never read to decide the checkbox's initial state.
+fn wire_about_and_autostart(window: &AppWindow, config: Rc<RefCell<AppConfig>>, data_dir: PathBuf) {
+    window.set_app_version(env!("CARGO_PKG_VERSION").into());
+    window.set_start_with_windows(autostart::is_enabled().unwrap_or(false));
+
+    window.on_open_third_party_notices_requested(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else { return };
+        let path = dir.join("THIRD_PARTY_NOTICES.md");
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "THIRD_PARTY_NOTICES.md not found next to the executable");
+            return;
+        }
+        if let Err(err) = std::process::Command::new("explorer.exe").arg(&path).spawn() {
+            tracing::warn!(error = %err, path = %path.display(), "failed to open THIRD_PARTY_NOTICES.md");
+        }
+    });
+
+    let w = window.as_weak();
+    let c = config;
+    window.on_start_with_windows_toggled(move |enabled| {
+        let Some(window) = w.upgrade() else { return };
+        if let Err(err) = autostart::set_enabled(enabled) {
+            window.set_start_with_windows(!enabled); // revert the checkbox
+            window.set_autostart_status_text(format!("自動起動の設定に失敗しました: {err}").into());
+            window.set_autostart_status_is_warning(true);
+            return;
+        }
+
+        let mut cfg = c.borrow_mut();
+        cfg.settings.start_with_windows = enabled;
+        match config_store::save(&data_dir, &cfg) {
+            Ok(()) => {
+                window.set_autostart_status_text(
+                    if enabled {
+                        "Windows起動時の自動起動を有効にしました。"
+                    } else {
+                        "自動起動を無効にしました。"
+                    }
+                    .into(),
+                );
+                window.set_autostart_status_is_warning(false);
+            }
+            Err(err) => {
+                window.set_autostart_status_text(format!("設定の保存に失敗しました: {err}").into());
+                window.set_autostart_status_is_warning(true);
+            }
+        }
+    });
+}
+
 /// Native `MessageBoxW` confirmation for the tray's "全管理ウィンドウを回収" —
 /// a single click would otherwise move every window across every workset at
 /// once with no chance to back out.
@@ -2094,6 +2157,28 @@ fn confirm_recover_all() -> bool {
     // duration of this call; `hwnd: None` shows an owner-less dialog.
     let result = unsafe { MessageBoxW(None, &text, &caption, MB_YESNO | MB_ICONWARNING) };
     result == IDYES
+}
+
+/// PLAN.md §10.3 steps 3-4: a leftover `switch-journal.json` at startup means
+/// the previous switch never finished. A single `MB_YESNOCANCEL` dialog maps
+/// onto the spec's three named choices — Yes/No/Cancel button labels are
+/// fixed by Win32, so the body text spells out what each one does.
+fn crash_recovery_dialog(affected_window_count: usize) -> JournalRecoveryChoice {
+    let text = HSTRING::from(format!(
+        "前回の切替が中断されました({affected_window_count}件のウィンドウに影響)。\n\n\
+         [はい] 元の配置に戻す\n\
+         [いいえ] 全ウィンドウをメイン画面へ回収\n\
+         [キャンセル] 何もしない(次回起動時に再度確認します)"
+    ));
+    let caption = HSTRING::from("RepoDeck — 切替の復旧");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    let result = unsafe { MessageBoxW(None, &text, &caption, MB_YESNOCANCEL | MB_ICONWARNING) };
+    match result {
+        IDYES => JournalRecoveryChoice::RestoreOriginalPlacement,
+        IDNO => JournalRecoveryChoice::RecoverAllToMain,
+        _ => JournalRecoveryChoice::DoNothing,
+    }
 }
 
 fn hotkey_register_error_message(err: HotkeyRegisterError) -> String {
@@ -2373,6 +2458,7 @@ pub fn run() -> Result<()> {
     })?;
 
     let _log_guard: WorkerGuard = logging::init(&data_dir)?;
+    logging::enforce_retention(&logging::log_dir(&data_dir));
 
     let Some(_instance_mutex) = acquire_single_instance()? else {
         tracing::info!(
@@ -2390,11 +2476,125 @@ pub fn run() -> Result<()> {
     let layout_studio_state = Rc::new(RefCell::new(LayoutStudioState::new()));
     let workset_manager_state = Rc::new(RefCell::new(WorksetManagerState::new()));
 
+    // Constructed here (rather than just before `wire_quick_switcher`, as in
+    // earlier phases) so the startup crash-recovery pass below can also use
+    // it for the "全てメインへ回収" choice.
+    let coordinator = Rc::new(SwitchCoordinator::new(Win32WindowOps, data_dir.clone()));
+
+    // PLAN.md §10.3: a leftover `switch-journal.json` means the previous
+    // switch never finished (RepoDeck crashed or was killed mid-switch).
+    // Runs before any window is shown.
+    if let Some(journal) = journal_store::load(&data_dir).unwrap_or(None) {
+        let runtime = runtime_store::load(&data_dir);
+        if crash_recovery::already_succeeded(&journal, runtime.current_workset_id) {
+            // The switch itself completed; only the journal-clear step was
+            // interrupted. Nothing to recover, nothing to ask the user.
+            let _ = journal_store::clear(&data_dir);
+        } else {
+            match crash_recovery_dialog(journal.windows.len()) {
+                JournalRecoveryChoice::RestoreOriginalPlacement => {
+                    let live_windows = enumerate::enumerate_top_level_windows(std::process::id())
+                        .unwrap_or_default();
+                    let report = crash_recovery::restore_original_placement(
+                        &Win32WindowOps,
+                        &config.borrow().worksets,
+                        &live_windows,
+                        &journal,
+                    );
+                    tracing::info!(
+                        recovered = report.recovered.len(),
+                        skipped = report.skipped.len(),
+                        "restored original placement after an interrupted switch"
+                    );
+                    let _ = journal_store::clear(&data_dir);
+                }
+                JournalRecoveryChoice::RecoverAllToMain => {
+                    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+                    let live_windows = enumerate::enumerate_top_level_windows(std::process::id())
+                        .unwrap_or_default();
+                    let cfg = config.borrow();
+                    match coordinator.recover_all_windows(
+                        &cfg.worksets,
+                        &live_monitors,
+                        &cfg.main_monitor_ids,
+                        &live_windows,
+                    ) {
+                        Ok(report) => tracing::info!(
+                            recovered = report.recovered.len(),
+                            skipped = report.skipped.len(),
+                            "recovered all windows after an interrupted switch"
+                        ),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "failed to persist runtime state during startup recovery"
+                        ),
+                    }
+                    drop(cfg);
+                    let _ = journal_store::clear(&data_dir);
+                }
+                JournalRecoveryChoice::DoNothing => {
+                    // Leave the journal in place; the same dialog reappears
+                    // next launch (PLAN.md §10.3 step 5: only a real
+                    // selection resolves it).
+                }
+            }
+        }
+    }
+
+    // Diagnostic bookkeeping only — the journal's presence, not this flag,
+    // is what gates recovery above, so a plain crash outside any switch
+    // never triggers a false recovery prompt.
+    {
+        let mut runtime = runtime_store::load(&data_dir);
+        runtime.last_clean_shutdown = false;
+        let _ = runtime_store::save(&data_dir, &runtime);
+    }
+
     // `window` is the repurposed settings surface (PLAN.md §13 Phase 7
     // checklist item 4) — see the doc comment on `AppWindow` in
     // `ui/app-window.slint` for why.
     let window = AppWindow::new().context("failed to create the RepoDeck settings window")?;
     apply_glass_backdrop(window.window());
+
+    // Monitor-change recovery (Phase 9): watches the Settings window's
+    // WNDPROC because, unlike the Quick Switcher, it exists for the whole
+    // process lifetime even while hidden — `WM_DISPLAYCHANGE` needs a
+    // persistent window to subclass.
+    let config_for_display = config.clone();
+    let data_dir_for_display = data_dir.clone();
+    let _display_change_watch = popup_window::watch_display_changes(window.window(), move || {
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let fingerprint = monitor_watch_service::compute_fingerprint(&live_monitors);
+
+        let mut runtime = runtime_store::load(&data_dir_for_display);
+        if runtime.last_seen_monitor_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            return; // e.g. a DPI-only change also fires WM_DISPLAYCHANGE
+        }
+
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let offscreen = {
+            let config = config_for_display.borrow();
+            monitor_watch_service::find_now_offscreen_windows(
+                &config.worksets,
+                &live_windows,
+                &live_monitors,
+            )
+        };
+        if !offscreen.is_empty() {
+            tracing::info!(
+                count = offscreen.len(),
+                "minimizing windows left offscreen by a monitor configuration change"
+            );
+        }
+        for hwnd in offscreen {
+            Win32WindowOps.minimize(hwnd);
+        }
+
+        runtime.last_seen_monitor_fingerprint = Some(fingerprint);
+        let _ = runtime_store::save(&data_dir_for_display, &runtime);
+    });
+
     let tray = TrayIcon::new().context("failed to create the RepoDeck tray icon")?;
     let layout_studio = LayoutStudio::new().context("failed to create the Layout Studio window")?;
     apply_glass_backdrop(layout_studio.window());
@@ -2421,7 +2621,6 @@ pub fn run() -> Result<()> {
         workset_manager_state,
     );
 
-    let coordinator = Rc::new(SwitchCoordinator::new(Win32WindowOps, data_dir.clone()));
     wire_quick_switcher(
         &quick_switcher,
         data_dir.clone(),
@@ -2488,6 +2687,7 @@ pub fn run() -> Result<()> {
     ));
     wire_settings(&window, data_dir.clone(), config.clone(), hotkey_thread);
     wire_codex_settings(&window, config.clone());
+    wire_about_and_autostart(&window, config.clone(), data_dir.clone());
 
     // PLAN.md §3.3's `close_on_focus_loss` setting: Slint has no public API
     // for window-deactivation, so this reaches the popup's raw HWND
@@ -2676,6 +2876,12 @@ pub fn run() -> Result<()> {
     }
 
     slint::run_event_loop().context("RepoDeck event loop failed")?;
+
+    {
+        let mut runtime = runtime_store::load(&data_dir);
+        runtime.last_clean_shutdown = true;
+        let _ = runtime_store::save(&data_dir, &runtime);
+    }
 
     tracing::info!("RepoDeck exiting");
     Ok(())

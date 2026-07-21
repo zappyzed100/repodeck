@@ -495,3 +495,35 @@ fn named_pipe_server_receives_a_real_hook_process_event() {
     assert_eq!(event.model.as_deref(), Some("gpt-e2e"));
     assert!(event.cwd.ends_with("guardrails-kit"));
 }
+
+/// Cleans up the real `RepoDeck` autostart registry value on drop, so a
+/// failed assertion mid-test never leaves a stray entry on the dev machine
+/// (PLAN.md §11: "管理者権限を要求しない" — this touches `HKEY_CURRENT_USER`
+/// only, no elevation involved).
+struct AutostartGuard;
+
+impl Drop for AutostartGuard {
+    fn drop(&mut self) {
+        let _ = repodeck::windowing::autostart::set_enabled(false);
+    }
+}
+
+/// PLAN.md §13 Phase 9's "起動時自動実行設定": a real round-trip against the
+/// per-user `Run` registry key.
+#[test]
+#[ignore = "writes a real registry value under HKEY_CURRENT_USER; run manually, not in CI"]
+fn autostart_enable_disable_round_trips_against_the_real_registry() {
+    use repodeck::windowing::autostart;
+
+    let _guard = AutostartGuard;
+
+    // Start from a known state in case a previous failed run left a value.
+    autostart::set_enabled(false).expect("failed to clear any pre-existing autostart value");
+    assert!(!autostart::is_enabled().expect("is_enabled should succeed"));
+
+    autostart::set_enabled(true).expect("failed to enable autostart");
+    assert!(autostart::is_enabled().expect("is_enabled should succeed"));
+
+    autostart::set_enabled(false).expect("failed to disable autostart");
+    assert!(!autostart::is_enabled().expect("is_enabled should succeed"));
+}

@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod dpi;
 pub mod enumerate;
 pub mod matcher;

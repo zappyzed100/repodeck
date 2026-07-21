@@ -11,7 +11,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWL_EXSTYLE, GWLP_WNDPROC, GetWindowLongPtrW, SetWindowLongPtrW, WA_INACTIVE,
-    WM_ACTIVATE, WNDPROC, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WM_ACTIVATE, WM_DISPLAYCHANGE, WNDPROC, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Best-effort forces real OS input focus onto `window` (PLAN.md §4.5's
@@ -149,4 +149,90 @@ pub fn watch_deactivation(
     });
 
     Some(DeactivationWatch { hwnd, original_raw })
+}
+
+// A second, independent subclassing mechanism (same pattern as
+// `watch_deactivation`/`SUBCLASSES`, kept as a parallel implementation
+// rather than a shared one so this Phase 9 addition can't regress the
+// already-shipping deactivation-watch behavior): observes
+// `WM_DISPLAYCHANGE` on a *persistent* window (Phase 9's monitor-change
+// recovery watches the Settings window, which exists for the whole process
+// lifetime, unlike the Quick Switcher the user can close). Delivered on the
+// same UI thread that owns the window's message queue, so `on_change` can
+// capture `Rc`s directly.
+thread_local! {
+    static DISPLAY_SUBCLASSES: RefCell<HashMap<isize, Subclass>> = RefCell::new(HashMap::new());
+}
+
+unsafe extern "system" fn display_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_DISPLAYCHANGE {
+        DISPLAY_SUBCLASSES.with(|map| {
+            if let Some((_, callback)) = map.borrow().get(&(hwnd.0 as isize)) {
+                callback();
+            }
+        });
+    }
+
+    let original =
+        DISPLAY_SUBCLASSES.with(|map| map.borrow().get(&(hwnd.0 as isize)).and_then(|(p, _)| *p));
+    match original {
+        // SAFETY: `original` is the real previous WNDPROC captured in
+        // `watch_display_changes`, and `hwnd`/`msg`/`wparam`/`lparam` are
+        // exactly what this procedure itself was just called with.
+        Some(_) => unsafe { CallWindowProcW(original, hwnd, msg, wparam, lparam) },
+        None => LRESULT(0),
+    }
+}
+
+/// Un-subclasses the window on drop, restoring its original WNDPROC.
+pub struct DisplayChangeWatch {
+    hwnd: HWND,
+    original_raw: isize,
+}
+
+impl Drop for DisplayChangeWatch {
+    fn drop(&mut self) {
+        // SAFETY: see `DeactivationWatch::drop`'s identical reasoning.
+        unsafe {
+            let _ = SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.original_raw);
+        }
+        DISPLAY_SUBCLASSES.with(|map| {
+            map.borrow_mut().remove(&(self.hwnd.0 as isize));
+        });
+    }
+}
+
+/// Subclasses `window`'s WNDPROC to observe `WM_DISPLAYCHANGE` and invoke
+/// `on_change` (Phase 9's monitor-configuration-change recovery — no public
+/// Slint API exposes this event). Always forwards to the original WNDPROC via
+/// `CallWindowProcW` so Slint's own window handling still runs.
+pub fn watch_display_changes(
+    window: &slint::Window,
+    on_change: impl Fn() + 'static,
+) -> Option<DisplayChangeWatch> {
+    let hwnd = hwnd_of(window)?;
+    let key = hwnd.0 as isize;
+
+    // SAFETY: `hwnd` is a live window's real handle; `display_subclass_proc`
+    // matches the `WNDPROC` signature exactly.
+    let original_raw = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            display_subclass_proc as *const () as isize,
+        )
+    };
+    let original = wndproc_from_isize(original_raw);
+
+    DISPLAY_SUBCLASSES.with(|map| {
+        map.borrow_mut()
+            .insert(key, (original, Box::new(on_change)));
+    });
+
+    Some(DisplayChangeWatch { hwnd, original_raw })
 }

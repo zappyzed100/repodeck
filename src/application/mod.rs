@@ -1,7 +1,9 @@
 pub mod agent_status_service;
+pub mod crash_recovery;
 pub mod layout_service;
 pub mod main_placement;
 pub mod monitor_resolution;
+pub mod monitor_watch_service;
 pub mod parking_allocator;
 pub mod parking_placement;
 pub mod popup_placement;

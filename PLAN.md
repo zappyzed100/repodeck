@@ -106,7 +106,12 @@ repodeck/
    バッジ・トレイアイコン色連動、設定画面「Codex連携」セクション（hook検出・hooks.json
    スニペット生成＋コピー・設定フォルダーを開く・実プロセスによるテストイベント送信）。
    詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照。
-9. **Phase 9 — 回復性・仕上げ**（未着手）: モニター変更監視、起動時復旧、配布物作成。
+9. **Phase 9 — 回復性・仕上げ**（完了）: モニター構成変更の監視（`WM_DISPLAYCHANGE`検知
+   →画面外ウィンドウのみ最小化）、起動時クラッシュ復旧（`switch-journal.json`残存時に
+   3択ダイアログ）、ログ保持（7日／50MB上限）、起動時自動実行設定、設定画面「バージョン
+   情報」セクション、配布一式（`.github/workflows/ci.yml`、`scripts/package.ps1`、
+   `README.md`/`README.en.md`）。config backup復旧はPhase 3で既に実装済みと確認。
+   詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照。
 
 MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本とする。
 
@@ -128,4 +133,4 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 6: 退避割当・切替Coordinator
 - [x] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
 - [x] Phase 8: Codex連携
-- [ ] Phase 9: 回復性・仕上げ `next`
+- [x] Phase 9: 回復性・仕上げ
