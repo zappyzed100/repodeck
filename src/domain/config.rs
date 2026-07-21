@@ -21,8 +21,22 @@ pub struct AppConfig {
     pub settings: UserSettings,
     pub monitors: Vec<SavedMonitor>,
     pub main_monitor_ids: Vec<String>,
+    /// User-named parking areas (サブA・サブB…), each a set of monitors defined
+    /// in Layout Studio, analogous to `main_monitor_ids`. A workset parks onto
+    /// one of these via [`ParkingPolicy::SubScreen`]. `#[serde(default)]` keeps
+    /// pre-existing configs loadable.
+    #[serde(default)]
+    pub sub_screens: Vec<SubScreen>,
     pub worksets: Vec<Workset>,
     pub fixed_slots: Vec<FixedParkingSlot>,
+}
+
+/// A named parking area spanning one or more monitors (PLAN.md §2.4 extension).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubScreen {
+    pub id: Uuid,
+    pub name: String,
+    pub monitor_ids: Vec<String>,
 }
 
 impl AppConfig {
@@ -35,6 +49,7 @@ impl AppConfig {
             settings: UserSettings::default(),
             monitors: Vec::new(),
             main_monitor_ids: Vec::new(),
+            sub_screens: Vec::new(),
             worksets: Vec::new(),
             fixed_slots: Vec::new(),
         }
@@ -107,6 +122,15 @@ impl AppConfig {
                     }
                     Some(_) => {}
                 }
+            }
+
+            if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy
+                && !self.sub_screens.iter().any(|s| s.id == *sub_screen_id)
+            {
+                errors.push(ConfigValidationError::MissingSubScreen {
+                    workset_id: workset.id,
+                    sub_screen_id: *sub_screen_id,
+                });
             }
 
             for window in &workset.windows {
@@ -282,6 +306,11 @@ pub enum ConfigValidationError {
     },
     #[error("workset {workset_id} references missing fixed parking slot {slot_id}")]
     MissingFixedSlot { workset_id: Uuid, slot_id: Uuid },
+    #[error("workset {workset_id} references missing sub-screen {sub_screen_id}")]
+    MissingSubScreen {
+        workset_id: Uuid,
+        sub_screen_id: Uuid,
+    },
     #[error("fixed parking slot {slot_id} is assigned to missing workset {workset_id}")]
     MissingAssignedWorkset { slot_id: Uuid, workset_id: Uuid },
     #[error(

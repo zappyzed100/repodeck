@@ -377,11 +377,18 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
         .map(|(index, (monitor, rect))| {
             let main_order = main_ids.iter().position(|id| id == &monitor.device_name);
             let excluded = state.excluded_for(config, &monitor.device_name);
+            let sub = config
+                .sub_screens
+                .iter()
+                .find(|s| s.monitor_ids.iter().any(|id| id == &monitor.device_name));
             let split = state.auto_split_for(config, &monitor.device_name);
             let role_label = match main_order {
                 Some(order) => format!("MAIN {}", order + 1),
                 None if excluded => "対象外".to_string(),
-                None => auto_split_label(split, monitor.work_area_px),
+                None => match sub {
+                    Some(s) => format!("サブ: {}", s.name),
+                    None => auto_split_label(split, monitor.work_area_px),
+                },
             };
             let dpi_percent = monitor.dpi_x * 100 / 96;
 
@@ -398,6 +405,7 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
                 .into(),
                 role_label: role_label.into(),
                 is_main: main_order.is_some(),
+                is_sub: sub.is_some(),
                 is_excluded: excluded,
                 selected: state.selected_index == Some(index),
             }
@@ -458,6 +466,31 @@ fn refresh_selected_monitor_panel(
         )
         .into(),
     );
+
+    refresh_sub_screen_rows(layout, config, monitor.device_name.as_str());
+}
+
+/// Removes `device_name` from every sub-screen. Used to keep a monitor's role
+/// exclusive (a monitor is main, a sub-screen member, excluded, or normal — not
+/// several at once).
+fn remove_monitor_from_all_sub_screens(config: &mut AppConfig, device_name: &str) {
+    for sub in &mut config.sub_screens {
+        sub.monitor_ids.retain(|id| id != device_name);
+    }
+}
+
+/// Rebuilds the Layout Studio's sub-screen list, marking which ones contain
+/// `device_name` (the selected monitor).
+fn refresh_sub_screen_rows(layout: &LayoutStudio, config: &AppConfig, device_name: &str) {
+    let rows: Vec<SubScreenRow> = config
+        .sub_screens
+        .iter()
+        .map(|s| SubScreenRow {
+            name: s.name.clone().into(),
+            assigned: s.monitor_ids.iter().any(|id| id == device_name),
+        })
+        .collect();
+    layout.set_sub_screen_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
 }
 
 fn resolve_main_monitor_bounds(
@@ -573,8 +606,9 @@ fn wire_layout_studio(
             );
         } else {
             config.main_monitor_ids.push(device_name.clone());
-            // Main and 「操作対象にしない」 are mutually exclusive.
-            state.excluded_overrides.insert(device_name, false);
+            // Main is mutually exclusive with 対象外 and sub-screen membership.
+            state.excluded_overrides.insert(device_name.clone(), false);
+            remove_monitor_from_all_sub_screens(&mut config, &device_name);
             layout.set_status_text(
                 "メイン画面に登録しました。「設定を保存」で確定してください。".into(),
             );
@@ -601,7 +635,7 @@ fn wire_layout_studio(
             .excluded_overrides
             .insert(device_name.clone(), excluded);
         if excluded {
-            // Main and 「操作対象にしない」 are mutually exclusive.
+            // 対象外 is mutually exclusive with main and sub-screen membership.
             if let Some(pos) = config
                 .main_monitor_ids
                 .iter()
@@ -609,6 +643,7 @@ fn wire_layout_studio(
             {
                 config.main_monitor_ids.remove(pos);
             }
+            remove_monitor_from_all_sub_screens(&mut config, &device_name);
             layout.set_status_text(
                 "このモニターを操作対象から外しました。「設定を保存」で確定してください。".into(),
             );
@@ -617,6 +652,115 @@ fn wire_layout_studio(
                 "このモニターを操作対象に戻しました。「設定を保存」で確定してください。".into(),
             );
         }
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    // --- Sub-screen (退避先) management ---
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_add(move |name| {
+        let Some(layout) = l.upgrade() else { return };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            layout.set_status_text("サブ画面の名前を入力してください。".into());
+            layout.set_status_is_warning(true);
+            return;
+        }
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if config.sub_screens.iter().any(|sub| sub.name == name) {
+            layout.set_status_text("同じ名前のサブ画面が既にあります。".into());
+            layout.set_status_is_warning(true);
+            return;
+        }
+        config.sub_screens.push(crate::domain::config::SubScreen {
+            id: uuid::Uuid::new_v4(),
+            name: name.clone(),
+            monitor_ids: Vec::new(),
+        });
+        layout.set_status_text(
+            format!("サブ画面「{name}」を追加しました。モニターを割り当ててください。").into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    layout.on_sub_screen_delete(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if index >= config.sub_screens.len() {
+            return;
+        }
+        let removed = config.sub_screens.remove(index);
+        // Any workset that parked to this sub-screen falls back to 自動.
+        for workset in &mut config.worksets {
+            if workset.parking_policy
+                == (crate::domain::workset::ParkingPolicy::SubScreen {
+                    sub_screen_id: removed.id,
+                })
+            {
+                workset.parking_policy = crate::domain::workset::ParkingPolicy::Auto;
+            }
+        }
+        let _ = config_store::save(&dir, &config);
+        layout.set_status_text(format!("サブ画面「{}」を削除しました。", removed.name).into());
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_toggle_monitor(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        let Some(device_name) = state
+            .selected_index
+            .and_then(|i| state.monitors.get(i))
+            .map(|m| m.device_name.clone())
+        else {
+            return;
+        };
+        // A monitor can only belong to one sub-screen; assigning here removes it
+        // from any other, from main, and from 対象外.
+        let already = config
+            .sub_screens
+            .get(index)
+            .is_some_and(|sub| sub.monitor_ids.iter().any(|id| id == &device_name));
+        remove_monitor_from_all_sub_screens(&mut config, &device_name);
+        if !already {
+            if let Some(pos) = config
+                .main_monitor_ids
+                .iter()
+                .position(|id| id == &device_name)
+            {
+                config.main_monitor_ids.remove(pos);
+            }
+            state.excluded_overrides.insert(device_name.clone(), false);
+            if let Some(sub) = config.sub_screens.get_mut(index) {
+                sub.monitor_ids.push(device_name);
+            }
+        }
+        layout.set_status_text(
+            "サブ画面の割当を更新しました。「設定を保存」で確定してください。".into(),
+        );
         layout.set_status_is_warning(false);
         refresh_selected_monitor_panel(&layout, &config, &state);
         refresh_monitor_tiles(&layout, &config, &mut state);
@@ -895,13 +1039,9 @@ struct WorksetManagerState {
     pending_empty_candidates: Vec<TopLevelWindow>,
     /// Rolling undo snapshot for the last "メイン画面を空にする" action.
     empty_undo_snapshot: UndoSnapshot,
-    /// 退避先固定 (fixed parking) selection for the workset being registered.
-    parking_fixed: bool,
-    /// Non-main monitor device names, parallel to the UI's `parking-monitors`.
-    parking_monitor_ids: Vec<String>,
-    fixed_monitor_id: Option<String>,
-    fixed_split: AutoSplit,
-    fixed_cell: usize,
+    /// 退避先 selection for the workset being registered: -1 = 自動, otherwise
+    /// an index into `AppConfig.sub_screens`.
+    parking_selected_sub: i32,
 }
 
 impl WorksetManagerState {
@@ -916,56 +1056,28 @@ impl WorksetManagerState {
             fullscreen_when_parked: false,
             pending_empty_candidates: Vec::new(),
             empty_undo_snapshot: UndoSnapshot::default(),
-            parking_fixed: false,
-            parking_monitor_ids: Vec::new(),
-            fixed_monitor_id: None,
-            fixed_split: AutoSplit::One,
-            fixed_cell: 0,
+            parking_selected_sub: -1,
         }
     }
 }
 
-/// Pushes the non-main monitors into the registration screen's parking-target
-/// list, marking `selected_id` as chosen, and records their ids on `state` so
-/// a click index maps back to a `device_name`.
-fn refresh_parking_monitors(
+/// Populates the registration screen's 退避先 sub-screen chips from the current
+/// config, clamping the selection back to 自動 if it's out of range.
+fn refresh_parking_subs(
     manager: &WorksetManager,
     config: &AppConfig,
     state: &mut WorksetManagerState,
 ) {
-    let non_main: Vec<&MonitorInfo> = state
-        .monitors
+    let names: Vec<slint::SharedString> = config
+        .sub_screens
         .iter()
-        .filter(|m| {
-            !config
-                .main_monitor_ids
-                .iter()
-                .any(|id| id == &m.device_name)
-        })
+        .map(|s| s.name.clone().into())
         .collect();
-    let rows: Vec<ParkingMonitorRow> = non_main
-        .iter()
-        .map(|m| ParkingMonitorRow {
-            device_name: m.device_name.clone().into(),
-            detail: format!("{}×{}", m.bounds_px.width, m.bounds_px.height).into(),
-            selected: state.fixed_monitor_id.as_deref() == Some(m.device_name.as_str()),
-        })
-        .collect();
-    state.parking_monitor_ids = non_main.iter().map(|m| m.device_name.clone()).collect();
-    manager.set_parking_monitors(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-}
-
-/// Sets the cell-selector model to `1..=split.cell_count()` and clamps the
-/// current cell selection into range.
-fn refresh_parking_cells(manager: &WorksetManager, state: &mut WorksetManagerState) {
-    let count = state.fixed_split.cell_count();
-    if state.fixed_cell >= count {
-        state.fixed_cell = 0;
+    if state.parking_selected_sub >= i32::try_from(names.len()).unwrap_or(0) {
+        state.parking_selected_sub = -1;
     }
-    let cells: Vec<i32> = (1..=i32::try_from(count).unwrap_or(1)).collect();
-    manager.set_parking_cells(std::rc::Rc::new(slint::VecModel::from(cells)).into());
-    manager.set_parking_selected_cell(i32::try_from(state.fixed_cell).unwrap_or(0));
-    manager.set_parking_selected_split(i32::try_from(count).unwrap_or(1).min(4));
+    manager.set_parking_subs(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_parking_selected_sub(state.parking_selected_sub);
 }
 
 /// Re-enumerates the top-level windows currently on the main screen and pushes
@@ -1180,14 +1292,9 @@ fn wire_workset_manager(
         state.picked_repository = None;
         state.fullscreen_when_parked = false;
         manager.set_fullscreen_when_parked(false);
-        // Reset the 退避先 picker to 自動.
-        state.parking_fixed = false;
-        state.fixed_monitor_id = None;
-        state.fixed_split = AutoSplit::One;
-        state.fixed_cell = 0;
-        manager.set_parking_fixed(false);
-        refresh_parking_monitors(&manager, &config, &mut state);
-        refresh_parking_cells(&manager, &mut state);
+        // Reset the 退避先 picker to 自動 and refresh the sub-screen chips.
+        state.parking_selected_sub = -1;
+        refresh_parking_subs(&manager, &config, &mut state);
         manager.set_picked_folder_label("（未選択）".into());
         manager.set_resolved_repo_label("".into());
         manager.set_registering(true);
@@ -1231,62 +1338,13 @@ fn wire_workset_manager(
         manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
     });
 
-    // --- 退避先固定 (fixed parking) picker ---
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_parking_mode_selected(move |fixed| {
-        let Some(manager) = m.upgrade() else { return };
-        let mut state = s.borrow_mut();
-        state.parking_fixed = fixed;
-        manager.set_parking_fixed(fixed);
-        if fixed {
-            refresh_parking_monitors(&manager, &c.borrow(), &mut state);
-            refresh_parking_cells(&manager, &mut state);
-        }
-    });
-
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_parking_monitor_selected(move |index| {
-        let Some(manager) = m.upgrade() else { return };
-        let Ok(index) = usize::try_from(index) else {
-            return;
-        };
-        let mut state = s.borrow_mut();
-        if let Some(id) = state.parking_monitor_ids.get(index).cloned() {
-            state.fixed_monitor_id = Some(id);
-            refresh_parking_monitors(&manager, &c.borrow(), &mut state);
-        }
-    });
-
+    // --- 退避先 (自動 / サブ画面) selection ---
     let m = manager.as_weak();
     let s = state.clone();
-    manager.on_parking_split_selected(move |split| {
+    manager.on_parking_sub_selected(move |index| {
         let Some(manager) = m.upgrade() else { return };
-        let mut state = s.borrow_mut();
-        state.fixed_split = match split {
-            2 => AutoSplit::TwoColumns,
-            4 => AutoSplit::FourGrid,
-            _ => AutoSplit::One,
-        };
-        state.fixed_cell = 0;
-        refresh_parking_cells(&manager, &mut state);
-    });
-
-    let m = manager.as_weak();
-    let s = state.clone();
-    manager.on_parking_cell_selected(move |index| {
-        let Some(manager) = m.upgrade() else { return };
-        let Ok(index) = usize::try_from(index) else {
-            return;
-        };
-        let mut state = s.borrow_mut();
-        if index < state.fixed_split.cell_count() {
-            state.fixed_cell = index;
-            manager.set_parking_selected_cell(i32::try_from(index).unwrap_or(0));
-        }
+        s.borrow_mut().parking_selected_sub = index;
+        manager.set_parking_selected_sub(index);
     });
 
     // --- "メイン画面を空にする" (moved here from Layout Studio) ---
@@ -1566,12 +1624,6 @@ fn wire_workset_manager(
             return;
         }
 
-        if state.parking_fixed && state.fixed_monitor_id.is_none() {
-            manager.set_status_text("退避先モニターを選択してください。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
         let color_hex = color_to_hex(state.selected_color);
         let save_result = {
             let mut config = c.borrow_mut();
@@ -1579,41 +1631,27 @@ fn wire_workset_manager(
             let mut workset = workset_service::build_workset(name, color_hex, repository_path, repository_kind, sort_order, managed_windows);
             workset.fullscreen_when_parked = state.fullscreen_when_parked;
 
-            // 退避先固定: create a fixed parking slot for this monitor+cell and
-            // point the workset's parking policy at it.
-            let mut added_slot = false;
-            if state.parking_fixed
-                && let Some(monitor_id) = state.fixed_monitor_id.clone()
+            // 退避先: -1 = 自動, otherwise the sub-screen at that index.
+            if state.parking_selected_sub >= 0
+                && let Some(sub) = usize::try_from(state.parking_selected_sub)
+                    .ok()
+                    .and_then(|i| config.sub_screens.get(i))
             {
-                let slot_id = uuid::Uuid::new_v4();
-                workset.parking_policy =
-                    crate::domain::workset::ParkingPolicy::Fixed { slot_id };
-                config.fixed_slots.push(crate::domain::workset::FixedParkingSlot {
-                    id: slot_id,
-                    monitor_id,
-                    grid: state.fixed_split,
-                    cell_index: state.fixed_cell,
-                    assigned_workset_id: workset.id,
-                });
-                added_slot = true;
+                workset.parking_policy = crate::domain::workset::ParkingPolicy::SubScreen {
+                    sub_screen_id: sub.id,
+                };
             }
             config.worksets.push(workset);
 
             let errors = config.validate();
             if !errors.is_empty() {
                 config.worksets.pop();
-                if added_slot {
-                    config.fixed_slots.pop();
-                }
                 Err(errors.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" / "))
             } else {
                 match config_store::save(&dir, &config) {
                     Ok(()) => Ok(()),
                     Err(err) => {
                         config.worksets.pop();
-                        if added_slot {
-                            config.fixed_slots.pop();
-                        }
                         Err(err.to_string())
                     }
                 }
@@ -2043,6 +2081,7 @@ fn wire_quick_switcher(
             match coord.switch_to(SwitchRequest {
                 worksets: &config.worksets,
                 fixed_slots: &config.fixed_slots,
+                sub_screens: &config.sub_screens,
                 saved_monitors: &config.monitors,
                 main_monitor_ids: &config.main_monitor_ids,
                 live_monitors: &live_monitors,

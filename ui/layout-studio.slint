@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
 import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 
 export struct MonitorTile {
@@ -10,8 +10,15 @@ export struct MonitorTile {
     detail-label: string,
     role-label: string,
     is-main: bool,
+    is-sub: bool,
     is-excluded: bool,
     selected: bool,
+}
+
+export struct SubScreenRow {
+    name: string,
+    // Whether the currently-selected monitor is assigned to this sub-screen.
+    assigned: bool,
 }
 
 export struct MainScreenCandidate {
@@ -71,7 +78,12 @@ export component LayoutStudio inherits Window {
     in property <bool> empty-screen-panel-visible: false;
     in property <[MainScreenCandidate]> main-screen-candidates: [];
 
+    in property <[SubScreenRow]> sub-screen-rows: [];
+
     callback refresh-requested();
+    callback sub-screen-add(name: string);
+    callback sub-screen-delete(index: int);
+    callback sub-screen-toggle-monitor(index: int);
     callback monitor-clicked(index: int);
     callback toggle-main-requested();
     callback toggle-excluded-requested();
@@ -139,7 +151,7 @@ export component LayoutStudio inherits Window {
                     clip: true;
                     background: tile.selected ? Theme.glass-selected : (tile.is-main ? Theme.accent-soft : Theme.glass-panel-soft);
                     border-width: tile.selected ? 2px : 1px;
-                    border-color: tile.is-main ? Theme.accent : Theme.hairline-bright;
+                    border-color: tile.is-main ? Theme.accent : (tile.is-sub ? Theme.warning : Theme.hairline-bright);
                     border-radius: Theme.radius-sm;
                     opacity: tile.is-excluded ? 0.45 : 1.0;
                     animate background, border-color, opacity { duration: Theme.duration-base; easing: ease-out; }
@@ -151,7 +163,7 @@ export component LayoutStudio inherits Window {
                             text: tile.role-label;
                             font-size: 12px;
                             font-weight: 700;
-                            color: tile.is-main ? Theme.accent : (tile.is-excluded ? Theme.text-tertiary : Theme.text-primary);
+                            color: tile.is-main ? Theme.accent : (tile.is-sub ? Theme.warning : (tile.is-excluded ? Theme.text-tertiary : Theme.text-primary));
                         }
                         Text {
                             text: tile.device-name;
@@ -197,7 +209,7 @@ export component LayoutStudio inherits Window {
                     // see the comment on `LayoutStudio` above), so the window
                     // would visibly resize every time the selection changes.
                     Rectangle {
-                        height: 230px;
+                        height: 460px;
                         if root.selected-has-monitor: VerticalLayout {
                             spacing: Theme.space-sm;
                             alignment: start;
@@ -252,10 +264,61 @@ export component LayoutStudio inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: "「自動」は解像度から分割数を決めます。固定枠の割当はワークセット登録後に利用できます。";
+                                    text: "「自動」は解像度から分割数を決めます。";
                                     font-size: 10px;
                                     color: Theme.text-tertiary;
                                     wrap: word-wrap;
+                                }
+                            }
+
+                            // --- Sub-screen (退避先) management ---
+                            Rectangle { height: 1px; background: Theme.hairline; }
+                            SectionLabel { text: "サブ画面（退避先エリア）"; }
+                            Text {
+                                text: "このモニターを割り当てるサブ画面を選択。1つのサブ画面に複数モニターも可。";
+                                font-size: 10px;
+                                color: Theme.text-tertiary;
+                                wrap: word-wrap;
+                            }
+                            ScrollView {
+                                height: 120px;
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    for sub[i] in root.sub-screen-rows: HorizontalLayout {
+                                        spacing: Theme.space-xs;
+                                        height: 28px;
+                                        GlassCheckbox {
+                                            checked: sub.assigned;
+                                            enabled: !root.selected-is-main && !root.selected-excluded;
+                                            toggled => { root.sub-screen-toggle-monitor(i); }
+                                        }
+                                        Text {
+                                            text: sub.name;
+                                            font-size: 12px;
+                                            color: Theme.text-primary;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                        GlassButton {
+                                            text: "削除";
+                                            clicked => { root.sub-screen-delete(i); }
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.space-xs;
+                                new-sub-name := LineEdit {
+                                    placeholder-text: "新しいサブ画面名";
+                                    horizontal-stretch: 1;
+                                }
+                                GlassButton {
+                                    text: "追加";
+                                    clicked => {
+                                        root.sub-screen-add(new-sub-name.text);
+                                        new-sub-name.text = "";
+                                    }
                                 }
                             }
                         }

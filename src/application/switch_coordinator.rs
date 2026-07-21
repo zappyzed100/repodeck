@@ -21,9 +21,10 @@ use crate::application::parking_placement::{ParkPlan, plan_park_into_slot};
 use crate::application::recovery_service::{self, RecoveryReport};
 use crate::application::window_ops::WindowOps;
 use crate::application::workset_service;
+use crate::domain::config::SubScreen;
 use crate::domain::monitor::SavedMonitor;
-use crate::domain::placement::SavedShowState;
-use crate::domain::workset::{FixedParkingSlot, ManagedWindow, Workset};
+use crate::domain::placement::{PixelRect, SavedShowState, bounding_rect};
+use crate::domain::workset::{FixedParkingSlot, ManagedWindow, ParkingPolicy, Workset};
 use crate::persistence::clock;
 use crate::persistence::journal_store::{
     self, JournalStatus, JournalStoreError, JournalWindowEntry, JournalWindowState, SwitchJournal,
@@ -42,6 +43,7 @@ pub struct SwitchCoordinator<W: WindowOps> {
 pub struct SwitchRequest<'a> {
     pub worksets: &'a [Workset],
     pub fixed_slots: &'a [FixedParkingSlot],
+    pub sub_screens: &'a [SubScreen],
     pub saved_monitors: &'a [SavedMonitor],
     pub main_monitor_ids: &'a [String],
     pub live_monitors: &'a [MonitorInfo],
@@ -284,6 +286,26 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         request: &SwitchRequest,
         auto_slot_assignments: &mut HashMap<String, String>,
     ) -> Result<(), String> {
+        // Sub-screen policy bypasses the auto-cell allocator: the workset parks
+        // onto its named area's monitors (the union work-area rect), shrunk to
+        // preserve its main-screen relative layout.
+        if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy {
+            let target = request
+                .sub_screens
+                .iter()
+                .find(|s| s.id == *sub_screen_id)
+                .and_then(|s| sub_screen_target_rect(s, request.live_monitors));
+            return match target {
+                Some(rect) => self.place_workset_into_rect(workset, resolved, request, rect),
+                None => {
+                    for w in resolved {
+                        self.window_ops.minimize(w.hwnd);
+                    }
+                    Ok(())
+                }
+            };
+        }
+
         let previous = decode_assignments(auto_slot_assignments);
         let allocation = allocate_parking(&AllocationInput {
             worksets: request.worksets,
@@ -310,47 +332,59 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 Ok(())
             }
             ParkAssignment::AutoSlot { rect, .. } | ParkAssignment::FixedSlot { rect, .. } => {
-                let mut main_rects = Vec::with_capacity(resolved.len());
+                self.place_workset_into_rect(workset, resolved, request, rect)
+            }
+        }
+    }
+
+    /// Places `resolved` into `target_rect`, shrinking to preserve the workset's
+    /// main-screen relative layout (via `plan_park_into_slot`), then maximizing
+    /// if `fullscreen_when_parked` is set. Shared by auto/fixed cells and
+    /// sub-screen areas.
+    fn place_workset_into_rect(
+        &self,
+        workset: &Workset,
+        resolved: &[ResolvedWindow],
+        request: &SwitchRequest,
+        target_rect: PixelRect,
+    ) -> Result<(), String> {
+        let mut main_rects = Vec::with_capacity(resolved.len());
+        for w in resolved {
+            let outcome = resolve_main_restore(
+                &w.managed.main_placement,
+                request.live_monitors,
+                request.main_monitor_ids,
+            )
+            .ok_or_else(|| "no live main monitor for parking source bounds".to_string())?;
+            main_rects.push(outcome.rect);
+        }
+        match plan_park_into_slot(&main_rects, target_rect) {
+            ParkPlan::MinimizeWhole => {
                 for w in resolved {
-                    let outcome = resolve_main_restore(
-                        &w.managed.main_placement,
-                        request.live_monitors,
-                        request.main_monitor_ids,
-                    )
-                    .ok_or_else(|| "no live main monitor for parking source bounds".to_string())?;
-                    main_rects.push(outcome.rect);
+                    self.window_ops.minimize(w.hwnd);
                 }
-                match plan_park_into_slot(&main_rects, rect) {
-                    ParkPlan::MinimizeWhole => {
-                        for w in resolved {
-                            self.window_ops.minimize(w.hwnd);
-                        }
-                        Ok(())
-                    }
-                    ParkPlan::ShrinkToFit(rects) => {
-                        for w in resolved {
-                            self.window_ops.restore(w.hwnd);
-                        }
-                        let moves: Vec<(isize, crate::domain::placement::PixelRect)> = resolved
-                            .iter()
-                            .zip(rects)
-                            .map(|(w, rect)| (w.hwnd, rect))
-                            .collect();
-                        self.window_ops
-                            .batch_move(&moves)
-                            .map_err(|e| e.to_string())?;
-                        // "退避後に全画面表示": maximize each window on the parking
-                        // monitor it was just placed on (PLAN.md §2.4 extension).
-                        // The batch_move above put each window's center on the
-                        // parking monitor, so `maximize` fills that monitor.
-                        if workset.fullscreen_when_parked {
-                            for w in resolved {
-                                self.window_ops.maximize(w.hwnd);
-                            }
-                        }
-                        Ok(())
+                Ok(())
+            }
+            ParkPlan::ShrinkToFit(rects) => {
+                for w in resolved {
+                    self.window_ops.restore(w.hwnd);
+                }
+                let moves: Vec<(isize, PixelRect)> = resolved
+                    .iter()
+                    .zip(rects)
+                    .map(|(w, rect)| (w.hwnd, rect))
+                    .collect();
+                self.window_ops
+                    .batch_move(&moves)
+                    .map_err(|e| e.to_string())?;
+                // "退避後に全画面表示": maximize each window on the parking monitor
+                // it was just placed on (PLAN.md §2.4 extension).
+                if workset.fullscreen_when_parked {
+                    for w in resolved {
+                        self.window_ops.maximize(w.hwnd);
                     }
                 }
+                Ok(())
             }
         }
     }
@@ -466,6 +500,22 @@ fn encode_assignments(map: &HashMap<Uuid, ParkingSlotId>) -> HashMap<String, Str
     map.iter()
         .map(|(id, slot)| (id.to_string(), slot.encode()))
         .collect()
+}
+
+/// The union work-area rect of a sub-screen's currently-live monitors, or
+/// `None` if none of them are connected (→ the workset is minimized instead).
+fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) -> Option<PixelRect> {
+    let work_areas: Vec<PixelRect> = sub
+        .monitor_ids
+        .iter()
+        .filter_map(|id| {
+            live_monitors
+                .iter()
+                .find(|m| &m.device_name == id)
+                .map(|m| m.work_area_px)
+        })
+        .collect();
+    bounding_rect(&work_areas)
 }
 
 #[cfg(test)]
@@ -657,6 +707,7 @@ mod tests {
                 .switch_to(SwitchRequest {
                     worksets: &worksets,
                     fixed_slots: &[],
+                    sub_screens: &[],
                     saved_monitors: &saved_monitors,
                     main_monitor_ids: &main_monitor_ids,
                     live_monitors: &live_monitors,
@@ -704,6 +755,7 @@ mod tests {
             .switch_to(SwitchRequest {
                 worksets: &worksets,
                 fixed_slots: &[],
+                sub_screens: &[],
                 saved_monitors: &[],
                 main_monitor_ids: &main_monitor_ids,
                 live_monitors: &live_monitors,
@@ -749,6 +801,7 @@ mod tests {
             .switch_to(SwitchRequest {
                 worksets: &worksets,
                 fixed_slots: &[],
+                sub_screens: &[],
                 saved_monitors: &[],
                 main_monitor_ids: &main_monitor_ids,
                 live_monitors: &live_monitors,
@@ -793,6 +846,7 @@ mod tests {
         let result = coordinator.switch_to(SwitchRequest {
             worksets: &worksets,
             fixed_slots: &[],
+            sub_screens: &[],
             saved_monitors: &[],
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live_monitors,
@@ -860,6 +914,7 @@ mod tests {
             .switch_to(SwitchRequest {
                 worksets: &worksets,
                 fixed_slots: &[],
+                sub_screens: &[],
                 saved_monitors: &[],
                 main_monitor_ids: &main_monitor_ids,
                 live_monitors: &live_monitors,
@@ -881,6 +936,7 @@ mod tests {
         let result = coordinator.switch_to(SwitchRequest {
             worksets: &worksets,
             fixed_slots: &[],
+            sub_screens: &[],
             saved_monitors: &[],
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live_monitors,
@@ -977,6 +1033,7 @@ mod tests {
         let request = |target: Uuid| SwitchRequest {
             worksets: &worksets,
             fixed_slots: &fixed_slots,
+            sub_screens: &[],
             saved_monitors: &saved_monitors,
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live_monitors,
@@ -1019,6 +1076,7 @@ mod tests {
         let result = coordinator.switch_to(SwitchRequest {
             worksets: &[],
             fixed_slots: &[],
+            sub_screens: &[],
             saved_monitors: &[],
             main_monitor_ids: &[],
             live_monitors: &[],

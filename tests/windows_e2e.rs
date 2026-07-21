@@ -288,6 +288,7 @@ fn switch_between_two_real_worksets_minimizes_the_non_current_one() {
         .switch_to(SwitchRequest {
             worksets: &worksets,
             fixed_slots: &[],
+            sub_screens: &[],
             saved_monitors: &[],
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live_monitors,
@@ -301,6 +302,7 @@ fn switch_between_two_real_worksets_minimizes_the_non_current_one() {
         .switch_to(SwitchRequest {
             worksets: &worksets,
             fixed_slots: &[],
+            sub_screens: &[],
             saved_monitors: &[],
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live_monitors,

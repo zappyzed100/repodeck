@@ -21,12 +21,6 @@ export struct RegistrationCandidate {
     checked: bool,
 }
 
-export struct ParkingMonitorRow {
-    device_name: string,
-    detail: string,
-    selected: bool,
-}
-
 component GlassPanel inherits Rectangle {
     background: Theme.glass-panel;
     border-radius: Theme.radius-lg;
@@ -66,12 +60,10 @@ export component WorksetManager inherits Window {
     in property <color> selected-color: #0a84ff;
     in-out property <bool> fullscreen-when-parked: false;
 
-    // 退避先（固定枠）: pick where this workset parks when it isn't current.
-    in-out property <bool> parking-fixed: false;
-    in property <[ParkingMonitorRow]> parking-monitors: [];
-    in-out property <int> parking-selected-split: 1;
-    in-out property <int> parking-selected-cell: 0;
-    in property <[int]> parking-cells: [1];
+    // 退避先: pick where this workset parks when it isn't current — 自動 or one
+    // of the named sub-screens defined in Layout Studio.
+    in property <[string]> parking-subs: [];
+    in-out property <int> parking-selected-sub: -1;
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
@@ -95,10 +87,7 @@ export component WorksetManager inherits Window {
     callback candidate-toggled(index: int);
     callback color-selected(color: color);
     callback fullscreen-toggled();
-    callback parking-mode-selected(fixed: bool);
-    callback parking-monitor-selected(index: int);
-    callback parking-split-selected(split: int);
-    callback parking-cell-selected(index: int);
+    callback parking-sub-selected(index: int);
     callback register-requested(name: string);
 
     callback empty-main-screen-requested();
@@ -326,62 +315,21 @@ export component WorksetManager inherits Window {
                     SectionLabel { text: "退避先"; vertical-alignment: center; }
                     GlassButton {
                         text: "自動";
-                        primary: !root.parking-fixed;
-                        clicked => { root.parking-mode-selected(false); }
+                        primary: root.parking-selected-sub == -1;
+                        clicked => { root.parking-sub-selected(-1); }
                     }
-                    GlassButton {
-                        text: "固定";
-                        primary: root.parking-fixed;
-                        clicked => { root.parking-mode-selected(true); }
+                    for name[i] in root.parking-subs: GlassButton {
+                        text: name;
+                        primary: root.parking-selected-sub == i;
+                        clicked => { root.parking-sub-selected(i); }
                     }
                     Rectangle { horizontal-stretch: 1; }
                 }
-
-                if root.parking-fixed: VerticalLayout {
-                    spacing: Theme.space-xs;
-                    Text {
-                        text: "退避先モニターを選択（メイン画面以外）";
-                        font-size: 11px;
-                        color: Theme.text-tertiary;
-                    }
-                    ScrollView {
-                        height: 84px;
-                        VerticalLayout {
-                            spacing: 2px;
-                            for mon[i] in root.parking-monitors: Rectangle {
-                                height: 24px;
-                                border-radius: Theme.radius-sm;
-                                background: mon.selected ? Theme.glass-selected : Theme.glass-panel-soft;
-                                border-width: 1px;
-                                border-color: mon.selected ? Theme.accent : Theme.hairline;
-                                HorizontalLayout {
-                                    padding-left: Theme.space-sm;
-                                    padding-right: Theme.space-sm;
-                                    Text {
-                                        text: mon.device-name + "  " + mon.detail;
-                                        font-size: 11px;
-                                        color: Theme.text-secondary;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                }
-                                TouchArea { clicked => { root.parking-monitor-selected(i); } }
-                            }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.space-xs;
-                        Text { text: "分割"; font-size: 11px; color: Theme.text-tertiary; vertical-alignment: center; }
-                        GlassButton { text: "1"; primary: root.parking-selected-split == 1; clicked => { root.parking-split-selected(1); } }
-                        GlassButton { text: "2"; primary: root.parking-selected-split == 2; clicked => { root.parking-split-selected(2); } }
-                        GlassButton { text: "4"; primary: root.parking-selected-split == 4; clicked => { root.parking-split-selected(4); } }
-                        Text { text: "セル"; font-size: 11px; color: Theme.text-tertiary; vertical-alignment: center; }
-                        for cell[ci] in root.parking-cells: GlassButton {
-                            text: cell;
-                            primary: root.parking-selected-cell == ci;
-                            clicked => { root.parking-cell-selected(ci); }
-                        }
-                    }
+                if root.parking-subs.length == 0: Text {
+                    text: "サブ画面が未作成です。レイアウトスタジオで作成すると退避先に選べます。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
                 }
 
                 HorizontalLayout {

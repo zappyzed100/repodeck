@@ -54,7 +54,13 @@ pub struct ManagedWindow {
 #[serde(rename_all = "snake_case")]
 pub enum ParkingPolicy {
     Auto,
-    Fixed { slot_id: Uuid },
+    Fixed {
+        slot_id: Uuid,
+    },
+    /// Park onto a named [`SubScreen`](crate::domain::config::SubScreen).
+    SubScreen {
+        sub_screen_id: Uuid,
+    },
 }
 
 /// A non-main monitor's grid cell reserved for one specific workset (PLAN.md §2.5, §3.7).
