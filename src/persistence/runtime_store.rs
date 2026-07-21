@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::domain::agent::AgentRun;
 use crate::persistence::clock;
 
 const RUNTIME_FILE: &str = "runtime.json";
@@ -23,8 +24,8 @@ pub struct RuntimeState {
     /// Workset id (as a string, per JSON object-key rules) -> assigned slot key.
     /// The slot-key encoding is owned by the Phase 6 parking allocator.
     pub auto_slot_assignments: HashMap<String, String>,
-    /// Raw agent-run records; typed as `AgentRun` starting in Phase 8 (PLAN.md §6).
-    pub agent_runs: Vec<serde_json::Value>,
+    /// Tracked Codex agent-run records (PLAN.md §6).
+    pub agent_runs: Vec<AgentRun>,
     pub last_seen_monitor_fingerprint: Option<String>,
     pub last_clean_shutdown: bool,
 }

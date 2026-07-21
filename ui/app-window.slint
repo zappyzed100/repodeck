@@ -1,4 +1,4 @@
-import { ComboBox } from "std-widgets.slint";
+import { ComboBox, ScrollView } from "std-widgets.slint";
 import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
@@ -23,7 +23,7 @@ export component AppWindow inherits Window {
     title: "RepoDeck — 設定";
     icon: @image-url("../assets/repodeck-icon.svg");
     preferred-width: 420px;
-    preferred-height: 440px;
+    preferred-height: 640px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -42,9 +42,20 @@ export component AppWindow inherits Window {
     in property <string> hotkey-status-text: "";
     in property <bool> hotkey-status-is-warning: false;
 
+    // Codex連携 (PLAN.md §6.5, Phase 8).
+    in property <bool> codex-hook-exe-found: false;
+    in property <string> codex-hook-snippet: "";
+    in property <string> codex-status-text: "";
+    in property <bool> codex-status-is-warning: false;
+    in property <bool> codex-send-test-event-enabled: false;
+
     callback hotkey-rebind-requested();
     callback open-layout-studio-requested();
     callback open-workset-manager-requested();
+    callback codex-check-hook-exe-requested();
+    callback codex-copy-snippet-requested();
+    callback codex-open-config-folder-requested();
+    callback codex-send-test-event-requested();
 
     Rectangle {
         // The glass card: everything visible sits on this opaque layer, so
@@ -147,11 +158,82 @@ export component AppWindow inherits Window {
                 text: "セット管理を開く";
                 clicked => { root.open-workset-manager-requested(); }
             }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "Codex連携"; }
+
+            Text {
+                text: root.codex-hook-exe-found ? "hook実行ファイル: 検出済み" : "hook実行ファイル: 未検出";
+                font-size: 12px;
+                color: root.codex-hook-exe-found ? Theme.text-secondary : Theme.danger;
+            }
+
+            GlassButton {
+                text: "hook実行ファイルを確認";
+                clicked => { root.codex-check-hook-exe-requested(); }
+            }
+
+            GlassButton {
+                text: "hooks.json断片をコピー";
+                clicked => { root.codex-copy-snippet-requested(); }
+            }
+
+            if root.codex-hook-snippet != "": Rectangle {
+                height: 100px;
+                border-radius: Theme.radius-md;
+                background: Theme.glass-panel-soft;
+                border-width: 1px;
+                border-color: Theme.hairline;
+
+                ScrollView {
+                    Text {
+                        text: root.codex-hook-snippet;
+                        font-size: 10px;
+                        font-family: "Consolas";
+                        color: Theme.text-secondary;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GlassButton {
+                text: "Codex設定フォルダーを開く";
+                clicked => { root.codex-open-config-folder-requested(); }
+            }
+
+            GlassButton {
+                text: "テストイベントを送信";
+                enabled: root.codex-send-test-event-enabled;
+                clicked => { root.codex-send-test-event-requested(); }
+            }
+
+            if root.codex-status-text != "": Text {
+                text: root.codex-status-text;
+                font-size: 12px;
+                color: root.codex-status-is-warning ? Theme.danger : Theme.success;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "Codex CLIの /hooks で4つのフックを信頼するまで、イベントは届きません。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
         }
     }
 }
 
 export component TrayIcon inherits SystemTrayIcon {
+    // `icon`/`tooltip` are inherited builtin properties of `SystemTrayIcon`,
+    // not properties declared on this component — Slint only generates
+    // Rust setters for properties declared at the component's own level, so
+    // runtime tray-icon-color updates (PLAN.md §6.7, Phase 8) alias them
+    // through component-level properties instead of setting `icon`/
+    // `tooltip` directly.
+    in-out property <image> icon-source <=> root.icon;
+    in-out property <string> tooltip-text <=> root.tooltip;
     icon: @image-url("../assets/repodeck-icon.svg");
     tooltip: "RepoDeck";
 

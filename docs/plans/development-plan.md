@@ -216,6 +216,73 @@
   - エージェント状態表示・全設定画面（ホットキー以外）・初回セットアップ
     ウィザードはPhase 7のチェックリスト外として意図的に対象外（Phase 8以降）。
 
+- **Phase 8（Codex連携）: 完了・実機検証済み。** Codex CLI/IDE拡張のライフサイクルフックを
+  唯一の連携経路とし、RepoDeckはCodexを起動・接続しない設計（PLAN.md §6.3）。
+  - `domain::agent`: `AgentState`（Idle/Running/NeedsInput/Ready/Blocked/Unknown）、
+    `AgentRun`、§6.2の6段階集約優先順位を実装する`aggregate_state`。表示順序
+    （§3.3: needs_input > ready > blocked > running > idle > unknown）とトレイ優先順位
+    （§6.7: needs_input > blocked > ready > running > idle）はReady/Blockedの順位が
+    入れ替わるため意図的に別関数（`row_display_priority`/`tray_priority`）とした。
+  - `ipc::protocol`: RepoDeck内部の正規化イベントschema v1（`NormalizedEvent`）と、
+    Codex hook JSON→正規化イベントの状態を持たない変換（`parse_and_adapt`）。
+    `permission_mode`はPLAN.md §6.3の消費フィールド一覧に載っているが、集約・イベント
+    対応表・通知のどこからも参照されないため実装せず（§6.4の転送JSON例にも無い）。
+  - `ipc::named_pipe`: `\\.\pipe\RepoDeck.AgentEvents.v1`の受信専用サーバー。
+    `ConvertStringSecurityDescriptorToSecurityDescriptorW("D:P(A;;GA;;;OW)")`で
+    所有者限定ACLを構築（Everyone・他ユーザー・組み込みグループ一切なし）。
+    `ConnectNamedPipe`/`ReadFile`は`lpOverlapped: None`の同期呼び出しのみでIOCP不要
+    （ベンダー同梱の`windows`クレートで確認済み）。`HotkeyThread`と異なり`Drop`は
+    シャットダウンフラグを立てるのみでスレッドをjoinしない（`ConnectNamedPipe`で
+    ブロック中のスレッドを起こす`PostThreadMessageW`相当の手段が無いため）。
+  - `src/bin/repodeck-hook.rs`: 標準入力→`ipc::protocol::parse_and_adapt`→
+    正規化JSONを名前付きパイプへ単発送信、常に終了コード0（Codexの hookランナーは
+    非ゼロ終了を実エラー扱いするため）。`CreateFileW(OPEN_EXISTING, ...)`は
+    `WaitNamedPipeW`によるリトライを行わないため、RepoDeck未起動時でも即座に失敗して
+    終了する（§6.4の「200ms以内に終了コード0」を構造的に満たす）。
+  - `application::agent_status_service`: `cwd`→ワークセットの対応付け（Gitルート
+    完全一致→配下判定の順、§6.6）、§6.3のイベント別状態遷移（`RunStarted`/
+    `NeedsInput`はupsert、`ToolUseObserved`は`NeedsInput`からの遷移のみ、
+    `RunCompleted`は`confirmed: false`のReadyを作成/更新）、`confirm_ready_and_recompute`
+    （§3.3「選択後」のready確認処理、`SwitchCoordinator::switch_to`成功後にのみ呼ぶ）。
+    一致しないイベントは`UnmatchedAgentEvent`として30分だけメモリ上に保持し、
+    後から一致するワークセットが登録されても昇格させない（§6.6）。
+  - トレイアイコンの状態バッジ6種は、PNGアセットを事前生成する代わりに`resvg`/
+    `tiny_skia`（既存のビルド依存）で起動時にメモリ上でレンダリングし、
+    `slint::Image::from_rgba8_premultiplied`で直接`Image`化した。設計時点では
+    「事前生成PNGを`slint::Image::load_from_path`で読み込む」想定だったが、
+    実装時にベンダーコードで`Image::from_rgba8_premultiplied`の存在を確認し、
+    インストール先パス解決が一切不要になるためこちらを採用（アセットファイルなし）。
+  - `SystemTrayIcon`を継承した`TrayIcon`コンポーネントの`icon`/`tooltip`は継承元の
+    組み込みプロパティであり、Slintはコンポーネント自身が宣言したプロパティにしか
+    Rust側セッターを生成しない——実機ビルドで`set_icon`/`set_tooltip`が存在しない
+    というコンパイルエラーで判明。`icon-source <=> root.icon`のような
+    component-level エイリアスプロパティを追加して解消（`ui/app-window.slint`）。
+  - 実機確認で実バグを1件発見・修正済み: `src/app.rs`の`handle_agent_ui_event`が、
+    パイプ経由で受信したバイト列（`repodeck-hook.exe`が送信する時点で既に
+    `ipc::protocol::parse_and_adapt`を適用済みの正規化JSON）へ**再度**
+    `parse_and_adapt`を呼んでいたため、`hook_event_name`フィールドが存在しないと
+    判定されて全イベントが「不正なJSON」として静かに破棄されていた
+    （実機のログに`missing field \`hook_event_name\``が出力されて発覚）。
+    受信バイト列を`NormalizedEvent`として直接デシリアライズするよう修正して解消。
+    単体テスト・自動E2Eテスト（モック無しの実`NamedPipeServer`＋実`repodeck-hook.exe`
+    サブプロセス往復）はどちらもこのバグを検出できておらず、実機でのボタン操作と
+    実際のバッジ色変化の目視確認だけが発見できた（Phase 7と同じ教訓）。
+  - 手動確認: 設定画面「Codex連携」セクションのレイアウト・hook実行ファイル検出
+    状態表示・ワークセット0件時の送信ボタン無効化を実機スクリーンショットで確認。
+    「hooks.json断片をコピー」クリック→クリップボードの実内容がPLAN.md §6.5の
+    生成後検証条件（4フック各1グループ・`type: command`・`timeout: 2`・
+    `commandWindows`の絶対パスを引用符で囲む）を満たすことを確認。実環境の
+    `config.json`へ一時テストワークセットを追加（ユーザー承認済み、検証後に
+    原状回復）した上で「テストイベントを送信」→実`repodeck-hook.exe`サブプロセスが
+    4フックを順に送信→クイックスイッチャーの行バッジが実際に緑（完了）へ変化する
+    ことを確認。該当ワークセットへの切替でバッジが確認済み（`confirmed: true`）に
+    なることも`runtime.json`の実内容で確認。トレイアイコンの色変化自体は
+    スクリーンショットでの目視確認はしていないが、バッジ更新と同一の
+    `handle_agent_ui_event`/`refresh_tray_status`経路で動くことをコードレビューで確認。
+  - Windowsトースト通知・`hooks.json`の自動書き込み・Codex App Serverへの接続・
+    エージェント状態変化での自動ワークセット切替は、PLAN.mdの対象外リストの通り
+    意図的にスコープ外（v0.2以降）。
+
 ### 実装メモ・既知の齟齬
 
 - **`PopupLocation`の記法齟齬**: §3.3（クイックスイッチャー表示位置のUI仕様）は

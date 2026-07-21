@@ -100,7 +100,12 @@ repodeck/
    （検索・矢印/数字キー/Enter・タスクバー/Alt+Tab非表示・アウトフォーカスで閉じる）、
    トレイメニュー刷新、`SwitchCoordinator`への実配線。エージェント状態表示はPhase 8待ち
    （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
-8. **Phase 8 — Codex連携**（未着手）: 名前付きパイプ、`repodeck-hook.exe`、エージェント状態集約。
+8. **Phase 8 — Codex連携**（完了）: 名前付きパイプ（`\\.\pipe\RepoDeck.AgentEvents.v1`、
+   所有者限定ACL）、`repodeck-hook.exe`（標準入力→正規化JSON→単発送信、常に終了コード0）、
+   エージェント状態集約（`domain::agent`の6段階優先順位）、クイックスイッチャーの状態
+   バッジ・トレイアイコン色連動、設定画面「Codex連携」セクション（hook検出・hooks.json
+   スニペット生成＋コピー・設定フォルダーを開く・実プロセスによるテストイベント送信）。
+   詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照。
 9. **Phase 9 — 回復性・仕上げ**（未着手）: モニター変更監視、起動時復旧、配布物作成。
 
 MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本とする。
@@ -122,5 +127,5 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 5: ワークセット登録・照合
 - [x] Phase 6: 退避割当・切替Coordinator
 - [x] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
-- [ ] Phase 8: Codex連携 `next`
-- [ ] Phase 9: 回復性・仕上げ
+- [x] Phase 8: Codex連携
+- [ ] Phase 9: 回復性・仕上げ `next`

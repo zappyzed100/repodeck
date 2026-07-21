@@ -3,6 +3,16 @@ use std::path::{Path, PathBuf};
 fn main() {
     slint_build::compile("ui/app-window.slint").expect("failed to compile Slint UI");
 
+    // This crate produces two binaries (`repodeck`, `repodeck-hook`), but
+    // Cargo only runs one build script per *package*, with no reliable way
+    // to tell which binary is currently being linked (`CARGO_BIN_NAME` isn't
+    // set for build scripts in this single-build-script setup). So the
+    // manifest + icon embedding below unconditionally applies to whichever
+    // binary Cargo happens to be linking, including `repodeck-hook.exe` — a
+    // harmless side effect for a console tool with no window (a few extra
+    // KB, no functional impact). Do not "fix" this with a `CARGO_BIN_NAME`
+    // gate; splitting the hook into its own workspace member just to avoid
+    // it would be overkill for what it actually costs.
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         use embed_manifest::{embed_manifest, new_manifest};
 

@@ -16,17 +16,23 @@ use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONWARNING, MB_YESNO, MessageBoxW};
 use windows::core::HSTRING;
 
+use crate::application::agent_status_service;
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
 use crate::application::popup_placement;
 use crate::application::quick_switcher_service;
 use crate::application::switch_coordinator::{SwitchCoordinator, SwitchRequest};
 use crate::application::workset_service;
 use crate::diagnostics::logging;
-use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier};
+use crate::domain::agent::{
+    AgentRun, AgentState, row_display_priority, state_color, tray_priority,
+};
+use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier, SortMode};
 use crate::domain::monitor::AutoSplit;
 use crate::domain::placement::SavedShowState;
 use crate::domain::workset::{ManagedWindow, ParkingPolicy};
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
+use crate::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
+use crate::ipc::protocol;
 use crate::persistence::{clock, config_store, runtime_store};
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
@@ -1336,37 +1342,65 @@ fn wire_workset_manager(
 }
 
 /// Rebuilds the Quick Switcher's row list from `config.worksets` (PLAN.md
-/// §3.3 "表示内容"), mirroring `refresh_workset_summaries`'s shape. No
-/// agent-status fields are populated — that data doesn't exist until Phase 8.
+/// §3.3 "表示内容"), mirroring `refresh_workset_summaries`'s shape, plus each
+/// row's Codex agent-status badge (PLAN.md §6, Phase 8). When `sort_mode`
+/// isn't `Manual`, status priority becomes the primary sort key (highest
+/// first), with the existing `SortMode` comparator only breaking ties within
+/// a status group — `Manual` bypasses status grouping entirely (badges still
+/// show, order never changes).
 fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
-    let current_workset_id = runtime_store::load(data_dir).current_workset_id;
+    let state = runtime_store::load(data_dir);
+    let current_workset_id = state.current_workset_id;
     let filter_text = switcher.get_filter_text().to_string();
-    let ordered = quick_switcher_service::sorted_and_filtered(
+    let mut ordered = quick_switcher_service::sorted_and_filtered(
         &config.worksets,
         config.settings.sort_mode,
         &filter_text,
     );
 
+    let aggregates = agent_status_service::aggregate_all(&config.worksets, &state.agent_runs);
+    if config.settings.sort_mode != SortMode::Manual {
+        ordered.sort_by_key(|w| {
+            std::cmp::Reverse(row_display_priority(
+                aggregates
+                    .get(&w.id)
+                    .copied()
+                    .unwrap_or(AgentState::Unknown),
+            ))
+        });
+    }
+
     let rows: Vec<QuickSwitcherRow> = ordered
         .iter()
         .enumerate()
-        .map(|(i, workset)| QuickSwitcherRow {
-            workset_id: workset.id.to_string().into(),
-            name: workset.name.clone().into(),
-            repository_name: workset
-                .repository_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| workset.repository_path.display().to_string())
-                .into(),
-            color: hex_to_color(&workset.color),
-            is_current: Some(workset.id) == current_workset_id,
-            is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
-            number_hint: if i < 9 {
-                i32::try_from(i + 1).unwrap_or(0)
-            } else {
-                0
-            },
+        .map(|(i, workset)| {
+            let agent_state = aggregates
+                .get(&workset.id)
+                .copied()
+                .unwrap_or(AgentState::Unknown);
+            let (agent_status_label, agent_elapsed_text) =
+                agent_row_status(&state.agent_runs, workset.id, agent_state);
+            QuickSwitcherRow {
+                workset_id: workset.id.to_string().into(),
+                name: workset.name.clone().into(),
+                repository_name: workset
+                    .repository_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workset.repository_path.display().to_string())
+                    .into(),
+                color: hex_to_color(&workset.color),
+                is_current: Some(workset.id) == current_workset_id,
+                is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
+                number_hint: if i < 9 {
+                    i32::try_from(i + 1).unwrap_or(0)
+                } else {
+                    0
+                },
+                agent_status_color: hex_to_color(state_color(agent_state)),
+                agent_status_label: agent_status_label.into(),
+                agent_elapsed_text: agent_elapsed_text.into(),
+            }
         })
         .collect();
 
@@ -1376,6 +1410,100 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
         switcher.set_selected_index(0);
     } else if switcher.get_selected_index() >= row_count {
         switcher.set_selected_index(row_count - 1);
+    }
+}
+
+/// Japanese label for an aggregate agent state, shared by the Quick
+/// Switcher's row badge and the tray tooltip. Empty for `Idle`/`Unknown` —
+/// the common case shouldn't carry visual noise.
+fn agent_status_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Running => "実行中",
+        AgentState::NeedsInput => "入力待ち",
+        AgentState::Ready => "完了",
+        AgentState::Blocked => "エラー",
+        AgentState::Idle | AgentState::Unknown => "",
+    }
+}
+
+/// Finds the run(s) that actually drive a workset's aggregate `state`
+/// (matching `domain::agent::aggregate_state`'s own per-state criteria — in
+/// particular, `Ready` only counts unconfirmed runs) and formats how long
+/// ago the most recent one transitioned. Empty for `Idle`/`Unknown`, where
+/// there's no single "since when" moment worth surfacing.
+fn agent_row_status(
+    runs: &[AgentRun],
+    workset_id: uuid::Uuid,
+    state: AgentState,
+) -> (&'static str, String) {
+    if matches!(state, AgentState::Idle | AgentState::Unknown) {
+        return (agent_status_label(state), String::new());
+    }
+
+    let driving_run = runs
+        .iter()
+        .filter(|r| {
+            r.workset_id == workset_id
+                && match state {
+                    AgentState::Ready => r.state == AgentState::Ready && !r.confirmed,
+                    other => r.state == other,
+                }
+        })
+        .max_by(|a, b| a.last_transition_at.cmp(&b.last_transition_at));
+
+    let elapsed = driving_run
+        .map(|r| format_elapsed(&r.last_transition_at))
+        .unwrap_or_default();
+    (agent_status_label(state), elapsed)
+}
+
+/// "3分" / "1分未満" style elapsed-time text from an RFC 3339 timestamp,
+/// computed fresh at display time rather than stored as a duration (PLAN.md
+/// §3.3's "経過時間" column).
+fn format_elapsed(timestamp: &str) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return String::new();
+    };
+    let minutes = (OffsetDateTime::now_utc() - parsed).whole_minutes();
+    if minutes < 1 {
+        "1分未満".to_string()
+    } else {
+        format!("{minutes}分")
+    }
+}
+
+/// The workset with the highest `tray_priority` aggregate state among those
+/// that aren't `Idle`/`Unknown` (PLAN.md §6.7's tray-color priority),
+/// shared by the tray-icon refresh and the tray-click row-selection logic.
+fn highest_priority_agent_workset(
+    config: &AppConfig,
+    agent_runs: &[AgentRun],
+) -> Option<(uuid::Uuid, AgentState)> {
+    let aggregates = agent_status_service::aggregate_all(&config.worksets, agent_runs);
+    config
+        .worksets
+        .iter()
+        .filter_map(|w| aggregates.get(&w.id).map(|s| (w.id, *s)))
+        .filter(|(_, s)| !matches!(s, AgentState::Idle | AgentState::Unknown))
+        .max_by_key(|(_, s)| tray_priority(*s))
+}
+
+/// Selects the row matching `workset_id`, if one is currently displayed
+/// (PLAN.md §6.7: a tray left-click that opens the Quick Switcher selects
+/// the highest-priority workset's row).
+fn select_row_for_workset(switcher: &QuickSwitcher, workset_id: uuid::Uuid) {
+    let target = workset_id.to_string();
+    let rows = switcher.get_rows();
+    for i in 0..rows.row_count() {
+        if let Some(row) = rows.row_data(i)
+            && row.workset_id == target
+        {
+            switcher.set_selected_index(i32::try_from(i).unwrap_or(0));
+            return;
+        }
     }
 }
 
@@ -1485,6 +1613,19 @@ fn wire_quick_switcher(
                 Ok(_) => {
                     switcher.set_status_text("".into());
                     switcher.set_status_is_warning(false);
+                    // PLAN.md §3.3 "選択後" / ready確認処理: switching to a
+                    // workset counts as the user having seen its completed
+                    // agent runs.
+                    if let Err(err) =
+                        agent_status_service::confirm_ready_and_recompute(&d, target_workset_id)
+                    {
+                        tracing::warn!(error = %err, "failed to confirm ready agent runs after switching");
+                    }
+                    UI_CONTEXT.with(|cell| {
+                        if let Some(ctx) = &*cell.borrow() {
+                            refresh_tray_status(ctx);
+                        }
+                    });
                     config.settings.close_after_switch
                 }
                 Err(err) => {
@@ -1535,11 +1676,13 @@ fn wire_quick_switcher(
 
     let s = switcher.as_weak();
     let settings_for_open = settings_window;
+    let c = config.clone();
     switcher.on_settings_requested(move || {
         if let Some(switcher) = s.upgrade() {
             let _ = switcher.hide();
         }
         if let Some(settings) = settings_for_open.upgrade() {
+            refresh_codex_settings_state(&settings, &c.borrow());
             let _ = settings.show();
         }
     });
@@ -1667,6 +1810,280 @@ fn wire_settings(
     });
 }
 
+/// Wires the settings window's "Codex連携" section (PLAN.md §6.5). Unlike
+/// `wire_settings`, nothing here is persisted to `AppConfig` — the hook
+/// path, snippet, and test-event flow are all derived fresh each time from
+/// the filesystem/process environment, not stored settings.
+fn wire_codex_settings(window: &AppWindow, config: Rc<RefCell<AppConfig>>) {
+    refresh_codex_settings_state(window, &config.borrow());
+
+    let w = window.as_weak();
+    window.on_codex_check_hook_exe_requested(move || {
+        if let Some(window) = w.upgrade() {
+            check_hook_exe(&window);
+        }
+    });
+
+    let w = window.as_weak();
+    window.on_codex_copy_snippet_requested(move || {
+        let Some(window) = w.upgrade() else { return };
+        let Some(hook_path) = hook_exe_path() else {
+            window.set_codex_status_text(
+                "repodeck-hook.exeが見つかりません。インストール先を確認してください。".into(),
+            );
+            window.set_codex_status_is_warning(true);
+            return;
+        };
+
+        let snippet = build_hooks_json_snippet(&hook_path);
+        window.set_codex_hook_snippet(snippet.clone().into());
+        match copy_text_to_clipboard(&snippet) {
+            Ok(()) => {
+                window.set_codex_status_text("クリップボードへコピーしました。".into());
+                window.set_codex_status_is_warning(false);
+            }
+            Err(err) => {
+                window.set_codex_status_text(format!("コピーに失敗しました: {err}").into());
+                window.set_codex_status_is_warning(true);
+            }
+        }
+    });
+
+    window.on_codex_open_config_folder_requested(move || {
+        let folder = codex_config_folder();
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(&folder)
+            .spawn()
+        {
+            tracing::warn!(error = %err, path = %folder.display(), "failed to open the Codex config folder");
+        }
+    });
+
+    let w = window.as_weak();
+    let c = config;
+    window.on_codex_send_test_event_requested(move || {
+        let Some(window) = w.upgrade() else { return };
+        let Some(repository_path) = c
+            .borrow()
+            .worksets
+            .first()
+            .map(|w| w.repository_path.clone())
+        else {
+            window.set_codex_status_text("先にセットを登録してください。".into());
+            window.set_codex_status_is_warning(true);
+            return;
+        };
+        let Some(hook_path) = hook_exe_path() else {
+            window.set_codex_status_text("repodeck-hook.exeが見つかりません。".into());
+            window.set_codex_status_is_warning(true);
+            return;
+        };
+
+        window.set_codex_status_text(
+            "テストイベントを送信中… クイックスイッチャーのバッジを確認してください。".into(),
+        );
+        window.set_codex_status_is_warning(false);
+        // Runs entirely on a background thread: the real feedback is the
+        // Quick Switcher badge / tray icon transitions that arrive back
+        // through the actual named pipe, exactly like a real Codex hook —
+        // this thread never touches UI state directly.
+        std::thread::spawn(move || {
+            if let Err(err) = send_test_event(&hook_path, &repository_path) {
+                tracing::warn!(error = %err, "failed to send the Codex test event sequence");
+            }
+        });
+    });
+}
+
+fn refresh_codex_settings_state(window: &AppWindow, config: &AppConfig) {
+    check_hook_exe(window);
+    window.set_codex_send_test_event_enabled(!config.worksets.is_empty());
+}
+
+fn check_hook_exe(window: &AppWindow) {
+    window.set_codex_hook_exe_found(hook_exe_path().is_some());
+}
+
+/// `repodeck-hook.exe` is expected to sit next to `repodeck.exe` (same
+/// install directory) — PLAN.md doesn't specify an installer, so this is
+/// the only location that's true in both a dev build (`target/debug/`) and
+/// a plain xcopy-style install.
+fn hook_exe_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let hook_path = exe.parent()?.join("repodeck-hook.exe");
+    hook_path.exists().then_some(hook_path)
+}
+
+/// Builds the `hooks.json` fragment for all 4 Codex hooks (PLAN.md §6.5),
+/// via `serde_json::json!`/`to_string_pretty` rather than string templating
+/// so every one of §6.5's validation conditions holds by construction: one
+/// group per hook, one `command`-type entry per group, a 2-second timeout,
+/// and `commandWindows` wrapping the absolute path in literal quotes (the
+/// shell-level quoting a path containing spaces needs, distinct from the
+/// JSON string's own quoting).
+fn build_hooks_json_snippet(hook_path: &Path) -> String {
+    let command = format!("\"{}\"", hook_path.display());
+    let hook_group = || {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "commandWindows": command,
+                "timeout": 2,
+            }]
+        })
+    };
+
+    let value = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [hook_group()],
+            "PermissionRequest": [hook_group()],
+            "PostToolUse": [hook_group()],
+            "Stop": [hook_group()],
+        }
+    });
+
+    serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+/// `%USERPROFILE%\.codex`, falling back to bare `%USERPROFILE%` if Codex
+/// hasn't created its config folder yet.
+fn codex_config_folder() -> PathBuf {
+    let base = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let codex_dir = base.join(".codex");
+    if codex_dir.exists() { codex_dir } else { base }
+}
+
+/// Fires the real `repodeck-hook.exe` through its full 4-hook lifecycle
+/// sequence (`UserPromptSubmit` → `PermissionRequest` → `PostToolUse` →
+/// `Stop`) against `repository_path`, with a short pause between each so the
+/// Quick Switcher badge/tray icon visibly transition through
+/// running→needs_input→running→ready (Phase 8 design decision 2) — this
+/// exercises the full pipe→ACL→adapter→aggregation→UI path, not an
+/// in-process shortcut.
+fn send_test_event(hook_path: &Path, repository_path: &Path) -> Result<(), String> {
+    let session_id = format!("repodeck-test-{}", uuid::Uuid::new_v4());
+    for hook_event_name in [
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+    ] {
+        send_one_test_hook_event(hook_path, repository_path, &session_id, hook_event_name)?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    Ok(())
+}
+
+fn send_one_test_hook_event(
+    hook_path: &Path,
+    repository_path: &Path,
+    session_id: &str,
+    hook_event_name: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "turn_id": "repodeck-test-turn",
+        "cwd": repository_path.to_string_lossy(),
+        "hook_event_name": hook_event_name,
+        "model": "repodeck-test",
+    })
+    .to_string();
+
+    let mut child = Command::new(hook_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open the hook process's stdin".to_string())?
+        .write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    child.wait().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Copies `text` to the clipboard as `CF_UNICODETEXT` (hardcoded as `13`
+/// rather than pulling in `Win32_System_Ole` for the constant). Ownership of
+/// the `GlobalAlloc`'d memory transfers to the clipboard on a *successful*
+/// `SetClipboardData` — it must not be freed in that case, only on failure,
+/// or the clipboard is left holding a dangling handle.
+fn copy_text_to_clipboard(text: &str) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+    // SAFETY: `hwndnewowner: None` associates the clipboard with the current
+    // task, sufficient for a one-shot copy.
+    unsafe { OpenClipboard(None) }?;
+
+    let result: windows::core::Result<()> = (|| {
+        // SAFETY: the clipboard is open (just above); this discards whatever
+        // was previously on it, which is the point of "copy".
+        unsafe { EmptyClipboard() }?;
+
+        // SAFETY: `byte_len` is nonzero (at least the NUL terminator).
+        let hglobal: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }?;
+
+        // SAFETY: `hglobal` was just allocated above with `byte_len` bytes.
+        let ptr = unsafe { GlobalLock(hglobal) };
+        if ptr.is_null() {
+            // SAFETY: `hglobal` is still owned by this function; the lock
+            // above failed, so the clipboard never took ownership of it.
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(windows::core::Error::from_thread());
+        }
+        // SAFETY: `ptr` is a writable buffer of `byte_len` bytes for as long
+        // as the lock above holds; unlocked immediately below.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr.cast::<u8>(), byte_len);
+        }
+        // SAFETY: unlocks the same handle locked above; a "failure" here
+        // (lock count reaching zero) is the documented normal case, not a
+        // real error, so the result is discarded.
+        let _ = unsafe { GlobalUnlock(hglobal) };
+
+        // SAFETY: `hglobal` is a valid `GMEM_MOVEABLE` handle. On success the
+        // clipboard now owns it and must not be freed here (see this
+        // function's doc comment); on failure it's still ours to free.
+        match unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hglobal.0))) } {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                unsafe {
+                    let _ = GlobalFree(Some(hglobal));
+                }
+                Err(err)
+            }
+        }
+    })();
+
+    // SAFETY: closes the clipboard opened above, regardless of the inner
+    // result.
+    unsafe {
+        let _ = CloseClipboard();
+    }
+
+    result
+}
+
 /// Native `MessageBoxW` confirmation for the tray's "全管理ウィンドウを回収" —
 /// a single click would otherwise move every window across every workset at
 /// once with no chance to back out.
@@ -1707,6 +2124,11 @@ struct CrossThreadUiContext {
     pending_hotkey_rollback: RefCell<Option<HotkeyConfig>>,
     settings_window: slint::Weak<AppWindow>,
     quick_switcher: slint::Weak<QuickSwitcher>,
+    tray: slint::Weak<TrayIcon>,
+    tray_icons: TrayIcons,
+    /// Codex events whose `cwd` didn't match any registered workset (PLAN.md
+    /// §6.6). In-memory only, never persisted.
+    unmatched_agent_events: RefCell<Vec<agent_status_service::UnmatchedAgentEvent>>,
 }
 
 thread_local! {
@@ -1742,6 +2164,187 @@ fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
             }
         }
     }
+}
+
+/// Send-safe projection of `ipc::named_pipe::PipeServerEvent::MessageReceived`,
+/// built on the pipe server's accept thread and handled on the UI thread via
+/// `slint::invoke_from_event_loop` — same shape as `HotkeyUiEvent`. Carries
+/// only the raw bytes (trivially `Send`); parsing and all `Rc`-based state
+/// access happen after the marshal, in `handle_agent_ui_event`.
+enum AgentUiEvent {
+    MessageReceived(Vec<u8>),
+}
+
+fn handle_agent_ui_event(event: AgentUiEvent) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let AgentUiEvent::MessageReceived(bytes) = event;
+
+    // `repodeck-hook.exe` already ran `ipc::protocol::parse_and_adapt` on the
+    // raw Codex hook JSON before sending it over the pipe (PLAN.md §6.4's
+    // "転送JSON" *is* the normalized wire schema) — deserializing straight to
+    // `NormalizedEvent` here, not re-adapting, is what the wire format is.
+    let normalized: protocol::NormalizedEvent = match serde_json::from_slice(&bytes) {
+        Ok(normalized) => normalized,
+        Err(err) => {
+            tracing::warn!(error = %err, "dropping malformed Codex agent event");
+            return;
+        }
+    };
+
+    {
+        let config = ctx.config.borrow();
+        let mut unmatched = ctx.unmatched_agent_events.borrow_mut();
+        if let Err(err) = agent_status_service::apply_event(
+            &ctx.data_dir,
+            &config.worksets,
+            &mut unmatched,
+            normalized,
+        ) {
+            tracing::warn!(error = %err, "failed to persist Codex agent status update");
+        }
+    }
+
+    refresh_tray_status(&ctx);
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        refresh_quick_switcher_rows(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+    }
+}
+
+/// Recomputes the tray icon color/tooltip from every registered workset's
+/// aggregate agent state (PLAN.md §6.7): the highest-`tray_priority` active
+/// workset wins, or the idle icon/plain tooltip if none are active.
+fn refresh_tray_status(ctx: &CrossThreadUiContext) {
+    let Some(tray) = ctx.tray.upgrade() else {
+        return;
+    };
+    let config = ctx.config.borrow();
+    let state = runtime_store::load(&ctx.data_dir);
+
+    match highest_priority_agent_workset(&config, &state.agent_runs) {
+        Some((workset_id, agent_state)) => {
+            let name = config
+                .worksets
+                .iter()
+                .find(|w| w.id == workset_id)
+                .map(|w| w.name.as_str())
+                .unwrap_or("");
+            tray.set_icon_source(ctx.tray_icons.get(agent_state).clone());
+            tray.set_tooltip_text(
+                format!("RepoDeck — {name}: {}", agent_status_label(agent_state)).into(),
+            );
+        }
+        None => {
+            tray.set_icon_source(ctx.tray_icons.get(AgentState::Idle).clone());
+            tray.set_tooltip_text("RepoDeck".into());
+        }
+    }
+}
+
+/// The 6 agent-state tray-icon variants (PLAN.md §6.7), rendered once at
+/// startup: the bundled app icon with a colored status-dot badge painted in
+/// the corner. Rendered in memory via `resvg`/`tiny_skia` (already a
+/// dependency for `build.rs`'s own icon generation) and handed to Slint as
+/// `Image::from_rgba8_premultiplied` — no asset files or install-path
+/// lookups needed at runtime.
+struct TrayIcons {
+    idle: slint::Image,
+    running: slint::Image,
+    needs_input: slint::Image,
+    ready: slint::Image,
+    blocked: slint::Image,
+    unknown: slint::Image,
+}
+
+impl TrayIcons {
+    fn render() -> Self {
+        Self {
+            idle: render_tray_icon(state_color(AgentState::Idle)),
+            running: render_tray_icon(state_color(AgentState::Running)),
+            needs_input: render_tray_icon(state_color(AgentState::NeedsInput)),
+            ready: render_tray_icon(state_color(AgentState::Ready)),
+            blocked: render_tray_icon(state_color(AgentState::Blocked)),
+            unknown: render_tray_icon(state_color(AgentState::Unknown)),
+        }
+    }
+
+    fn get(&self, state: AgentState) -> &slint::Image {
+        match state {
+            AgentState::Idle => &self.idle,
+            AgentState::Running => &self.running,
+            AgentState::NeedsInput => &self.needs_input,
+            AgentState::Ready => &self.ready,
+            AgentState::Blocked => &self.blocked,
+            AgentState::Unknown => &self.unknown,
+        }
+    }
+}
+
+const TRAY_ICON_SVG: &[u8] = include_bytes!("../assets/repodeck-icon.svg");
+const TRAY_ICON_SIZE: u32 = 32;
+const TRAY_BADGE_RADIUS: f32 = 9.0;
+
+fn render_tray_icon(hex_color: &str) -> slint::Image {
+    let tree = resvg::usvg::Tree::from_data(TRAY_ICON_SVG, &resvg::usvg::Options::default())
+        .expect("bundled repodeck-icon.svg must parse");
+    let source_size = tree.size();
+
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(TRAY_ICON_SIZE, TRAY_ICON_SIZE).expect("nonzero icon size");
+    let scale_x = TRAY_ICON_SIZE as f32 / source_size.width();
+    let scale_y = TRAY_ICON_SIZE as f32 / source_size.height();
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale_x, scale_y),
+        &mut pixmap.as_mut(),
+    );
+
+    draw_status_badge(&mut pixmap, hex_color);
+
+    let mut buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(TRAY_ICON_SIZE, TRAY_ICON_SIZE);
+    buffer.make_mut_bytes().copy_from_slice(pixmap.data());
+    slint::Image::from_rgba8_premultiplied(buffer)
+}
+
+/// Paints a filled circle badge (with a thin dark ring for contrast against
+/// light taskbars) in the bottom-right corner, in the state's hex color.
+fn draw_status_badge(pixmap: &mut resvg::tiny_skia::Pixmap, hex_color: &str) {
+    let cx = TRAY_ICON_SIZE as f32 - TRAY_BADGE_RADIUS - 1.0;
+    let cy = TRAY_ICON_SIZE as f32 - TRAY_BADGE_RADIUS - 1.0;
+
+    let mut ring_paint = resvg::tiny_skia::Paint::default();
+    ring_paint.set_color(resvg::tiny_skia::Color::from_rgba8(15, 23, 42, 255));
+    let ring_path = resvg::tiny_skia::PathBuilder::from_circle(cx, cy, TRAY_BADGE_RADIUS + 1.5)
+        .expect("nonzero radius");
+    pixmap.fill_path(
+        &ring_path,
+        &ring_paint,
+        resvg::tiny_skia::FillRule::Winding,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+
+    let mut fill_paint = resvg::tiny_skia::Paint::default();
+    fill_paint.set_color(hex_to_tiny_skia_color(hex_color));
+    let fill_path = resvg::tiny_skia::PathBuilder::from_circle(cx, cy, TRAY_BADGE_RADIUS)
+        .expect("nonzero radius");
+    pixmap.fill_path(
+        &fill_path,
+        &fill_paint,
+        resvg::tiny_skia::FillRule::Winding,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+fn hex_to_tiny_skia_color(hex: &str) -> resvg::tiny_skia::Color {
+    let hex = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
+    let g = u8::from_str_radix(hex.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
+    let b = u8::from_str_radix(hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
+    resvg::tiny_skia::Color::from_rgba8(r, g, b, 255)
 }
 
 /// Shows the Quick Switcher in response to a second `repodeck.exe` launch
@@ -1827,13 +2430,13 @@ pub fn run() -> Result<()> {
         window.as_weak(),
     );
 
-    // Populates the cross-thread context the hotkey thread and the
-    // second-instance listener thread reach `config`/`quick_switcher`
-    // through: neither can capture an `Rc` directly (it isn't `Send`), so
-    // both only ever call a plain-fn/zero-capture closure via
-    // `slint::invoke_from_event_loop`, which looks the real state up here —
-    // safe because Slint guarantees that closure runs on this same (UI)
-    // thread that populated it.
+    // Populates the cross-thread context the hotkey thread, the pipe-server
+    // thread, and the second-instance listener thread reach
+    // `config`/`quick_switcher`/`tray` through: none of them can capture an
+    // `Rc` directly (it isn't `Send`), so each only ever calls a plain-fn/
+    // zero-capture closure via `slint::invoke_from_event_loop`, which looks
+    // the real state up here — safe because Slint guarantees that closure
+    // runs on this same (UI) thread that populated it.
     UI_CONTEXT.with(|cell| {
         *cell.borrow_mut() = Some(Rc::new(CrossThreadUiContext {
             config: config.clone(),
@@ -1841,8 +2444,34 @@ pub fn run() -> Result<()> {
             pending_hotkey_rollback: RefCell::new(None),
             settings_window: window.as_weak(),
             quick_switcher: quick_switcher.as_weak(),
+            tray: tray.as_weak(),
+            tray_icons: TrayIcons::render(),
+            unmatched_agent_events: RefCell::new(Vec::new()),
         }));
     });
+
+    // Codex agent-event named pipe server (PLAN.md §6.4, §9.1). A failure to
+    // bind (e.g. another process already squatting the pipe name) disables
+    // Codex integration for this session rather than the whole app.
+    let _pipe_server = match NamedPipeServer::spawn(|event| match event {
+        PipeServerEvent::MessageReceived(bytes) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                handle_agent_ui_event(AgentUiEvent::MessageReceived(bytes));
+            });
+        }
+        PipeServerEvent::MessageTooLarge => {
+            tracing::warn!("dropped an oversized Codex agent event");
+        }
+        PipeServerEvent::ConnectionError(message) => {
+            tracing::warn!(error = %message, "Codex agent-event pipe connection error");
+        }
+    }) {
+        Ok(server) => Some(server),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start the Codex agent-event named pipe server");
+            None
+        }
+    };
 
     let hotkey_thread = Rc::new(HotkeyThread::spawn(
         config.borrow().settings.quick_switcher_hotkey.clone(),
@@ -1858,6 +2487,7 @@ pub fn run() -> Result<()> {
         },
     ));
     wire_settings(&window, data_dir.clone(), config.clone(), hotkey_thread);
+    wire_codex_settings(&window, config.clone());
 
     // PLAN.md §3.3's `close_on_focus_loss` setting: Slint has no public API
     // for window-deactivation, so this reaches the popup's raw HWND
@@ -1880,8 +2510,21 @@ pub fn run() -> Result<()> {
     let config_for_tray = config.clone();
     let data_dir_for_tray = data_dir.clone();
     tray.on_toggle_quick_switcher_requested(move || {
-        if let Some(switcher) = switcher_for_tray.upgrade() {
-            toggle_quick_switcher(&switcher, &config_for_tray.borrow(), &data_dir_for_tray);
+        let Some(switcher) = switcher_for_tray.upgrade() else {
+            return;
+        };
+        let was_visible = switcher.window().is_visible();
+        let config = config_for_tray.borrow();
+        toggle_quick_switcher(&switcher, &config, &data_dir_for_tray);
+        // PLAN.md §6.7: opening (not closing) via the tray selects the
+        // highest-priority agent workset's row, if any is active.
+        if !was_visible {
+            let state = runtime_store::load(&data_dir_for_tray);
+            if let Some((workset_id, _)) =
+                highest_priority_agent_workset(&config, &state.agent_runs)
+            {
+                select_row_for_workset(&switcher, workset_id);
+            }
         }
     });
 
@@ -1945,8 +2588,10 @@ pub fn run() -> Result<()> {
     });
 
     let window_for_settings = window.as_weak();
+    let config_for_settings = config.clone();
     tray.on_settings_requested(move || {
         if let Some(window) = window_for_settings.upgrade() {
+            refresh_codex_settings_state(&window, &config_for_settings.borrow());
             let _ = window.show();
         }
     });

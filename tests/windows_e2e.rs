@@ -383,3 +383,115 @@ fn hotkey_thread_reports_already_registered_when_the_combo_is_taken() {
         "expected an already_registered event, got {events:?}"
     );
 }
+
+/// PLAN.md §6.4's "RepoDeck未起動でも200ms以内に終了コード0": with no
+/// `NamedPipeServer` listening at all, `repodeck-hook.exe` must still exit 0
+/// quickly (`CreateFileW(OPEN_EXISTING, ...)` fails immediately with no
+/// `WaitNamedPipeW` retry, per its own doc comment).
+#[test]
+#[ignore = "spawns a real subprocess; run manually, not in CI"]
+fn repodeck_hook_exits_zero_when_no_pipe_server_is_listening() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let payload = serde_json::json!({
+        "session_id": "e2e-no-server",
+        "turn_id": "t",
+        "cwd": r"C:\repo",
+        "hook_event_name": "Stop",
+    })
+    .to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_repodeck-hook"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn repodeck-hook.exe");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(payload.as_bytes())
+        .expect("failed to write to repodeck-hook.exe's stdin");
+
+    let start = Instant::now();
+    let status = child.wait().expect("failed to wait on repodeck-hook.exe");
+    let elapsed = start.elapsed();
+
+    assert!(status.success(), "expected exit code 0, got {status:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "repodeck-hook.exe took too long with no server listening: {elapsed:?}"
+    );
+}
+
+/// Full pipe round-trip (PLAN.md §6.4/§9.1): a real `NamedPipeServer`
+/// receives a real `repodeck-hook.exe` subprocess's forwarded message, and
+/// the bytes deserialize to the expected `NormalizedEvent`.
+#[test]
+#[ignore = "spawns a real subprocess and binds a real named pipe; run manually, not in CI"]
+fn named_pipe_server_receives_a_real_hook_process_event() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    use repodeck::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
+    use repodeck::ipc::protocol::{NormalizedEvent, NormalizedEventKind};
+
+    let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_server = received.clone();
+    let _server = NamedPipeServer::spawn(move |event| {
+        if let PipeServerEvent::MessageReceived(bytes) = event {
+            received_for_server.lock().unwrap().push(bytes);
+        }
+    })
+    .expect("failed to start the named pipe server");
+
+    // Give the server a moment to reach its first `ConnectNamedPipe` wait.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let payload = serde_json::json!({
+        "session_id": "e2e-round-trip",
+        "turn_id": "t1",
+        "cwd": r"C:\repo\guardrails-kit",
+        "hook_event_name": "Stop",
+        "model": "gpt-e2e",
+    })
+    .to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_repodeck-hook"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn repodeck-hook.exe");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(payload.as_bytes())
+        .expect("failed to write to repodeck-hook.exe's stdin");
+    let status = child.wait().expect("failed to wait on repodeck-hook.exe");
+    assert!(status.success(), "expected exit code 0, got {status:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let bytes = loop {
+        if let Some(bytes) = received.lock().unwrap().first().cloned() {
+            break bytes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "named pipe server never received the hook process's message"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let event: NormalizedEvent = serde_json::from_slice(&bytes)
+        .expect("received bytes should deserialize as NormalizedEvent");
+    assert_eq!(event.event, NormalizedEventKind::RunCompleted);
+    assert_eq!(event.session_id, "e2e-round-trip");
+    assert_eq!(event.turn_id, "t1");
+    assert_eq!(event.model.as_deref(), Some("gpt-e2e"));
+    assert!(event.cwd.ends_with("guardrails-kit"));
+}

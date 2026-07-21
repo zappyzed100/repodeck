@@ -9,6 +9,11 @@ export struct QuickSwitcherRow {
     is-current: bool,
     is-parking-target: bool,
     number-hint: int,
+    // Codex agent status (PLAN.md §6, Phase 8). `agent-status-label` is
+    // empty for Idle/Unknown to avoid visual noise in the common case.
+    agent-status-color: color,
+    agent-status-label: string,
+    agent-elapsed-text: string,
 }
 
 export component QuickSwitcher inherits Window {
@@ -159,6 +164,23 @@ export component QuickSwitcher inherits Window {
                             }
 
                             Rectangle { horizontal-stretch: 1; }
+
+                            if row.agent-status-label != "": HorizontalLayout {
+                                spacing: 4px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 8px;
+                                    height: 8px;
+                                    border-radius: 4px;
+                                    background: row.agent-status-color;
+                                }
+                                Text {
+                                    text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
+                                    font-size: 11px;
+                                    color: Theme.text-secondary;
+                                    vertical-alignment: center;
+                                }
+                            }
 
                             if row.number-hint > 0: Rectangle {
                                 width: 20px;

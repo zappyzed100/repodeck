@@ -1,3 +1,4 @@
+pub mod agent_status_service;
 pub mod layout_service;
 pub mod main_placement;
 pub mod monitor_resolution;
