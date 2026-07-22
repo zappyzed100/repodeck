@@ -8,7 +8,8 @@ use crate::application::layout_service::auto_split_cells;
 use crate::application::monitor_resolution::{
     find_live_monitor_by_stable_id, sort_monitors_reading_order,
 };
-use crate::domain::monitor::SavedMonitor;
+use crate::application::switch_coordinator::{screen_capacity, subdivide_for_count};
+use crate::domain::monitor::{AutoSplit, SavedMonitor};
 use crate::domain::placement::PixelRect;
 use crate::domain::workset::{FixedParkingSlot, ParkingPolicy, Workset};
 use crate::windowing::monitor::MonitorInfo;
@@ -137,63 +138,6 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         assignments.insert(workset.id, assignment);
     }
 
-    // Cell enumeration (§4.4 steps 1-2): non-main, non-excluded monitors,
-    // reading order.
-    let mut non_main_monitors: Vec<MonitorInfo> = input
-        .live_monitors
-        .iter()
-        .filter(|m| !input.main_monitor_ids.iter().any(|id| id == &m.device_name))
-        .filter(|m| {
-            !input
-                .saved_monitors
-                .iter()
-                .any(|s| s.stable_id == m.device_name && s.excluded)
-        })
-        // Sub-screen monitors are reserved for their designated worksets.
-        .filter(|m| {
-            !input
-                .sub_screen_monitor_ids
-                .iter()
-                .any(|id| id == &m.device_name)
-        })
-        .cloned()
-        .collect();
-    sort_monitors_reading_order(&mut non_main_monitors);
-
-    let mut ordered_cells: Vec<(ParkingSlotId, PixelRect)> = Vec::new();
-    for monitor in &non_main_monitors {
-        let split = input
-            .saved_monitors
-            .iter()
-            .find(|s| s.stable_id == monitor.device_name)
-            .and_then(|s| s.auto_split)
-            .unwrap_or_else(|| {
-                crate::application::layout_service::resolve_auto_split(monitor.work_area_px)
-            });
-        for (cell_index, rect) in auto_split_cells(monitor.work_area_px, split)
-            .into_iter()
-            .enumerate()
-        {
-            ordered_cells.push((
-                ParkingSlotId {
-                    monitor_id: monitor.device_name.clone(),
-                    cell_index,
-                },
-                rect,
-            ));
-        }
-    }
-
-    // Exclude fixed cells (§4.4 step 3), unconditionally.
-    let available_cells: Vec<(ParkingSlotId, PixelRect)> = ordered_cells
-        .into_iter()
-        .filter(|(id, _)| !fixed_cells.contains(id))
-        .collect();
-    let cell_rects: HashMap<&ParkingSlotId, PixelRect> = available_cells
-        .iter()
-        .map(|(id, rect)| (id, *rect))
-        .collect();
-
     // Auto-pool worksets (§4.4 step 4), deterministic order.
     let mut auto_pool: Vec<&Workset> = input
         .worksets
@@ -204,47 +148,150 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         .collect();
     auto_pool.sort_by_key(|w| (w.sort_order, w.id));
 
-    let mut claimed: HashSet<&ParkingSlotId> = HashSet::new();
-    let mut kept: HashMap<Uuid, &ParkingSlotId> = HashMap::new();
+    // Monitors available to the auto pool: non-main, non-excluded, non-sub, and
+    // not already carrying a fixed cell (a monitor shared with a fixed slot is
+    // left to that slot rather than mixed with dynamic subdivision), in reading
+    // order for deterministic tie-breaks.
+    let fixed_monitor_ids: HashSet<&str> =
+        fixed_cells.iter().map(|c| c.monitor_id.as_str()).collect();
+    let mut auto_monitors: Vec<MonitorInfo> = input
+        .live_monitors
+        .iter()
+        .filter(|m| !input.main_monitor_ids.iter().any(|id| id == &m.device_name))
+        .filter(|m| {
+            !input
+                .saved_monitors
+                .iter()
+                .any(|s| s.stable_id == m.device_name && s.excluded)
+        })
+        .filter(|m| {
+            !input
+                .sub_screen_monitor_ids
+                .iter()
+                .any(|id| id == &m.device_name)
+        })
+        .filter(|m| !fixed_monitor_ids.contains(m.device_name.as_str()))
+        .cloned()
+        .collect();
+    sort_monitors_reading_order(&mut auto_monitors);
 
-    // Stability pass (§4.4 step 5): keep a valid previous assignment.
+    // A monitor's parking capacity: its saved `auto_split` read as a *maximum*
+    // (One→1, TwoColumns→2, FourGrid→4), or the size-based default (QHD holds a
+    // 3×2 of six, smaller screens four) when left on 「自動」. Crucially this is
+    // only the cap — a monitor is subdivided by the number of windows that
+    // *actually* park on it, so a lone window fills the whole screen instead of
+    // being wedged into a fixed quarter while other screens sit empty
+    // (2026-07-23 bug fix: 「空いてる退避画面があるのに1/4で詰め込まれる」).
+    let capacity = |m: &MonitorInfo| -> usize {
+        match input
+            .saved_monitors
+            .iter()
+            .find(|s| s.stable_id == m.device_name)
+            .and_then(|s| s.auto_split)
+        {
+            Some(AutoSplit::One) => 1,
+            Some(AutoSplit::TwoColumns) => 2,
+            Some(AutoSplit::FourGrid) => 4,
+            None => screen_capacity(m.work_area_px),
+        }
+    };
+
+    // Distribute worksets across monitors so total parked area is maximised:
+    // light up the largest empty monitor first (never shrink a window while a
+    // screen is empty), then the monitor whose next cell stays largest
+    // (`area/(count+1)`). Same rule as `switch_coordinator::distribute_parking`.
+    let index_by_id: HashMap<&str, usize> = auto_monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.device_name.as_str(), i))
+        .collect();
+    let mut occupants: Vec<Vec<&Workset>> = vec![Vec::new(); auto_monitors.len()];
+    let mut placed: HashSet<Uuid> = HashSet::new();
+
+    // Stability (§4.4 step 5): keep a workset on its previous monitor when that
+    // monitor is still an auto target with spare capacity, so windows don't
+    // needlessly jump screens between switches.
     for workset in &auto_pool {
-        let Some(previous) = input.previous_assignments.get(&workset.id) else {
-            continue;
-        };
-        let Some((slot_id, _)) = available_cells.iter().find(|(id, _)| id == previous) else {
-            continue;
-        };
-        if claimed.insert(slot_id) {
-            kept.insert(workset.id, slot_id);
+        if let Some(previous) = input.previous_assignments.get(&workset.id)
+            && let Some(&i) = index_by_id.get(previous.monitor_id.as_str())
+            && occupants[i].len() < capacity(&auto_monitors[i])
+        {
+            occupants[i].push(workset);
+            placed.insert(workset.id);
         }
     }
 
-    // First Fit (§4.4 step 6): remaining worksets take the next free cell.
-    let mut new_auto_slot_assignments = HashMap::new();
     for workset in &auto_pool {
-        let slot_id = if let Some(&kept_slot) = kept.get(&workset.id) {
-            Some(kept_slot)
-        } else {
-            available_cells
-                .iter()
-                .map(|(id, _)| id)
-                .find(|id| claimed.insert(id))
-        };
+        if placed.contains(&workset.id) {
+            continue;
+        }
+        let best = (0..auto_monitors.len())
+            .filter(|&i| occupants[i].len() < capacity(&auto_monitors[i]))
+            .max_by_key(|&i| {
+                let area = i64::from(auto_monitors[i].work_area_px.width)
+                    * i64::from(auto_monitors[i].work_area_px.height);
+                let count = occupants[i].len() as i64;
+                let lights_up = count == 0;
+                let metric = if lights_up { area } else { area / (count + 1) };
+                (lights_up, metric, -(i as i64))
+            });
+        // No monitor with room → left unplaced, minimized below.
+        if let Some(i) = best {
+            occupants[i].push(workset);
+            placed.insert(workset.id);
+        }
+    }
 
-        let assignment = match slot_id {
-            Some(id) => {
-                let rect = cell_rects[id];
-                new_auto_slot_assignments.insert(workset.id, id.clone());
-                ParkAssignment::AutoSlot {
-                    slot: id.clone(),
-                    rect,
-                }
-            }
-            // Overflow (§4.4 step 7): no cell left.
-            None => ParkAssignment::Minimized,
-        };
-        assignments.insert(workset.id, assignment);
+    tracing::info!(
+        target: "parking",
+        auto_worksets = auto_pool.len(),
+        monitors = ?auto_monitors
+            .iter()
+            .map(|m| (m.device_name.clone(), capacity(m), m.work_area_px.width, m.work_area_px.height))
+            .collect::<Vec<_>>(),
+        "auto-park: distributing across available monitors"
+    );
+
+    // Assign each monitor's occupants to cells subdivided by their *actual*
+    // count (1→whole, 2→halves, up to the QHD 3×2 of six).
+    let mut new_auto_slot_assignments = HashMap::new();
+    for (i, monitor) in auto_monitors.iter().enumerate() {
+        if occupants[i].is_empty() {
+            continue;
+        }
+        let cells = subdivide_for_count(monitor.work_area_px, occupants[i].len());
+        for (cell_index, workset) in occupants[i].iter().enumerate() {
+            let rect = cells.get(cell_index).copied().unwrap_or(monitor.work_area_px);
+            let slot = ParkingSlotId {
+                monitor_id: monitor.device_name.clone(),
+                cell_index,
+            };
+            tracing::info!(
+                target: "parking",
+                workset = %workset.id,
+                name = %workset.name,
+                monitor = %monitor.device_name,
+                cell = cell_index,
+                of = occupants[i].len(),
+                rect = ?rect,
+                "auto-park: assigned cell"
+            );
+            new_auto_slot_assignments.insert(workset.id, slot.clone());
+            assignments.insert(workset.id, ParkAssignment::AutoSlot { slot, rect });
+        }
+    }
+
+    // Overflow (§4.4 step 7): worksets that found no monitor with room.
+    for workset in &auto_pool {
+        if !placed.contains(&workset.id) {
+            tracing::info!(
+                target: "parking",
+                workset = %workset.id,
+                name = %workset.name,
+                "auto-park: no monitor had room, minimizing"
+            );
+            assignments.insert(workset.id, ParkAssignment::Minimized);
+        }
     }
 
     AllocationResult {
@@ -357,6 +404,48 @@ mod tests {
         });
 
         assert_eq!(result.assignments[&a.id], ParkAssignment::Minimized);
+    }
+
+    #[test]
+    fn few_worksets_are_not_packed_into_quarters_while_a_screen_is_empty() {
+        // Regression (2026-07-23): two monitors both configured FourGrid, only
+        // two worksets to park. The old fixed-grid First-Fit wedged both into
+        // SIDE1's quarters (960×540) and left SIDE2 empty. They must instead
+        // spread one-per-monitor at full size, subdivided by actual count.
+        let live = vec![
+            monitor("MAIN", 0, 1920),
+            monitor("SIDE1", 1920, 1920),
+            monitor("SIDE2", 3840, 1920),
+        ];
+        let saved = vec![
+            saved_monitor("SIDE1", AutoSplit::FourGrid),
+            saved_monitor("SIDE2", AutoSplit::FourGrid),
+        ];
+        let a = auto_workset(0);
+        let b = auto_workset(1);
+        let worksets = vec![a.clone(), b.clone()];
+
+        let result = allocate_parking(&AllocationInput {
+            worksets: &worksets,
+            current_workset_id: None,
+            fixed_slots: &[],
+            main_monitor_ids: &["MAIN".to_string()],
+            live_monitors: &live,
+            saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
+            previous_assignments: &HashMap::new(),
+        });
+
+        let placed = |w: &Workset| match &result.assignments[&w.id] {
+            ParkAssignment::AutoSlot { rect, slot } => (*rect, slot.monitor_id.clone()),
+            other => panic!("expected AutoSlot, got {other:?}"),
+        };
+        let (rect_a, mon_a) = placed(&a);
+        let (rect_b, mon_b) = placed(&b);
+        assert_ne!(mon_a, mon_b, "the two worksets spread onto different monitors");
+        // Full monitor size (1920×1080), not a 960×540 quarter.
+        assert_eq!((rect_a.width, rect_a.height), (1920, 1080));
+        assert_eq!((rect_b.width, rect_b.height), (1920, 1080));
     }
 
     #[test]

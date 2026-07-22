@@ -114,6 +114,13 @@
    （`sub_screen_monitor_ids`）。ただし「メイン画面を空にする」経路（`compute_empty_main_destinations`）
    では、**実際に窓が入った使用中サブのみ**除外し、空きサブは退避先に含める。
 
+**切替時の auto 割当も同モデルに統一**（2026-07-23 バグ修正）: 旧実装はモニタごとに `auto_split` で
+固定分割し読み順 First Fit で埋めていたため、**空きモニタがあるのに 1台の 1/4 セルに詰め込まれる**
+不具合があった。現在は `allocate_parking` も `distribute_parking` と同じく、① `auto_split` を
+**上限（One→1 / TwoColumns→2 / FourGrid→4 /「自動」→画面サイズ基準4or6）** として扱い、
+② 面積の大きい空きモニタから点灯、③ 各モニタを**実際の駐機台数で分割**する（1台なら全画面）。
+固定スロットを持つモニタは auto プールから除外。割当結果は `tracing` の `target: "parking"` に記録。
+
 ## 現在の実装状況（2026-07-20時点）
 
 - **Phase 1（プロジェクト基盤）: 完了・検証済み。** Cargoプロジェクト、`ui/app-window.slint`最小ウィンドウ、
