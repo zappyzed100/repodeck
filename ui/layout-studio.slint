@@ -21,6 +21,8 @@ export struct SubScreenRow {
     assigned: bool,
     // The area within the monitor(s): "全体" / "左半分" / "左上1/4" ...
     region-label: string,
+    // Maximize (full-screen) windows parked into this sub-screen.
+    fullscreen: bool,
 }
 
 export struct MainScreenCandidate {
@@ -87,6 +89,7 @@ export component LayoutStudio inherits Window {
     callback sub-screen-delete(index: int);
     callback sub-screen-toggle-monitor(index: int);
     callback sub-screen-cycle-region(index: int);
+    callback sub-screen-toggle-fullscreen(index: int);
     callback monitor-clicked(index: int);
     callback toggle-main-requested();
     callback toggle-excluded-requested();
@@ -284,32 +287,50 @@ export component LayoutStudio inherits Window {
                                 wrap: word-wrap;
                             }
                             ScrollView {
-                                height: 120px;
+                                height: 170px;
                                 VerticalLayout {
-                                    spacing: 2px;
-                                    for sub[i] in root.sub-screen-rows: HorizontalLayout {
-                                        spacing: Theme.space-xs;
-                                        height: 28px;
-                                        GlassCheckbox {
-                                            checked: sub.assigned;
-                                            enabled: !root.selected-is-main && !root.selected-excluded;
-                                            toggled => { root.sub-screen-toggle-monitor(i); }
-                                        }
-                                        Text {
-                                            text: sub.name;
-                                            font-size: 12px;
-                                            color: Theme.text-primary;
-                                            vertical-alignment: center;
-                                            horizontal-stretch: 1;
-                                            overflow: elide;
-                                        }
-                                        GlassButton {
-                                            text: sub.region-label;
-                                            clicked => { root.sub-screen-cycle-region(i); }
-                                        }
-                                        GlassButton {
-                                            text: "削除";
-                                            clicked => { root.sub-screen-delete(i); }
+                                    spacing: Theme.space-xs;
+                                    for sub[i] in root.sub-screen-rows: Rectangle {
+                                        height: 50px;
+                                        border-radius: Theme.radius-sm;
+                                        background: Theme.glass-panel-soft;
+                                        VerticalLayout {
+                                            padding: 4px;
+                                            spacing: 2px;
+                                            HorizontalLayout {
+                                                spacing: Theme.space-xs;
+                                                GlassCheckbox {
+                                                    checked: sub.assigned;
+                                                    enabled: !root.selected-is-main && !root.selected-excluded;
+                                                    toggled => { root.sub-screen-toggle-monitor(i); }
+                                                }
+                                                Text {
+                                                    text: sub.name;
+                                                    font-size: 12px;
+                                                    color: Theme.text-primary;
+                                                    vertical-alignment: center;
+                                                    horizontal-stretch: 1;
+                                                    overflow: elide;
+                                                }
+                                                GlassButton {
+                                                    text: "削除";
+                                                    clicked => { root.sub-screen-delete(i); }
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: Theme.space-xs;
+                                                Text { text: "領域"; font-size: 10px; color: Theme.text-tertiary; vertical-alignment: center; }
+                                                GlassButton {
+                                                    text: sub.region-label;
+                                                    clicked => { root.sub-screen-cycle-region(i); }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                                GlassCheckbox {
+                                                    checked: sub.fullscreen;
+                                                    toggled => { root.sub-screen-toggle-fullscreen(i); }
+                                                }
+                                                Text { text: "全画面"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                                            }
                                         }
                                     }
                                 }

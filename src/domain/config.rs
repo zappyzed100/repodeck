@@ -47,6 +47,11 @@ pub struct SubScreen {
     /// Which cell of `split` (reading order) when `split != One`.
     #[serde(default)]
     pub cell_index: usize,
+    /// Maximize (full-screen) any workset parked into this area, e.g. a video
+    /// kept full-screen on a secondary monitor. `#[serde(default)]` keeps
+    /// pre-existing configs loadable.
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 impl AppConfig {

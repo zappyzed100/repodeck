@@ -519,6 +519,7 @@ fn refresh_sub_screen_rows(layout: &LayoutStudio, config: &AppConfig, device_nam
             name: s.name.clone().into(),
             assigned: s.monitor_ids.iter().any(|id| id == device_name),
             region_label: sub_region_label(s.split, s.cell_index).into(),
+            fullscreen: s.fullscreen,
         })
         .collect();
     layout.set_sub_screen_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
@@ -713,6 +714,7 @@ fn wire_layout_studio(
             monitor_ids: Vec::new(),
             split: AutoSplit::One,
             cell_index: 0,
+            fullscreen: false,
         });
         layout.set_status_text(
             format!("サブ画面「{name}」を追加しました。モニターを割り当ててください。").into(),
@@ -820,6 +822,26 @@ fn wire_layout_studio(
         layout.set_status_is_warning(false);
         refresh_selected_monitor_panel(&layout, &config, &state);
         refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_toggle_fullscreen(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let state = s.borrow();
+        let mut config = c.borrow_mut();
+        if let Some(sub) = config.sub_screens.get_mut(index) {
+            sub.fullscreen = !sub.fullscreen;
+        }
+        layout.set_status_text(
+            "サブ画面の全画面設定を変更しました。「設定を保存」で確定してください。".into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
     });
 
     let l = layout.as_weak();
@@ -1838,10 +1860,11 @@ fn wire_workset_manager(
                 ) else {
                     continue;
                 };
+                let want_fullscreen = workset.fullscreen_when_parked || sub.fullscreen;
                 for w in &workset.windows {
                     if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id) {
                         rects.insert(*hwnd, rect);
-                        if workset.fullscreen_when_parked {
+                        if want_fullscreen {
                             fullscreen.insert(*hwnd);
                         }
                     }
@@ -2493,6 +2516,16 @@ fn toggle_quick_switcher(switcher: &QuickSwitcher, config: &AppConfig, data_dir:
     } else {
         show_quick_switcher_at_cursor(switcher, config, data_dir);
     }
+}
+
+/// Single entry point for "メイン画面を空にする" shared by the tray menu, the
+/// Quick Switcher, and the Workset Manager: bring the manager to the front and
+/// trigger its empty-main modal (which runs the one real handler in
+/// `wire_workset_manager`).
+fn open_empty_main_screen(workset_manager: &WorksetManager) {
+    let _ = workset_manager.show();
+    popup_window::restore_and_foreground(workset_manager.window());
+    workset_manager.invoke_empty_main_screen_requested();
 }
 
 fn wire_quick_switcher(
@@ -3976,6 +4009,19 @@ pub fn run() -> Result<()> {
         window.as_weak(),
     );
 
+    // "メイン画面を空にする" from the Quick Switcher: hide it, open the Workset
+    // Manager and trigger its empty-main modal.
+    let workset_manager_for_qs_empty = workset_manager.as_weak();
+    let switcher_for_qs_empty = quick_switcher.as_weak();
+    quick_switcher.on_empty_main_requested(move || {
+        if let Some(switcher) = switcher_for_qs_empty.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(workset_manager) = workset_manager_for_qs_empty.upgrade() {
+            open_empty_main_screen(&workset_manager);
+        }
+    });
+
     // Populates the cross-thread context the hotkey thread, the pipe-server
     // thread, and the second-instance listener thread reach
     // `config`/`quick_switcher`/`tray` through: none of them can capture an
@@ -4110,10 +4156,7 @@ pub fn run() -> Result<()> {
     let workset_manager_for_empty = workset_manager.as_weak();
     tray.on_empty_main_screen_requested(move || {
         if let Some(workset_manager) = workset_manager_for_empty.upgrade() {
-            let _ = workset_manager.show();
-            popup_window::restore_and_foreground(workset_manager.window());
-            workset_manager.invoke_start_registration();
-            workset_manager.invoke_empty_main_screen_requested();
+            open_empty_main_screen(&workset_manager);
         }
     });
 

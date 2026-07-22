@@ -42,6 +42,7 @@ export component QuickSwitcher inherits Window {
     callback switch-requested(workset-id: string);
     callback recover-requested();
     callback settings-requested();
+    callback empty-main-requested();
     callback close-requested();
 
     backdrop := Rectangle {
@@ -153,9 +154,11 @@ export component QuickSwitcher inherits Window {
                     for row[i] in root.rows: Rectangle {
                         height: 52px;
                         border-radius: Theme.radius-md;
-                        background: i == root.selected-index ? Theme.glass-selected : Theme.glass-panel-soft;
-                        border-width: row.is-current ? 2px : 1px;
-                        border-color: row.is-current ? Theme.accent : Theme.hairline;
+                        // The up/down selection is shown by the accent border;
+                        // the current workset by the filled background.
+                        background: row.is-current ? Theme.glass-selected : Theme.glass-panel-soft;
+                        border-width: i == root.selected-index ? 2px : 1px;
+                        border-color: i == root.selected-index ? Theme.accent : Theme.hairline;
                         animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
 
                         HorizontalLayout {
@@ -256,6 +259,12 @@ export component QuickSwitcher inherits Window {
                     text: "回収する";
                     clicked => { root.recover-requested(); }
                 }
+            }
+
+            // Always-available action: clear the main screen.
+            GlassButton {
+                text: "メイン画面を空にする";
+                clicked => { root.empty-main-requested(); }
             }
     }
 }

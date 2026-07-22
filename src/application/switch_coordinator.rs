@@ -298,13 +298,12 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // onto its named area's monitors (the union work-area rect), shrunk to
         // preserve its main-screen relative layout.
         if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy {
-            let target = request
-                .sub_screens
-                .iter()
-                .find(|s| s.id == *sub_screen_id)
-                .and_then(|s| sub_screen_target_rect(s, request.live_monitors));
+            let sub = request.sub_screens.iter().find(|s| s.id == *sub_screen_id);
+            let target = sub.and_then(|s| sub_screen_target_rect(s, request.live_monitors));
+            // Full-screen if either the sub-screen or the workset asks for it.
+            let fullscreen = workset.fullscreen_when_parked || sub.is_some_and(|s| s.fullscreen);
             return match target {
-                Some(rect) => self.place_workset_into_rect(workset, resolved, request, rect),
+                Some(rect) => self.place_workset_into_rect(resolved, request, rect, fullscreen),
                 None => {
                     for w in resolved {
                         self.window_ops.minimize(w.hwnd);
@@ -339,22 +338,21 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 }
                 Ok(())
             }
-            ParkAssignment::AutoSlot { rect, .. } | ParkAssignment::FixedSlot { rect, .. } => {
-                self.place_workset_into_rect(workset, resolved, request, rect)
-            }
+            ParkAssignment::AutoSlot { rect, .. } | ParkAssignment::FixedSlot { rect, .. } => self
+                .place_workset_into_rect(resolved, request, rect, workset.fullscreen_when_parked),
         }
     }
 
     /// Places `resolved` into `target_rect`, shrinking to preserve the workset's
     /// main-screen relative layout (via `plan_park_into_slot`), then maximizing
-    /// if `fullscreen_when_parked` is set. Shared by auto/fixed cells and
+    /// each window if `fullscreen` is set. Shared by auto/fixed cells and
     /// sub-screen areas.
     fn place_workset_into_rect(
         &self,
-        workset: &Workset,
         resolved: &[ResolvedWindow],
         request: &SwitchRequest,
         target_rect: PixelRect,
+        fullscreen: bool,
     ) -> Result<(), String> {
         let mut main_rects = Vec::with_capacity(resolved.len());
         for w in resolved {
@@ -387,7 +385,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                     .map_err(|e| e.to_string())?;
                 // "退避後に全画面表示": maximize each window on the parking monitor
                 // it was just placed on (PLAN.md §2.4 extension).
-                if workset.fullscreen_when_parked {
+                if fullscreen {
                     for w in resolved {
                         self.window_ops.maximize(w.hwnd);
                     }
