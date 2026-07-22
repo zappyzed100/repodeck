@@ -19,6 +19,8 @@ export struct SubScreenRow {
     name: string,
     // Whether the currently-selected monitor is assigned to this sub-screen.
     assigned: bool,
+    // The area within the monitor(s): "全体" / "左半分" / "左上1/4" ...
+    region-label: string,
 }
 
 export struct MainScreenCandidate {
@@ -84,6 +86,7 @@ export component LayoutStudio inherits Window {
     callback sub-screen-add(name: string);
     callback sub-screen-delete(index: int);
     callback sub-screen-toggle-monitor(index: int);
+    callback sub-screen-cycle-region(index: int);
     callback monitor-clicked(index: int);
     callback toggle-main-requested();
     callback toggle-excluded-requested();
@@ -299,6 +302,10 @@ export component LayoutStudio inherits Window {
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
                                             overflow: elide;
+                                        }
+                                        GlassButton {
+                                            text: sub.region-label;
+                                            clicked => { root.sub-screen-cycle-region(i); }
                                         }
                                         GlassButton {
                                             text: "削除";

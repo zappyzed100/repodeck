@@ -38,7 +38,7 @@ use crate::domain::agent::{
 use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier, SortMode};
 use crate::domain::monitor::AutoSplit;
 use crate::domain::placement::SavedShowState;
-use crate::domain::workset::{ManagedWindow, ParkingPolicy};
+use crate::domain::workset::ParkingPolicy;
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
 use crate::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
@@ -482,6 +482,35 @@ fn remove_monitor_from_all_sub_screens(config: &mut AppConfig, device_name: &str
 
 /// Rebuilds the Layout Studio's sub-screen list, marking which ones contain
 /// `device_name` (the selected monitor).
+/// The sub-screen "region" options the region button cycles through: whole
+/// area, left/right half, and the four quarters, as `(split, cell, label)`.
+const SUB_REGIONS: [(AutoSplit, usize, &str); 7] = [
+    (AutoSplit::One, 0, "全体"),
+    (AutoSplit::TwoColumns, 0, "左半分"),
+    (AutoSplit::TwoColumns, 1, "右半分"),
+    (AutoSplit::FourGrid, 0, "左上¼"),
+    (AutoSplit::FourGrid, 1, "右上¼"),
+    (AutoSplit::FourGrid, 2, "左下¼"),
+    (AutoSplit::FourGrid, 3, "右下¼"),
+];
+
+fn sub_region_label(split: AutoSplit, cell: usize) -> &'static str {
+    SUB_REGIONS
+        .iter()
+        .find(|(s, c, _)| *s == split && *c == cell)
+        .map_or("全体", |(_, _, label)| label)
+}
+
+/// The next `(split, cell)` in the region cycle after the given one.
+fn next_sub_region(split: AutoSplit, cell: usize) -> (AutoSplit, usize) {
+    let idx = SUB_REGIONS
+        .iter()
+        .position(|(s, c, _)| *s == split && *c == cell)
+        .unwrap_or(0);
+    let (s, c, _) = SUB_REGIONS[(idx + 1) % SUB_REGIONS.len()];
+    (s, c)
+}
+
 fn refresh_sub_screen_rows(layout: &LayoutStudio, config: &AppConfig, device_name: &str) {
     let rows: Vec<SubScreenRow> = config
         .sub_screens
@@ -489,6 +518,7 @@ fn refresh_sub_screen_rows(layout: &LayoutStudio, config: &AppConfig, device_nam
         .map(|s| SubScreenRow {
             name: s.name.clone().into(),
             assigned: s.monitor_ids.iter().any(|id| id == device_name),
+            region_label: sub_region_label(s.split, s.cell_index).into(),
         })
         .collect();
     layout.set_sub_screen_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
@@ -681,6 +711,8 @@ fn wire_layout_studio(
             id: uuid::Uuid::new_v4(),
             name: name.clone(),
             monitor_ids: Vec::new(),
+            split: AutoSplit::One,
+            cell_index: 0,
         });
         layout.set_status_text(
             format!("サブ画面「{name}」を追加しました。モニターを割り当ててください。").into(),
@@ -761,6 +793,29 @@ fn wire_layout_studio(
         }
         layout.set_status_text(
             "サブ画面の割当を更新しました。「設定を保存」で確定してください。".into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_cycle_region(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if let Some(sub) = config.sub_screens.get_mut(index) {
+            let (split, cell) = next_sub_region(sub.split, sub.cell_index);
+            sub.split = split;
+            sub.cell_index = cell;
+        }
+        layout.set_status_text(
+            "サブ画面の領域を変更しました。「設定を保存」で確定してください。".into(),
         );
         layout.set_status_is_warning(false);
         refresh_selected_monitor_panel(&layout, &config, &state);
@@ -2008,141 +2063,94 @@ fn wire_workset_manager(
         }
     });
 
+    // "配置を再登録": re-capture the current on-screen positions of this
+    // workset's open windows as their new main placement, so "restore to main"
+    // reflects the arrangement the user just made.
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
     let dir = data_dir;
-    let pid = std::process::id();
-    manager.on_rebind_requested(move |window_index| {
+    manager.on_recapture_placement_requested(move || {
         let Some(manager) = m.upgrade() else { return };
-        let state = s.borrow();
-        let Some(ws_index) = state.selected_workset_index else {
-            return;
-        };
-        let Ok(window_index) = usize::try_from(window_index) else {
+
+        // Gather the selected workset index under a scoped borrow (never held
+        // across the mutable borrow below).
+        let Some(ws_index) = s.borrow().selected_workset_index else {
             return;
         };
 
-        let managed_window_id_and_matcher = {
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let (decisions, monitors, main_ids) = {
             let config = c.borrow();
-            config
-                .worksets
-                .get(ws_index)
-                .and_then(|w| w.windows.get(window_index))
-                .map(|w| (w.id, w.matcher.clone(), w.z_order))
-        };
-        let Some((managed_window_id, window_matcher, z_order)) = managed_window_id_and_matcher
-        else {
-            return;
+            let runtime = runtime_store::load(&dir);
+            let decisions = workset_service::resolve_all_matches_with_bindings(
+                &config.worksets,
+                &live_windows,
+                &runtime.window_bindings,
+            );
+            (
+                decisions,
+                monitor::enumerate_monitors().unwrap_or_default(),
+                config.main_monitor_ids.clone(),
+            )
         };
 
-        let live_windows = match enumerate::enumerate_top_level_windows(pid) {
-            Ok(windows) => windows,
-            Err(err) => {
-                manager
-                    .set_status_text(format!("ウィンドウ一覧の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
+        let mut updated = 0usize;
+        {
+            let mut config = c.borrow_mut();
+            let Some(workset) = config.worksets.get_mut(ws_index) else {
                 return;
+            };
+            for w in &mut workset.windows {
+                let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id) else {
+                    continue;
+                };
+                let Some(live) = live_windows.iter().find(|lw| lw.hwnd == *hwnd) else {
+                    continue;
+                };
+                let raw = HWND(*hwnd as *mut _);
+                let (Ok(show_state), Ok(rect)) = (
+                    win_placement::get_show_state(raw),
+                    win_placement::get_normal_rect(raw),
+                ) else {
+                    continue;
+                };
+                // Only windows currently on a main monitor can have their main
+                // placement re-captured; others (parked on a sub) are skipped.
+                if let Ok(rebuilt) = workset_service::build_managed_window(
+                    live, rect, show_state, w.z_order, &monitors, &main_ids,
+                ) {
+                    w.main_placement = rebuilt.main_placement;
+                    updated += 1;
+                }
             }
-        };
+            if updated > 0 {
+                workset.updated_at = clock::now_rfc3339();
+            }
+        }
 
-        let bound_elsewhere: std::collections::HashSet<isize> = {
-            let config = c.borrow();
-            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
-            decisions
-                .iter()
-                .filter(|&(id, _)| *id != managed_window_id)
-                .filter_map(|(_, decision)| {
-                    if let MatchDecision::AutoRebind { hwnd } = decision {
-                        Some(*hwnd)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        let decision = crate::windowing::matcher::resolve_best_match(
-            &window_matcher,
-            &live_windows,
-            &bound_elsewhere,
-        );
-        let target_hwnd = match decision {
-            MatchDecision::AutoRebind { hwnd } => Some(hwnd),
-            MatchDecision::Ambiguous { candidates } => candidates.into_iter().next(),
-            MatchDecision::Unresolved => live_windows
-                .iter()
-                .filter(|w| !bound_elsewhere.contains(&w.hwnd))
-                .max_by_key(|w| crate::windowing::matcher::score_candidate(&window_matcher, w))
-                .map(|w| w.hwnd),
-        };
-
-        let Some(target_hwnd) = target_hwnd else {
-            manager.set_status_text("再登録できる候補が見つかりませんでした。".into());
+        if updated == 0 {
+            manager.set_status_text(
+                "メイン画面上に、再登録できる開いているウィンドウがありませんでした。".into(),
+            );
             manager.set_status_is_warning(true);
             return;
-        };
-        let Some(target_window) = live_windows.iter().find(|w| w.hwnd == target_hwnd) else {
-            return;
-        };
+        }
 
-        let hwnd = HWND(target_hwnd as *mut _);
-        let show_state = match win_placement::get_show_state(hwnd) {
-            Ok(s) => s,
-            Err(err) => {
-                manager.set_status_text(format!("状態の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
-        let rect = match win_placement::get_normal_rect(hwnd) {
-            Ok(r) => r,
-            Err(err) => {
-                manager.set_status_text(format!("配置の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
-
-        let mut state = s.borrow_mut();
-        let rebuilt = workset_service::build_managed_window(
-            target_window,
-            rect,
-            show_state,
-            z_order,
-            &state.monitors,
-            &c.borrow().main_monitor_ids,
-        );
-        match rebuilt {
-            Ok(new_managed_window) => {
-                let mut config = c.borrow_mut();
-                if let Some(workset) = config.worksets.get_mut(ws_index)
-                    && let Some(slot) = workset.windows.get_mut(window_index)
-                {
-                    *slot = ManagedWindow {
-                        id: managed_window_id,
-                        ..new_managed_window
-                    };
-                    workset.updated_at = clock::now_rfc3339();
-                }
-                drop(config);
-
-                if let Err(err) = config_store::save(&dir, &c.borrow()) {
-                    manager.set_status_text(format!("保存に失敗しました: {err}").into());
-                    manager.set_status_is_warning(true);
-                    return;
-                }
-
-                manager.set_status_text("再登録しました。".into());
+        match config_store::save(&dir, &c.borrow()) {
+            Ok(()) => {
+                manager.set_status_text(
+                    format!("{updated}個のウィンドウ配置を再登録しました。").into(),
+                );
                 manager.set_status_is_warning(false);
-                refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-                refresh_selected_workset_detail(&manager, &c.borrow(), &state);
             }
             Err(err) => {
-                manager.set_status_text(format!("再登録できません: {err}").into());
+                manager.set_status_text(format!("保存に失敗しました: {err}").into());
                 manager.set_status_is_warning(true);
             }
         }
+        refresh_selected_workset_detail(&manager, &c.borrow(), &s.borrow());
     });
 }
 

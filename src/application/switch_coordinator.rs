@@ -510,9 +510,14 @@ fn encode_assignments(map: &HashMap<Uuid, ParkingSlotId>) -> HashMap<String, Str
         .collect()
 }
 
-/// The union work-area rect of a sub-screen's currently-live monitors, or
-/// `None` if none of them are connected (→ the workset is minimized instead).
+/// The target rect a sub-screen parks into, or `None` if none of its monitors
+/// are connected (→ the workset is minimized instead). `split == One` uses the
+/// union of all live monitors' work areas (may span several); a `TwoColumns`/
+/// `FourGrid` sub-screen uses the chosen half/quarter cell of its first live
+/// monitor.
 fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) -> Option<PixelRect> {
+    use crate::domain::monitor::AutoSplit;
+
     let work_areas: Vec<PixelRect> = sub
         .monitor_ids
         .iter()
@@ -523,7 +528,17 @@ fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) -> Opt
                 .map(|m| m.work_area_px)
         })
         .collect();
-    bounding_rect(&work_areas)
+    if work_areas.is_empty() {
+        return None;
+    }
+    if sub.split == AutoSplit::One {
+        return bounding_rect(&work_areas);
+    }
+    let cells = crate::application::layout_service::auto_split_cells(work_areas[0], sub.split);
+    cells
+        .get(sub.cell_index)
+        .copied()
+        .or_else(|| bounding_rect(&work_areas))
 }
 
 #[cfg(test)]

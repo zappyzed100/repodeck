@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::domain::placement::PixelRect;
 
 /// How many parking cells a non-main monitor is split into (PLAN.md §2.5, §4.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoSplit {
+    #[default]
     One,
     TwoColumns,
     FourGrid,

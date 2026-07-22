@@ -81,7 +81,7 @@ export component WorksetManager inherits Window {
     callback workset-selected(index: int);
     callback delete-workset-requested();
     callback reopen-closed-requested();
-    callback rebind-requested(window-index: int);
+    callback recapture-placement-requested();
 
     callback start-registration();
     callback cancel-registration();
@@ -187,6 +187,11 @@ export component WorksetManager inherits Window {
                             clicked => { root.reopen-closed-requested(); }
                         }
                         GlassButton {
+                            text: "配置を再登録";
+                            enabled: root.selected-workset-index >= 0;
+                            clicked => { root.recapture-placement-requested(); }
+                        }
+                        GlassButton {
                             text: "このセットを削除";
                             enabled: root.selected-workset-index >= 0;
                             clicked => { root.delete-workset-requested(); }
@@ -213,10 +218,6 @@ export component WorksetManager inherits Window {
                                             font-size: 10px;
                                             color: w.status_is_warning ? Theme.danger : Theme.success;
                                         }
-                                    }
-                                    GlassButton {
-                                        text: "このウィンドウを再登録";
-                                        clicked => { root.rebind-requested(i); }
                                     }
                                 }
                             }
@@ -309,6 +310,13 @@ export component WorksetManager inherits Window {
                             }
                         }
                     }
+                }
+
+                Text {
+                    text: "「閉じたアプリを開き直す」対象: VS Codeはフォルダー、ブラウザはURL（新規ウィンドウ）で復元します。その他のアプリは実行ファイルを再起動します（開いていた文書までは復元されません）。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
                 }
 
                 HorizontalLayout {

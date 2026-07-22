@@ -31,12 +31,22 @@ pub struct AppConfig {
     pub fixed_slots: Vec<FixedParkingSlot>,
 }
 
-/// A named parking area spanning one or more monitors (PLAN.md §2.4 extension).
+/// A named parking area (PLAN.md §2.4 extension). Either a whole area spanning
+/// one or more monitors (`split == One`, using the union of the monitors), or a
+/// fraction of a single monitor (`split == TwoColumns`/`FourGrid` + `cell_index`
+/// picks the half/quarter of the first assigned monitor).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubScreen {
     pub id: Uuid,
     pub name: String,
     pub monitor_ids: Vec<String>,
+    /// How the area is carved out. `One` = the whole union of `monitor_ids`;
+    /// `TwoColumns`/`FourGrid` = a half/quarter cell of the first monitor.
+    #[serde(default)]
+    pub split: crate::domain::monitor::AutoSplit,
+    /// Which cell of `split` (reading order) when `split != One`.
+    #[serde(default)]
+    pub cell_index: usize,
 }
 
 impl AppConfig {
