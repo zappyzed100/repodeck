@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod placement;
 pub mod popup_window;
 pub mod power_watch;
+pub mod process_info;
 pub mod session;
 pub mod win32_error;
 pub mod window_ops_impl;

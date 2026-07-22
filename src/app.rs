@@ -1190,17 +1190,34 @@ fn capture_launch_spec(
     window: &TopLevelWindow,
     repository_path: &Path,
 ) -> Option<crate::domain::workset::LaunchSpec> {
+    use crate::domain::workset::LaunchKind;
     let exe = window.executable_path.as_ref()?;
     let kind = launch_service::classify(exe);
-    let browser_url = if kind == crate::domain::workset::LaunchKind::Browser {
+    let browser_url = if kind == LaunchKind::Browser {
         crate::windowing::browser_url::read_browser_url(window.hwnd)
     } else {
         None
     };
-    let repo = (!repository_path.as_os_str().is_empty()).then_some(repository_path);
+    // For VS Code, prefer the folder/workspace the window actually has open (read
+    // from its process command line) over the workset's `repository_path` — most
+    // worksets have no repository_path, so relying on it left VS Code relaunching
+    // with no folder (2026-07-23). Fall back to repository_path if the capture
+    // fails (protected process, or a bare window with no path argument).
+    let captured_vscode_folder = if kind == LaunchKind::VsCode {
+        let folder = crate::windowing::process_info::read_process_command_line(window.process_id)
+            .and_then(|cl| launch_service::extract_vscode_folder(&cl));
+        tracing::info!(target: "launch", pid = window.process_id, folder = ?folder, "capture: VS Code open folder from command line");
+        folder
+    } else {
+        None
+    };
+    let repo_folder = captured_vscode_folder
+        .as_deref()
+        .map(Path::new)
+        .or_else(|| (!repository_path.as_os_str().is_empty()).then_some(repository_path));
     Some(launch_service::build_launch_spec(
         exe,
-        repo,
+        repo_folder,
         browser_url.as_deref(),
     ))
 }
@@ -1438,6 +1455,10 @@ struct PendingAcquire {
     workset_id: uuid::Uuid,
     before: std::collections::HashSet<isize>,
     dead: Vec<(uuid::Uuid, PathBuf, String)>,
+    /// Relaunched browsers whose launch spec carried no URL — they open a blank
+    /// window with the address bar focused, so they are minimized once bound so
+    /// stray keystrokes during the switch can't land in the omnibox (2026-07-23).
+    blank_browsers: std::collections::HashSet<uuid::Uuid>,
 }
 
 /// Launches the target workset's closed (unresolved) windows that carry a
@@ -1460,15 +1481,22 @@ fn launch_missing_for_switch(
     );
 
     let mut dead = Vec::new();
+    let mut blank_browsers = std::collections::HashSet::new();
     for w in &workset.windows {
         let alive = matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }));
         if !alive && let Some(spec) = &w.launch_spec {
             match crate::windowing::app_launch::launch(spec) {
                 Ok(()) => {
+                    let no_url = spec.kind == crate::domain::workset::LaunchKind::Browser
+                        && !spec.args.iter().any(|a| a.contains("://"));
                     tracing::info!(
                         target: "launch", managed = %w.id, program = %spec.program.display(),
-                        class = %w.matcher.window_class, "switch: relaunching closed app via set"
+                        class = %w.matcher.window_class, no_url,
+                        "switch: relaunching closed app via set"
                     );
+                    if no_url {
+                        blank_browsers.insert(w.id);
+                    }
                     dead.push((w.id, spec.program.clone(), w.matcher.window_class.clone()));
                 }
                 Err(err) => {
@@ -1486,6 +1514,7 @@ fn launch_missing_for_switch(
         workset_id: target_id,
         before: live_windows.iter().map(|w| w.hwnd).collect(),
         dead,
+        blank_browsers,
     })
 }
 
@@ -1500,6 +1529,7 @@ fn acquire_launched_and_place(
 ) {
     let after = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
     let mut claimed: std::collections::HashSet<isize> = std::collections::HashSet::new();
+    let mut blank_browser_hwnds: Vec<isize> = Vec::new();
     let mut runtime = runtime_store::load(data_dir);
     for (id, exe, class) in &pending.dead {
         if let Some(w) = after.iter().find(|w| {
@@ -1511,12 +1541,23 @@ fn acquire_launched_and_place(
             tracing::info!(target: "launch", managed = %id, hwnd = w.hwnd, class = %class, "switch: bound relaunched window to its set");
             runtime.window_bindings.insert(*id, w.hwnd);
             claimed.insert(w.hwnd);
+            if pending.blank_browsers.contains(id) {
+                blank_browser_hwnds.push(w.hwnd);
+            }
         } else {
             tracing::warn!(target: "launch", managed = %id, program = %exe.display(), class = %class, "switch: relaunched app did not appear in time to bind");
         }
     }
     let _ = runtime_store::save(data_dir, &runtime);
     reopen_place_workset(pending.workset_id, config, data_dir, coordinator);
+
+    // A blank browser (relaunched with no captured URL) opens with its address
+    // bar focused; minimize it after placement so stray keystrokes during the
+    // switch can't be typed into the omnibox.
+    for hwnd in blank_browser_hwnds {
+        tracing::info!(target: "launch", hwnd, "minimizing relaunched blank browser (no captured URL)");
+        Win32WindowOps.minimize(hwnd);
+    }
 }
 
 fn wire_workset_manager(

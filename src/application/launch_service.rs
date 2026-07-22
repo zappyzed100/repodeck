@@ -49,6 +49,50 @@ pub fn normalize_url(raw: &str) -> String {
     }
 }
 
+/// Splits a Windows command line into arguments, honoring double quotes (so a
+/// path with spaces stays one token). Good enough for reading back a launch
+/// command line — not a full CommandLineToArgvW escape parser.
+fn tokenize_command_line(command_line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+    for ch in command_line.chars() {
+        match ch {
+            '"' => started = true, // toggle handled below
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// From a VS Code process command line, the folder/workspace path it was opened
+/// on: the first positional argument (skipping the executable and any `--flags`,
+/// and `foo://` URIs). `None` if it was launched with no path (a bare window).
+pub fn extract_vscode_folder(command_line: &str) -> Option<String> {
+    tokenize_command_line(command_line)
+        .into_iter()
+        .skip(1) // the executable itself
+        .find(|token| {
+            !token.is_empty() && !token.starts_with('-') && !token.contains("://")
+        })
+}
+
 /// Builds the relaunch spec for a window given its executable, the owning
 /// workset's repository path (for VS Code), and its captured browser URL (for
 /// browsers). Returns `None` for a generic app with nothing to relaunch
@@ -160,6 +204,32 @@ mod tests {
             spec.args,
             vec!["-new-window".to_string(), "https://a.b".to_string()]
         );
+    }
+
+    #[test]
+    fn extract_vscode_folder_reads_the_positional_path() {
+        assert_eq!(
+            extract_vscode_folder(r#""C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe" "D:\work\my repo""#),
+            Some(r"D:\work\my repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_vscode_folder_skips_flags_and_uris() {
+        assert_eq!(
+            extract_vscode_folder(r#""Code.exe" --new-window D:\repo"#),
+            Some(r"D:\repo".to_string())
+        );
+        // A --folder-uri style launch (uri, not a plain path) is ignored.
+        assert_eq!(
+            extract_vscode_folder(r#""Code.exe" --folder-uri file:///D:/repo"#),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_vscode_folder_none_for_a_bare_window() {
+        assert_eq!(extract_vscode_folder(r#""C:\x\Code.exe""#), None);
     }
 
     #[test]
