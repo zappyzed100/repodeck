@@ -8,11 +8,18 @@ export struct QuickSwitcherRow {
     is-current: bool,
     is-parking-target: bool,
     number-hint: int,
-    // Codex agent status (PLAN.md §6, Phase 8). `agent-status-label` is
-    // empty for Idle/Unknown to avoid visual noise in the common case.
+    // Codex agent status (PLAN.md §6, Phase 8). Always shown now: `agent-symbol`
+    // + `agent-status-label` (✓成功 / ×失敗 / ●実行中・入力待ち / —未実行),
+    // coloured by `agent-status-color`.
     agent-status-color: color,
+    agent-symbol: string,
     agent-status-label: string,
     agent-elapsed-text: string,
+    // Git working-tree status (empty for non-git repos, filled by a background
+    // refresh): current branch, "変更N" change count, and "最終commit" age.
+    branch-text: string,
+    changed-text: string,
+    last-commit-text: string,
 }
 
 export component QuickSwitcher inherits Window {
@@ -20,8 +27,8 @@ export component QuickSwitcher inherits Window {
     icon: @image-url("../assets/repodeck-icon.svg");
     no-frame: true;
     always-on-top: true;
-    width: 480px;
-    height: 560px;
+    width: 620px;
+    height: 720px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -174,7 +181,7 @@ export component QuickSwitcher inherits Window {
                         spacing: Theme.space-xs;
 
                         for row[i] in root.rows: Rectangle {
-                        height: 52px;
+                        height: 62px;
                         border-radius: Theme.radius-md;
                         // The up/down selection is shown by the accent border;
                         // the current workset by the filled background.
@@ -195,7 +202,10 @@ export component QuickSwitcher inherits Window {
 
                             VerticalLayout {
                                 alignment: center;
-                                spacing: 2px;
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+
+                                // Line 1: name + badges … right: agent status.
                                 HorizontalLayout {
                                     spacing: Theme.space-xs;
                                     Text {
@@ -203,43 +213,69 @@ export component QuickSwitcher inherits Window {
                                         font-size: 14px;
                                         font-weight: 600;
                                         color: Theme.text-primary;
+                                        overflow: elide;
                                     }
                                     if row.is-current: Text {
                                         text: "現在";
                                         font-size: 11px;
                                         font-weight: 700;
                                         color: Theme.accent;
+                                        vertical-alignment: center;
                                     }
                                     if row.is-parking-target: Text {
                                         text: "固定枠";
                                         font-size: 11px;
                                         color: Theme.text-tertiary;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Rectangle { horizontal-stretch: 1; }
+
+                                    Text {
+                                        text: row.agent-symbol;
+                                        font-size: 12px;
+                                        color: row.agent-status-color;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
+                                        font-size: 11px;
+                                        color: Theme.text-secondary;
+                                        vertical-alignment: center;
                                     }
                                 }
-                                Text {
-                                    text: row.repository-name;
-                                    font-size: 11px;
-                                    color: Theme.text-secondary;
-                                    overflow: elide;
-                                }
-                            }
 
-                            Rectangle { horizontal-stretch: 1; }
-
-                            if row.agent-status-label != "": HorizontalLayout {
-                                spacing: 4px;
-                                alignment: center;
-                                Rectangle {
-                                    width: 8px;
-                                    height: 8px;
-                                    border-radius: 4px;
-                                    background: row.agent-status-color;
-                                }
-                                Text {
-                                    text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
-                                    font-size: 11px;
-                                    color: Theme.text-secondary;
-                                    vertical-alignment: center;
+                                // Line 2: branch · 変更N · 最終commit (falls back
+                                // to the folder name for a non-git repo).
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    Text {
+                                        text: row.branch-text == "" ? row.repository-name : row.branch-text;
+                                        font-size: 11px;
+                                        color: row.branch-text == "" ? Theme.text-secondary : Theme.text-primary;
+                                        overflow: elide;
+                                    }
+                                    if row.changed-text != "": Text {
+                                        text: "·";
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.changed-text != "": Text {
+                                        text: row.changed-text;
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.last-commit-text != "": Text {
+                                        text: "·";
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.last-commit-text != "": Text {
+                                        text: row.last-commit-text;
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
                             }
 

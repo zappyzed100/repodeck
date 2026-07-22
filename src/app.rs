@@ -2448,8 +2448,10 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                 .get(&workset.id)
                 .copied()
                 .unwrap_or(AgentState::Unknown);
-            let (agent_status_label, agent_elapsed_text) =
+            let (_, agent_elapsed_text) =
                 agent_row_status(&state.agent_runs, workset.id, agent_state);
+            let (agent_symbol, agent_status_label) = agent_symbol_and_label(agent_state);
+            let git = cached_git_status(&workset.repository_path);
             QuickSwitcherRow {
                 workset_id: workset.id.to_string().into(),
                 name: workset.name.clone().into(),
@@ -2468,8 +2470,21 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                     0
                 },
                 agent_status_color: hex_to_color(state_color(agent_state)),
+                agent_symbol: agent_symbol.into(),
                 agent_status_label: agent_status_label.into(),
                 agent_elapsed_text: agent_elapsed_text.into(),
+                branch_text: git.branch.clone().unwrap_or_default().into(),
+                changed_text: if git.is_git {
+                    format!("変更{}", git.changed_count).into()
+                } else {
+                    slint::SharedString::new()
+                },
+                last_commit_text: git
+                    .last_commit_at
+                    .as_deref()
+                    .map(format_commit_relative)
+                    .unwrap_or_default()
+                    .into(),
             }
         })
         .collect();
@@ -2483,6 +2498,33 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
     } else if switcher.get_selected_index() < 0 {
         switcher.set_selected_index(0);
     }
+}
+
+/// Quick Switcher status cell for an aggregate agent state: a mark plus a
+/// Japanese word, always shown (including 未実行 for Idle/Unknown, unlike the
+/// tray tooltip). `×` is U+00D7, which the UI font renders (unlike U+2715);
+/// the colour (`state_color`) carries the success/failure meaning alongside.
+fn agent_symbol_and_label(state: AgentState) -> (&'static str, &'static str) {
+    match state {
+        AgentState::Running => ("●", "実行中"),
+        AgentState::NeedsInput => ("●", "入力待ち"),
+        AgentState::Ready => ("✓", "成功"),
+        AgentState::Blocked => ("×", "失敗"),
+        AgentState::Idle | AgentState::Unknown => ("—", "未実行"),
+    }
+}
+
+/// Relative "最終commit" text (「18分前」) from a commit's RFC 3339 timestamp,
+/// computed fresh at display time. Empty when the timestamp can't be parsed.
+fn format_commit_relative(timestamp: &str) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return String::new();
+    };
+    let minutes = (OffsetDateTime::now_utc() - parsed).whole_minutes();
+    crate::domain::git::relative_label(minutes)
 }
 
 /// Japanese label for an aggregate agent state, shared by the Quick
@@ -2585,6 +2627,9 @@ fn select_row_for_workset(switcher: &QuickSwitcher, workset_id: uuid::Uuid) {
 /// reliably grab keyboard focus on `.show()` alone).
 fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
     refresh_quick_switcher_rows(switcher, config, data_dir);
+    // Kick a background git refresh; rows re-render when it completes. The
+    // switcher shows the cached (possibly stale/empty) values immediately.
+    spawn_git_refresh(workset_repo_paths(config));
 
     let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
     let cursor = monitor::cursor_position().unwrap_or((0, 0));
@@ -2890,6 +2935,9 @@ fn wire_quick_switcher(
         };
 
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+        // A switch can change branch/uncommitted state (e.g. worktrees) — refresh
+        // git in the background so the next open shows current values.
+        spawn_git_refresh(workset_repo_paths(&c.borrow()));
         if close_after_switch {
             let _ = switcher.hide();
         }
@@ -3987,6 +4035,67 @@ fn show_quick_switcher_from_context() {
             && let Some(switcher) = ctx.quick_switcher.upgrade()
         {
             show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+        }
+    });
+}
+
+/// Per-repository git status, refreshed in the background (`spawn_git_refresh`)
+/// and read when building Quick Switcher rows. A process-wide cache rather than
+/// `Rc` state so the background thread can write it; the UI thread reads it.
+static GIT_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, crate::domain::git::GitStatus>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The cached git status for `path`, or the empty default until the first
+/// background refresh has populated it.
+fn cached_git_status(path: &Path) -> crate::domain::git::GitStatus {
+    GIT_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
+        .unwrap_or_default()
+}
+
+/// Fetches each repository's git status on a background thread (so `git` never
+/// blocks the switcher from opening), stores it in `GIT_CACHE`, then re-renders
+/// the Quick Switcher on the UI thread. Called when the switcher opens and after
+/// a switch — the moments its branch / change-count / last-commit can differ.
+fn spawn_git_refresh(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for path in paths {
+            let status = crate::application::git_status_service::fetch(&path);
+            if let Ok(mut cache) = GIT_CACHE.lock() {
+                cache.insert(path, status);
+            }
+        }
+        let _ = slint::invoke_from_event_loop(refresh_quick_switcher_from_context);
+    });
+}
+
+/// The distinct repository paths of all worksets — the work list for
+/// `spawn_git_refresh`.
+fn workset_repo_paths(config: &AppConfig) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = config
+        .worksets
+        .iter()
+        .map(|w| w.repository_path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Re-renders the Quick Switcher's rows from the UI-thread context (used as the
+/// background git refresh's completion callback).
+fn refresh_quick_switcher_from_context() {
+    UI_CONTEXT.with(|cell| {
+        if let Some(ctx) = &*cell.borrow()
+            && let Some(switcher) = ctx.quick_switcher.upgrade()
+        {
+            refresh_quick_switcher_rows(&switcher, &ctx.config.borrow(), &ctx.data_dir);
         }
     });
 }
