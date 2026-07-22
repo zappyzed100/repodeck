@@ -2682,6 +2682,11 @@ fn compute_empty_main_destinations(
     // Non-designated registered windows, collected for distribution: (hwnd, its
     // main-screen rect for aspect-preserving shrink).
     let mut to_distribute: Vec<(isize, PixelRect)> = Vec::new();
+    // Sub-screens that actually receive a designated window this pass. Only these
+    // are withheld from general parking; an *empty* sub-screen is fair game as a
+    // parking target (「サブにウィンドウが入っているときは入れない」, 2026-07-23).
+    let mut occupied_sub_ids: std::collections::HashSet<uuid::Uuid> =
+        std::collections::HashSet::new();
 
     for workset in &config.worksets {
         // Resolve this workset's live on-main windows once.
@@ -2733,6 +2738,7 @@ fn compute_empty_main_destinations(
                 && let Some(&rect) = mapped.first()
             {
                 rects.insert(*hwnd, rect);
+                occupied_sub_ids.insert(*sub_screen_id);
                 if want_fullscreen {
                     fullscreen.insert(*hwnd);
                 }
@@ -2740,10 +2746,14 @@ fn compute_empty_main_destinations(
         }
     }
 
-    // Parking screens = live monitors that are non-main, non-sub, non-excluded.
-    let sub_ids: std::collections::HashSet<&str> = config
+    // Parking screens = live monitors that are non-main, non-excluded, and not
+    // an *occupied* sub-screen. A sub-screen only counts as reserved when a
+    // designated workset actually parked a window into it this pass; an empty
+    // sub-screen is usable as a general parking target (2026-07-23).
+    let occupied_sub_monitor_ids: std::collections::HashSet<&str> = config
         .sub_screens
         .iter()
+        .filter(|s| occupied_sub_ids.contains(&s.id))
         .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
         .collect();
     let parking_screens: Vec<PixelRect> = live_monitors
@@ -2754,7 +2764,7 @@ fn compute_empty_main_destinations(
                 .iter()
                 .any(|id| id == &m.device_name)
         })
-        .filter(|m| !sub_ids.contains(m.device_name.as_str()))
+        .filter(|m| !occupied_sub_monitor_ids.contains(m.device_name.as_str()))
         .filter(|m| {
             !config
                 .monitors

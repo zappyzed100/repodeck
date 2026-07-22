@@ -171,10 +171,25 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .unwrap_or_default();
         let target_resolved = resolved_windows(target, &decisions, request.live_windows);
 
+        // If the outgoing workset parks into a sub-screen cell that a stale
+        // window from another set still occupies, that window is evacuated to
+        // general parking first (below). Resolve it now so it is journaled too.
+        let sub_evictees = self.resolve_sub_evictees(
+            current,
+            &current_resolved,
+            &target_resolved,
+            &decisions,
+            &request,
+        );
+
         // Step 4: journal every affected window's pre-switch placement.
         let transaction_id = Uuid::new_v4();
         let mut journal_windows = Vec::new();
-        for resolved in current_resolved.iter().chain(target_resolved.iter()) {
+        for resolved in current_resolved
+            .iter()
+            .chain(target_resolved.iter())
+            .chain(sub_evictees.iter())
+        {
             journal_windows.push(capture_journal_entry(&self.window_ops, resolved)?);
         }
         let journal = SwitchJournal {
@@ -194,6 +209,9 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // video and the foreground still ends up on the new workset.
         let mut fullscreen_hwnds: Vec<isize> = Vec::new();
         if let Some(current) = current {
+            // Clear any stale occupant out of the sub-screen cell first, so the
+            // outgoing window is not stacked on top of it.
+            self.park_evictees(&sub_evictees, &request);
             match self.park_workset(
                 current,
                 &current_resolved,
@@ -449,6 +467,123 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         }
     }
 
+    /// Windows that must be evacuated from the outgoing workset's sub-screen cell
+    /// before it is parked there. Empty unless `current` is sub-designated and a
+    /// managed window from *another* (inactive) workset is still sitting in that
+    /// exact cell from an earlier switch. These are journaled by the caller (so a
+    /// rollback restores them) and then moved by `park_evictees`.
+    fn resolve_sub_evictees<'a>(
+        &self,
+        current: Option<&Workset>,
+        current_resolved: &[ResolvedWindow<'a>],
+        target_resolved: &[ResolvedWindow<'a>],
+        decisions: &HashMap<Uuid, MatchDecision>,
+        request: &SwitchRequest<'a>,
+    ) -> Vec<ResolvedWindow<'a>> {
+        let Some(current) = current else {
+            return Vec::new();
+        };
+        let ParkingPolicy::SubScreen { sub_screen_id } = &current.parking_policy else {
+            return Vec::new();
+        };
+        let Some(sub) = request.sub_screens.iter().find(|s| s.id == *sub_screen_id) else {
+            return Vec::new();
+        };
+        let Some(cell) =
+            sub_screen_slot_rect(sub, request.worksets, current.id, request.live_monitors)
+        else {
+            return Vec::new();
+        };
+
+        // Every managed live window and its current rect, keyed by hwnd so a
+        // window shared across worksets is considered once. The `ManagedWindow`
+        // (any owning one) supplies the id/process for journaling.
+        let mut managed_by_hwnd: HashMap<isize, (&ManagedWindow, u32, PixelRect)> = HashMap::new();
+        for ws in request.worksets {
+            for mw in &ws.windows {
+                if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&mw.id)
+                    && let Some(live) = request.live_windows.iter().find(|w| w.hwnd == *hwnd)
+                {
+                    managed_by_hwnd
+                        .entry(*hwnd)
+                        .or_insert((mw, live.process_id, live.rect_px));
+                }
+            }
+        }
+
+        let incoming: std::collections::HashSet<isize> = current_resolved
+            .iter()
+            .chain(target_resolved)
+            .map(|w| w.hwnd)
+            .collect();
+        let managed: Vec<(isize, PixelRect)> = managed_by_hwnd
+            .iter()
+            .map(|(hwnd, (_, _, rect))| (*hwnd, *rect))
+            .collect();
+
+        stale_sub_occupants(cell, &incoming, &managed)
+            .into_iter()
+            .filter_map(|hwnd| {
+                managed_by_hwnd
+                    .get(&hwnd)
+                    .map(|(mw, pid, _)| ResolvedWindow {
+                        managed: mw,
+                        hwnd,
+                        process_id: *pid,
+                    })
+            })
+            .collect()
+    }
+
+    /// Moves `evictees` off a sub-screen cell into general (non-sub) parking,
+    /// distributed to keep total parked area largest (`distribute_parking`).
+    /// A window that fits nowhere is minimized. Called before the outgoing
+    /// workset is parked into that cell.
+    fn park_evictees(&self, evictees: &[ResolvedWindow], request: &SwitchRequest) {
+        if evictees.is_empty() {
+            return;
+        }
+        let sub_monitor_ids: std::collections::HashSet<&str> = request
+            .sub_screens
+            .iter()
+            .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
+            .collect();
+        let screens: Vec<PixelRect> = request
+            .live_monitors
+            .iter()
+            .filter(|m| !request.main_monitor_ids.iter().any(|id| id == &m.device_name))
+            .filter(|m| {
+                !request
+                    .saved_monitors
+                    .iter()
+                    .any(|s| s.stable_id == m.device_name && s.excluded)
+            })
+            .filter(|m| !sub_monitor_ids.contains(m.device_name.as_str()))
+            .map(|m| m.work_area_px)
+            .collect();
+
+        let hwnds: Vec<isize> = evictees.iter().map(|w| w.hwnd).collect();
+        let (placements, overflow) = distribute_parking(&screens, &hwnds);
+        for (hwnd, cell) in placements {
+            let src = request
+                .live_windows
+                .iter()
+                .find(|w| w.hwnd == hwnd)
+                .map(|w| w.rect_px);
+            match src.map(|s| plan_park_into_slot(std::slice::from_ref(&s), cell)) {
+                Some(ParkPlan::ShrinkToFit(mapped)) => {
+                    if let Some(&rect) = mapped.first() {
+                        self.window_ops.set_placement(hwnd, rect, false, true);
+                    }
+                }
+                _ => self.window_ops.minimize(hwnd),
+            }
+        }
+        for hwnd in overflow {
+            self.window_ops.minimize(hwnd);
+        }
+    }
+
     /// PLAN.md §3.8 failure path: restores every journaled window to its
     /// pre-switch placement. `current_workset_id` is never touched here.
     fn rollback(&self, mut journal: SwitchJournal, reason: String) -> SwitchError {
@@ -678,15 +813,24 @@ pub fn subdivide_for_count(rect: PixelRect, count: usize) -> Vec<PixelRect> {
     }
 }
 
-/// Distributes `windows` across the available parking `screens`, filling the
-/// least-occupied screen first (empty screens preferred), and subdividing each
-/// screen by how many windows it ends up holding (see `subdivide_for_count`),
-/// never stacking. Each screen's capacity depends on its size (`screen_capacity`
-/// — 4 for a 1080p-class monitor, 6 for QHD-class); any window beyond every
-/// screen's capacity is returned in the overflow list (to be minimized).
+/// Distributes `windows` across the available parking `screens` so the **sum of
+/// the resulting window areas is maximised**, subdividing each screen by how many
+/// windows it ends up holding (see `subdivide_for_count`), never stacking. Each
+/// screen's capacity depends on its size (`screen_capacity` — 4 for a 1080p-class
+/// monitor, 6 for QHD-class); any window beyond every screen's capacity is
+/// returned in the overflow list (to be minimized).
 ///
-/// 確定仕様（development-plan.md「退避の優先順位ルール」）: 「空いてる画面を優先」
-/// 「既に入っていれば重ねず分割」「QHDは3×2の6分割まで」。
+/// Because a screen's windows always *tile it completely*, the total parked area
+/// equals the sum of the areas of the screens that hold at least one window —
+/// independent of how many each holds. So maximising the sum means: light up an
+/// empty screen (largest first) in preference to adding to an already-occupied
+/// one, since the latter leaves the total unchanged. Among already-occupied
+/// screens (where the total no longer grows) the next window goes to the one that
+/// keeps windows largest — the greatest resulting cell area, `area / (count+1)`.
+///
+/// 確定仕様（development-plan.md「退避の優先順位ルール」, 2026-07-23）: 「空いてる
+/// 画面を面積の大きい順に優先」「既に入っていれば重ねず、次のセルが最大になる画面へ」
+/// 「QHDは3×2の6分割まで」。
 pub fn distribute_parking(
     screens: &[PixelRect],
     windows: &[isize],
@@ -694,12 +838,21 @@ pub fn distribute_parking(
     let mut occupants: Vec<Vec<isize>> = vec![Vec::new(); screens.len()];
     let mut overflow = Vec::new();
     for &hwnd in windows {
-        // The least-occupied screen that still has room; ties resolve to the
-        // first (reading-order) screen, so windows spread out evenly.
-        match (0..screens.len())
+        // Among screens with room, pick the one that most increases the total
+        // parked area (see the doc comment): an empty screen (ranked by its full
+        // area) always beats an occupied one (ranked by its next cell size,
+        // `area / (count+1)`). Ties resolve to the earliest (reading-order)
+        // screen via `-index`.
+        let best = (0..screens.len())
             .filter(|&i| occupants[i].len() < screen_capacity(screens[i]))
-            .min_by_key(|&i| occupants[i].len())
-        {
+            .max_by_key(|&i| {
+                let area = i64::from(screens[i].width) * i64::from(screens[i].height);
+                let count = occupants[i].len() as i64;
+                let lights_up = count == 0;
+                let metric = if lights_up { area } else { area / (count + 1) };
+                (lights_up, metric, -(i as i64))
+            });
+        match best {
             Some(i) => occupants[i].push(hwnd),
             None => overflow.push(hwnd),
         }
@@ -711,6 +864,30 @@ pub fn distribute_parking(
         }
     }
     (placements, overflow)
+}
+
+/// hwnds of managed windows that still occupy `cell` (a sub-screen cell about to
+/// receive an incoming window) but are **not** part of this switch — stale
+/// occupants left there by an earlier switch. They must be evacuated to general
+/// parking before the incoming window is placed, otherwise it would be stacked
+/// on top of them (「サブに入った画面を他に退避させてからメインをサブに入れる」,
+/// 2026-07-23). `managed` is `(hwnd, current rect)` for every RepoDeck-managed
+/// live window; `incoming` is the hwnds of the current + target worksets, which
+/// are never evicted. The result is sorted and de-duplicated for determinism.
+pub fn stale_sub_occupants(
+    cell: PixelRect,
+    incoming: &std::collections::HashSet<isize>,
+    managed: &[(isize, PixelRect)],
+) -> Vec<isize> {
+    let mut out: Vec<isize> = managed
+        .iter()
+        .filter(|(hwnd, _)| !incoming.contains(hwnd))
+        .filter(|(_, rect)| rect.overlaps(&cell))
+        .map(|(hwnd, _)| *hwnd)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Counts how many worksets park onto the sub-screen `sub_screen_id`.
@@ -1266,6 +1443,56 @@ mod tests {
                 .iter()
                 .all(|(_, r)| r.width < 1000 && r.height < 800)
         );
+    }
+
+    #[test]
+    fn distribute_parking_lights_the_largest_screen_first() {
+        // A smaller screen listed BEFORE a larger one. A single window must land
+        // on the larger screen (maximising total parked area), not the first
+        // one in the list.
+        let screens = vec![
+            PixelRect::new(0, 0, 1920, 1080),    // HD, listed first
+            PixelRect::new(1920, 0, 2560, 1440), // QHD, larger — listed second
+        ];
+        let (placements, overflow) = distribute_parking(&screens, &[1]);
+        assert!(overflow.is_empty());
+        assert_eq!(placements.len(), 1);
+        assert!(
+            placements[0].1.x >= 1920,
+            "the single window should land on the larger QHD screen, got {:?}",
+            placements[0].1
+        );
+    }
+
+    #[test]
+    fn distribute_parking_keeps_windows_largest_when_screens_are_mixed() {
+        // HD (listed first) + QHD, three windows. Once both screens are lit, the
+        // third window goes where its cell stays largest: the QHD (a QHD half is
+        // bigger than an HD half), so QHD holds 2 and HD holds 1.
+        let screens = vec![
+            PixelRect::new(0, 0, 1920, 1080),    // HD
+            PixelRect::new(1920, 0, 2560, 1440), // QHD
+        ];
+        let (placements, overflow) = distribute_parking(&screens, &[1, 2, 3]);
+        assert!(overflow.is_empty());
+        let on_qhd = placements.iter().filter(|(_, r)| r.x >= 1920).count();
+        let on_hd = placements.iter().filter(|(_, r)| r.x < 1920).count();
+        assert_eq!(on_qhd, 2, "QHD should take the extra window");
+        assert_eq!(on_hd, 1);
+    }
+
+    #[test]
+    fn stale_sub_occupants_flags_only_foreign_windows_overlapping_the_cell() {
+        let cell = PixelRect::new(1920, 0, 1280, 1440); // a sub-screen half
+        let incoming: std::collections::HashSet<isize> = [10, 11].into_iter().collect();
+        let managed = vec![
+            (10, PixelRect::new(1920, 0, 1280, 1440)), // incoming → never evicted
+            (20, PixelRect::new(1920, 0, 1280, 1440)), // foreign, on the cell → evict
+            (30, PixelRect::new(0, 0, 1920, 1080)),    // foreign, on the main → keep
+            (40, PixelRect::new(2000, 100, 400, 300)), // foreign, partly on cell → evict
+        ];
+        let evictees = stale_sub_occupants(cell, &incoming, &managed);
+        assert_eq!(evictees, vec![20, 40]);
     }
 
     #[test]
