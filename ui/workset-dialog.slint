@@ -65,6 +65,11 @@ export component WorksetManager inherits Window {
     in property <[string]> parking-subs: [];
     in-out property <int> parking-selected-sub: -1;
 
+    // When true the registration view is editing an existing set ("配置を
+    // 再登録") rather than creating a new one; the name is pre-filled.
+    in property <bool> registration-editing: false;
+    in-out property <string> registration-name: "";
+
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
 
@@ -233,7 +238,7 @@ export component WorksetManager inherits Window {
                 spacing: Theme.space-sm;
 
                 Text {
-                    text: "新しいワークセットを登録";
+                    text: root.registration-editing ? "セットの配置を再登録" : "新しいワークセットを登録";
                     font-family: Theme.font-display;
                     font-size: 18px;
                     font-weight: 600;
@@ -256,7 +261,10 @@ export component WorksetManager inherits Window {
                 Text { text: root.resolved-repo-label; font-size: 11px; color: Theme.text-tertiary; wrap: word-wrap; }
 
                 SectionLabel { text: "名前"; }
-                name-input := LineEdit { placeholder-text: "ワークセット名"; }
+                name-input := LineEdit {
+                    placeholder-text: "ワークセット名";
+                    text <=> root.registration-name;
+                }
 
                 SectionLabel { text: "色"; }
                 HorizontalLayout {
@@ -364,7 +372,7 @@ export component WorksetManager inherits Window {
                         clicked => { root.cancel-registration(); }
                     }
                     GlassButton {
-                        text: "登録";
+                        text: root.registration-editing ? "更新" : "登録";
                         primary: true;
                         clicked => { root.register-requested(name-input.text); }
                     }

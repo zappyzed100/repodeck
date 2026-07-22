@@ -515,7 +515,7 @@ fn encode_assignments(map: &HashMap<Uuid, ParkingSlotId>) -> HashMap<String, Str
 /// union of all live monitors' work areas (may span several); a `TwoColumns`/
 /// `FourGrid` sub-screen uses the chosen half/quarter cell of its first live
 /// monitor.
-fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) -> Option<PixelRect> {
+pub fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) -> Option<PixelRect> {
     use crate::domain::monitor::AutoSplit;
 
     let work_areas: Vec<PixelRect> = sub

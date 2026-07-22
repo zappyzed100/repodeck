@@ -1098,6 +1098,9 @@ struct WorksetManagerState {
     /// 退避先 selection for the workset being registered: -1 = 自動, otherwise
     /// an index into `AppConfig.sub_screens`.
     parking_selected_sub: i32,
+    /// When set, the registration view is editing (re-registering) this
+    /// existing workset rather than creating a new one.
+    editing_workset_id: Option<uuid::Uuid>,
 }
 
 impl WorksetManagerState {
@@ -1113,6 +1116,7 @@ impl WorksetManagerState {
             pending_empty_candidates: Vec::new(),
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
+            editing_workset_id: None,
         }
     }
 }
@@ -1295,11 +1299,22 @@ fn refresh_selected_workset_detail(
     manager: &WorksetManager,
     config: &AppConfig,
     state: &WorksetManagerState,
+    data_dir: &Path,
 ) {
+    // Keep the Slint `selected-workset-index` in sync so the detail-pane
+    // buttons (which enable on `>= 0`) and the row highlight reflect the
+    // selection.
+    manager.set_selected_workset_index(
+        state
+            .selected_workset_index
+            .and_then(|i| i32::try_from(i).ok())
+            .unwrap_or(-1),
+    );
     let Some(index) = state.selected_workset_index else {
         manager.set_selected_workset_windows(
             std::rc::Rc::new(slint::VecModel::from(Vec::<ManagedWindowSummary>::new())).into(),
         );
+        manager.set_selected_missing_count(0);
         return;
     };
     let Some(workset) = config.worksets.get(index) else {
@@ -1308,7 +1323,15 @@ fn refresh_selected_workset_detail(
 
     let live_windows =
         enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-    let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
+    // Use the session HWND bindings (same as a real switch) so a window pinned
+    // to a specific HWND shows as resolved, not "ambiguous", even when another
+    // same-app window (e.g. a second browser) exists elsewhere.
+    let bindings = runtime_store::load(data_dir).window_bindings;
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &bindings,
+    );
 
     let rows: Vec<ManagedWindowSummary> = workset
         .windows
@@ -1475,16 +1498,18 @@ fn wire_workset_manager(
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_refresh_requested(move || {
         let Some(manager) = m.upgrade() else { return };
         let mut state = s.borrow_mut();
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
     });
 
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_workset_selected(move |index| {
         let Some(manager) = m.upgrade() else { return };
         let Ok(index) = usize::try_from(index) else {
@@ -1494,7 +1519,7 @@ fn wire_workset_manager(
         if index < c.borrow().worksets.len() {
             state.selected_workset_index = Some(index);
         }
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
     });
 
     let m = manager.as_weak();
@@ -1528,7 +1553,7 @@ fn wire_workset_manager(
             }
         }
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
     });
 
     let m = manager.as_weak();
@@ -1598,7 +1623,7 @@ fn wire_workset_manager(
             move || {
                 reopen_place_workset(workset_id, &c2, &dir2, &coord2);
                 if let Some(manager) = m2.upgrade() {
-                    refresh_selected_workset_detail(&manager, &c2.borrow(), &s2.borrow());
+                    refresh_selected_workset_detail(&manager, &c2.borrow(), &s2.borrow(), &dir2);
                     manager.set_status_text("配置を復元しました。".into());
                     manager.set_status_is_warning(false);
                 }
@@ -1617,6 +1642,9 @@ fn wire_workset_manager(
 
         let found = refresh_registration_candidates(&manager, &config, &mut state);
         state.picked_repository = None;
+        state.editing_workset_id = None;
+        manager.set_registration_editing(false);
+        manager.set_registration_name("".into());
         state.fullscreen_when_parked = false;
         manager.set_fullscreen_when_parked(false);
         // Reset the 退避先 picker to 自動 and refresh the sub-screen chips.
@@ -1768,13 +1796,64 @@ fn wire_workset_manager(
     });
 
     let m = manager.as_weak();
+    let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_confirm_empty_main_screen(move || {
         let Some(manager) = m.upgrade() else { return };
         let mut state = s.borrow_mut();
 
+        // Map each live HWND to the workset that owns it (if any) and, for
+        // worksets with a sub-screen destination, the rect to park it into —
+        // so a window registered in another set is sent to its parking area
+        // instead of being minimized.
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let (owner_park_rect, owner_fullscreen): (
+            std::collections::HashMap<isize, crate::domain::placement::PixelRect>,
+            std::collections::HashSet<isize>,
+        ) = {
+            let config = c.borrow();
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+            let bindings = runtime_store::load(&d).window_bindings;
+            let decisions = workset_service::resolve_all_matches_with_bindings(
+                &config.worksets,
+                &live_windows,
+                &bindings,
+            );
+            let mut rects = std::collections::HashMap::new();
+            let mut fullscreen = std::collections::HashSet::new();
+            for workset in &config.worksets {
+                let crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } =
+                    &workset.parking_policy
+                else {
+                    continue;
+                };
+                let Some(sub) = config.sub_screens.iter().find(|s| s.id == *sub_screen_id) else {
+                    continue;
+                };
+                let Some(rect) = crate::application::switch_coordinator::sub_screen_target_rect(
+                    sub,
+                    &live_monitors,
+                ) else {
+                    continue;
+                };
+                for w in &workset.windows {
+                    if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id) {
+                        rects.insert(*hwnd, rect);
+                        if workset.fullscreen_when_parked {
+                            fullscreen.insert(*hwnd);
+                        }
+                    }
+                }
+            }
+            (rects, fullscreen)
+        };
+
         let model = manager.get_main_screen_candidates();
         let mut entries = Vec::new();
+        let mut parked = 0usize;
+        let mut minimized = 0usize;
         for (index, window) in state.pending_empty_candidates.iter().enumerate() {
             let checked = model.row_data(index).map(|row| row.checked).unwrap_or(false);
             if !checked {
@@ -1795,7 +1874,23 @@ fn wire_workset_manager(
                     continue;
                 }
             };
-            win_placement::minimize(hwnd);
+
+            if let Some(rect) = owner_park_rect.get(&window.hwnd) {
+                // Registered in another set with a sub-screen: park it there.
+                win_placement::restore(hwnd);
+                if win_placement::set_window_rect(hwnd, *rect).is_ok() {
+                    if owner_fullscreen.contains(&window.hwnd) {
+                        win_placement::maximize(hwnd);
+                    }
+                    parked += 1;
+                } else {
+                    win_placement::minimize(hwnd);
+                    minimized += 1;
+                }
+            } else {
+                win_placement::minimize(hwnd);
+                minimized += 1;
+            }
             entries.push(UndoEntry {
                 hwnd: window.hwnd,
                 process_id: window.process_id,
@@ -1804,13 +1899,14 @@ fn wire_workset_manager(
             });
         }
 
-        let minimized_count = entries.len();
         state.empty_undo_snapshot = UndoSnapshot { entries };
         state.pending_empty_candidates.clear();
 
         manager.set_empty_undo_available(!state.empty_undo_snapshot.is_empty());
         manager.set_empty_screen_panel_visible(false);
-        manager.set_status_text(format!("{minimized_count}個のウィンドウを最小化しました。").into());
+        manager.set_status_text(
+            format!("{parked}個を退避、{minimized}個を最小化しました。").into(),
+        );
         manager.set_status_is_warning(false);
     });
 
@@ -1828,8 +1924,11 @@ fn wire_workset_manager(
     });
 
     let m = manager.as_weak();
+    let s = state.clone();
     manager.on_cancel_registration(move || {
         let Some(manager) = m.upgrade() else { return };
+        s.borrow_mut().editing_workset_id = None;
+        manager.set_registration_editing(false);
         manager.set_registering(false);
     });
 
@@ -2007,6 +2106,7 @@ fn wire_workset_manager(
         }
 
         let color_hex = color_to_hex(state.selected_color);
+        let editing_id = state.editing_workset_id;
         let save_result = {
             let mut config = c.borrow_mut();
             let sort_order = i32::try_from(config.worksets.len()).unwrap_or(i32::MAX);
@@ -2023,17 +2123,51 @@ fn wire_workset_manager(
                     sub_screen_id: sub.id,
                 };
             }
-            config.worksets.push(workset);
+
+            // Editing ("配置を再登録") replaces the existing set's fields in
+            // place (keeping its id/created_at/sort_order/hotkey); a fresh
+            // registration appends a new set. Snapshot for rollback on error.
+            let backup = editing_id.and_then(|id| {
+                config
+                    .worksets
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| (w.id, w.clone()))
+            });
+            if let Some((existing_id, _)) = &backup
+                && let Some(existing) = config.worksets.iter_mut().find(|w| &w.id == existing_id)
+            {
+                existing.name = workset.name.clone();
+                existing.repository_path = workset.repository_path.clone();
+                existing.repository_kind = workset.repository_kind;
+                existing.color = workset.color.clone();
+                existing.parking_policy = workset.parking_policy.clone();
+                existing.fullscreen_when_parked = workset.fullscreen_when_parked;
+                existing.windows = workset.windows.clone();
+                existing.updated_at = clock::now_rfc3339();
+            } else {
+                config.worksets.push(workset);
+            }
 
             let errors = config.validate();
+            let restore = |config: &mut AppConfig| match &backup {
+                Some((id, original)) => {
+                    if let Some(w) = config.worksets.iter_mut().find(|w| &w.id == id) {
+                        *w = original.clone();
+                    }
+                }
+                None => {
+                    config.worksets.pop();
+                }
+            };
             if !errors.is_empty() {
-                config.worksets.pop();
+                restore(&mut config);
                 Err(errors.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" / "))
             } else {
                 match config_store::save(&dir, &config) {
                     Ok(()) => Ok(()),
                     Err(err) => {
-                        config.worksets.pop();
+                        restore(&mut config);
                         Err(err.to_string())
                     }
                 }
@@ -2051,10 +2185,21 @@ fn wire_workset_manager(
                 let _ = runtime_store::save(&dir, &runtime);
 
                 state.registering = false;
+                let was_editing = state.editing_workset_id.is_some();
+                state.editing_workset_id = None;
                 manager.set_registering(false);
-                manager.set_status_text("ワークセットを登録しました。".into());
+                manager.set_registration_editing(false);
+                manager.set_status_text(
+                    if was_editing {
+                        "セットを更新しました。"
+                    } else {
+                        "ワークセットを登録しました。"
+                    }
+                    .into(),
+                );
                 manager.set_status_is_warning(false);
                 refresh_workset_summaries(&manager, &c.borrow(), &mut state);
+                refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
             }
             Err(message) => {
                 manager.set_status_text(format!("登録できません: {message}").into());
@@ -2063,94 +2208,73 @@ fn wire_workset_manager(
         }
     });
 
-    // "配置を再登録": re-capture the current on-screen positions of this
-    // workset's open windows as their new main placement, so "restore to main"
-    // reflects the arrangement the user just made.
+    // "配置を再登録": re-enter the same registration flow as a first
+    // registration, but scoped to the selected set — detect the windows now on
+    // the main screen, let the user re-pick and adjust, then update the set.
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
-    let dir = data_dir;
     manager.on_recapture_placement_requested(move || {
         let Some(manager) = m.upgrade() else { return };
-
-        // Gather the selected workset index under a scoped borrow (never held
-        // across the mutable borrow below).
-        let Some(ws_index) = s.borrow().selected_workset_index else {
+        let mut state = s.borrow_mut();
+        let config = c.borrow();
+        let Some(workset) = state
+            .selected_workset_index
+            .and_then(|i| config.worksets.get(i))
+        else {
             return;
         };
 
-        let live_windows =
-            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-        let (decisions, monitors, main_ids) = {
-            let config = c.borrow();
-            let runtime = runtime_store::load(&dir);
-            let decisions = workset_service::resolve_all_matches_with_bindings(
-                &config.worksets,
-                &live_windows,
-                &runtime.window_bindings,
-            );
-            (
-                decisions,
-                monitor::enumerate_monitors().unwrap_or_default(),
-                config.main_monitor_ids.clone(),
-            )
+        // Pre-fill the registration view from the existing set.
+        state.editing_workset_id = Some(workset.id);
+        let repo = workset.repository_path.clone();
+        state.picked_repository = if repo.as_os_str().is_empty() {
+            None
+        } else {
+            Some((repo, workset.repository_kind))
         };
+        state.selected_color = hex_to_color(&workset.color);
+        state.fullscreen_when_parked = workset.fullscreen_when_parked;
+        state.parking_selected_sub = match &workset.parking_policy {
+            crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } => config
+                .sub_screens
+                .iter()
+                .position(|sub| sub.id == *sub_screen_id)
+                .and_then(|i| i32::try_from(i).ok())
+                .unwrap_or(-1),
+            _ => -1,
+        };
+        manager.set_registration_name(workset.name.clone().into());
+        manager.set_registration_editing(true);
+        manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
 
-        let mut updated = 0usize;
-        {
-            let mut config = c.borrow_mut();
-            let Some(workset) = config.worksets.get_mut(ws_index) else {
-                return;
-            };
-            for w in &mut workset.windows {
-                let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id) else {
-                    continue;
-                };
-                let Some(live) = live_windows.iter().find(|lw| lw.hwnd == *hwnd) else {
-                    continue;
-                };
-                let raw = HWND(*hwnd as *mut _);
-                let (Ok(show_state), Ok(rect)) = (
-                    win_placement::get_show_state(raw),
-                    win_placement::get_normal_rect(raw),
-                ) else {
-                    continue;
-                };
-                // Only windows currently on a main monitor can have their main
-                // placement re-captured; others (parked on a sub) are skipped.
-                if let Ok(rebuilt) = workset_service::build_managed_window(
-                    live, rect, show_state, w.z_order, &monitors, &main_ids,
-                ) {
-                    w.main_placement = rebuilt.main_placement;
-                    updated += 1;
-                }
-            }
-            if updated > 0 {
-                workset.updated_at = clock::now_rfc3339();
-            }
-        }
+        let found = refresh_registration_candidates(&manager, &config, &mut state);
+        refresh_parking_subs(&manager, &config, &mut state);
+        // Show the full palette (including this set's current color) when editing.
+        manager.set_color_choices(
+            std::rc::Rc::new(slint::VecModel::from(
+                WORKSET_PALETTE.iter().map(|c| hex_to_color(c)).collect::<Vec<_>>(),
+            ))
+            .into(),
+        );
+        manager.set_selected_color(state.selected_color);
 
-        if updated == 0 {
-            manager.set_status_text(
-                "メイン画面上に、再登録できる開いているウィンドウがありませんでした。".into(),
-            );
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        match config_store::save(&dir, &c.borrow()) {
-            Ok(()) => {
-                manager.set_status_text(
-                    format!("{updated}個のウィンドウ配置を再登録しました。").into(),
-                );
-                manager.set_status_is_warning(false);
+        let repo_label = state
+            .picked_repository
+            .as_ref()
+            .map_or_else(|| "（リポジトリなし）".to_string(), |(p, _)| p.display().to_string());
+        manager.set_picked_folder_label(repo_label.into());
+        manager.set_resolved_repo_label("".into());
+        manager.set_registering(true);
+        manager.set_status_text(
+            if found {
+                "登録し直すウィンドウを選び直してください。"
+            } else {
+                "メイン画面に候補ウィンドウがありません。配置してから「候補を更新」を押してください。"
             }
-            Err(err) => {
-                manager.set_status_text(format!("保存に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-            }
-        }
-        refresh_selected_workset_detail(&manager, &c.borrow(), &s.borrow());
+            .into(),
+        );
+        manager.set_status_is_warning(false);
     });
 }
 
@@ -3969,6 +4093,7 @@ pub fn run() -> Result<()> {
     tray.on_layout_studio_requested(move || {
         if let Some(layout_studio) = layout_studio_for_open.upgrade() {
             let _ = layout_studio.show();
+            popup_window::restore_and_foreground(layout_studio.window());
         }
     });
 
@@ -3976,7 +4101,7 @@ pub fn run() -> Result<()> {
     tray.on_register_workset_requested(move || {
         if let Some(workset_manager) = workset_manager_for_register.upgrade() {
             let _ = workset_manager.show();
-            workset_manager.invoke_start_registration();
+            popup_window::restore_and_foreground(workset_manager.window());
         }
     });
 
@@ -3986,6 +4111,7 @@ pub fn run() -> Result<()> {
     tray.on_empty_main_screen_requested(move || {
         if let Some(workset_manager) = workset_manager_for_empty.upgrade() {
             let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
             workset_manager.invoke_start_registration();
             workset_manager.invoke_empty_main_screen_requested();
         }
@@ -4035,6 +4161,7 @@ pub fn run() -> Result<()> {
         if let Some(window) = window_for_settings.upgrade() {
             refresh_codex_settings_state(&window, &config_for_settings.borrow());
             let _ = window.show();
+            popup_window::restore_and_foreground(window.window());
             if sysmenu_suppression.borrow().is_none() {
                 *sysmenu_suppression.borrow_mut() =
                     popup_window::suppress_system_menu_key(window.window());
@@ -4059,12 +4186,14 @@ pub fn run() -> Result<()> {
     window.on_open_layout_studio_requested(move || {
         if let Some(layout_studio) = layout_studio_for_main_window.upgrade() {
             let _ = layout_studio.show();
+            popup_window::restore_and_foreground(layout_studio.window());
         }
     });
     let workset_manager_for_main_window = workset_manager.as_weak();
     window.on_open_workset_manager_requested(move || {
         if let Some(workset_manager) = workset_manager_for_main_window.upgrade() {
             let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
         }
     });
 

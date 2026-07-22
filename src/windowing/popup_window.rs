@@ -24,6 +24,25 @@ pub fn force_foreground(window: &slint::Window) {
     }
 }
 
+/// Brings an on-demand window (Workset Manager, Settings, …) to the front:
+/// un-minimizes it if iconic, then forces it foreground. Slint's `.show()`
+/// alone doesn't raise an already-shown window that's minimized or behind
+/// others, so opening it from the tray could silently do nothing.
+pub fn restore_and_foreground(window: &slint::Window) {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, ShowWindow};
+
+    if let Some(hwnd) = hwnd_of(window) {
+        // SAFETY: `hwnd` is a live handle from the Slint window; `IsIconic`/
+        // `ShowWindow` only read/adjust its window state.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+        crate::windowing::placement::set_foreground_best_effort(hwnd);
+    }
+}
+
 fn hwnd_of(window: &slint::Window) -> Option<HWND> {
     let window_handle = window.window_handle();
     let handle = HasWindowHandle::window_handle(&window_handle).ok()?;
