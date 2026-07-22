@@ -48,6 +48,7 @@ export component QuickSwitcher inherits Window {
     callback switch-requested(workset-id: string);
     callback recover-requested();
     callback settings-requested();
+    callback manager-requested();
     callback empty-main-requested();
     callback close-requested();
 
@@ -130,8 +131,33 @@ export component QuickSwitcher inherits Window {
                                 root.settings-requested();
                                 return accept;
                             }
+                            if (event.modifiers.control && event.text == "m") {
+                                root.manager-requested();
+                                return accept;
+                            }
                             return reject;
                         }
+                    }
+                }
+
+                manage-button := Rectangle {
+                    width: 92px;
+                    border-radius: Theme.radius-md;
+                    background: manage-touch.pressed || manage-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                    Text {
+                        text: "セット管理";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    manage-touch := TouchArea {
+                        clicked => { root.manager-requested(); }
                     }
                 }
 

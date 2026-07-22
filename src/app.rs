@@ -1464,9 +1464,15 @@ fn launch_missing_for_switch(
         let alive = matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }));
         if !alive && let Some(spec) = &w.launch_spec {
             match crate::windowing::app_launch::launch(spec) {
-                Ok(()) => dead.push((w.id, spec.program.clone(), w.matcher.window_class.clone())),
+                Ok(()) => {
+                    tracing::info!(
+                        target: "launch", managed = %w.id, program = %spec.program.display(),
+                        class = %w.matcher.window_class, "switch: relaunching closed app via set"
+                    );
+                    dead.push((w.id, spec.program.clone(), w.matcher.window_class.clone()));
+                }
                 Err(err) => {
-                    tracing::warn!(error = %err, program = %spec.program.display(), "switch: relaunch failed");
+                    tracing::warn!(target: "launch", error = %err, program = %spec.program.display(), "switch: relaunch failed");
                 }
             }
         }
@@ -1475,6 +1481,7 @@ fn launch_missing_for_switch(
     if dead.is_empty() {
         return None;
     }
+    tracing::info!(target: "launch", workset = %workset.name, relaunched = dead.len(), "switch: awaiting relaunched windows to bind");
     Some(PendingAcquire {
         workset_id: target_id,
         before: live_windows.iter().map(|w| w.hwnd).collect(),
@@ -1501,8 +1508,11 @@ fn acquire_launched_and_place(
                 && w.window_class == *class
                 && w.executable_path.as_ref() == Some(exe)
         }) {
+            tracing::info!(target: "launch", managed = %id, hwnd = w.hwnd, class = %class, "switch: bound relaunched window to its set");
             runtime.window_bindings.insert(*id, w.hwnd);
             claimed.insert(w.hwnd);
+        } else {
+            tracing::warn!(target: "launch", managed = %id, program = %exe.display(), class = %class, "switch: relaunched app did not appear in time to bind");
         }
     }
     let _ = runtime_store::save(data_dir, &runtime);
@@ -4341,8 +4351,24 @@ pub fn run() -> Result<()> {
 
         let mut runtime = runtime_store::load(&data_dir_for_display);
         if runtime.last_seen_monitor_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            tracing::debug!(target: "monitors", "WM_DISPLAYCHANGE with unchanged topology (e.g. DPI-only); ignoring");
             return; // e.g. a DPI-only change also fires WM_DISPLAYCHANGE
         }
+
+        // A real topology change — including a Remote Desktop connect/disconnect,
+        // which swaps the physical monitors for the RDP virtual display and back.
+        // Log the before/after so a "windows went weird over RDP" report can be
+        // traced to exactly which monitors appeared/disappeared and which windows
+        // it stranded.
+        tracing::info!(
+            target: "monitors",
+            previous = runtime.last_seen_monitor_fingerprint.as_deref().unwrap_or("(none)"),
+            live = ?live_monitors
+                .iter()
+                .map(|m| (m.device_name.clone(), m.bounds_px.x, m.bounds_px.y, m.bounds_px.width, m.bounds_px.height))
+                .collect::<Vec<_>>(),
+            "monitor topology changed (WM_DISPLAYCHANGE)"
+        );
 
         let live_windows =
             enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
@@ -4356,12 +4382,23 @@ pub fn run() -> Result<()> {
         };
         if !offscreen.is_empty() {
             tracing::info!(
+                target: "monitors",
                 count = offscreen.len(),
                 "minimizing windows left offscreen by a monitor configuration change"
             );
         }
-        for hwnd in offscreen {
-            Win32WindowOps.minimize(hwnd);
+        for hwnd in &offscreen {
+            let rect = live_windows
+                .iter()
+                .find(|w| w.hwnd == *hwnd)
+                .map(|w| (w.rect_px.x, w.rect_px.y, w.rect_px.width, w.rect_px.height));
+            let title = live_windows
+                .iter()
+                .find(|w| w.hwnd == *hwnd)
+                .map(|w| w.title.clone())
+                .unwrap_or_default();
+            tracing::info!(target: "monitors", hwnd, ?rect, %title, "minimizing offscreen window");
+            Win32WindowOps.minimize(*hwnd);
         }
 
         runtime.last_seen_monitor_fingerprint = Some(fingerprint);
@@ -4430,6 +4467,20 @@ pub fn run() -> Result<()> {
         }
         if let Some(workset_manager) = workset_manager_for_qs_empty.upgrade() {
             open_empty_main_screen(&workset_manager);
+        }
+    });
+
+    // "セット管理" from the Quick Switcher: hide it and bring the Workset Manager
+    // to the front (the standard place to register a set and launch its apps).
+    let workset_manager_for_qs_manage = workset_manager.as_weak();
+    let switcher_for_qs_manage = quick_switcher.as_weak();
+    quick_switcher.on_manager_requested(move || {
+        if let Some(switcher) = switcher_for_qs_manage.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(workset_manager) = workset_manager_for_qs_manage.upgrade() {
+            let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
         }
     });
 

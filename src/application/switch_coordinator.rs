@@ -153,6 +153,13 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         if runtime.current_workset_id == Some(target.id) {
             let resolved = resolved_windows(target, &decisions, request.live_windows);
             let focused_hwnd = frontmost(&resolved).map(|w| w.hwnd);
+            tracing::info!(
+                target: "switch",
+                to = %target.name,
+                windows = resolved.len(),
+                focus = ?focused_hwnd,
+                "switch: already current, focus-only no-op"
+            );
             if let Some(hwnd) = focused_hwnd {
                 self.window_ops.set_foreground(hwnd);
             }
@@ -170,6 +177,29 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .map(|w| resolved_windows(w, &decisions, request.live_windows))
             .unwrap_or_default();
         let target_resolved = resolved_windows(target, &decisions, request.live_windows);
+
+        tracing::info!(
+            target: "switch",
+            from = current.map(|w| w.name.as_str()).unwrap_or("(none)"),
+            to = %target.name,
+            current_windows = current_resolved.len(),
+            target_windows = target_resolved.len(),
+            live_windows = request.live_windows.len(),
+            live_monitors = request.live_monitors.len(),
+            "switch: begin"
+        );
+        for w in &current_resolved {
+            tracing::info!(
+                target: "switch", role = "current(park)", hwnd = w.hwnd,
+                managed = %w.managed.id, z = w.managed.z_order, "switch: resolved window"
+            );
+        }
+        for w in &target_resolved {
+            tracing::info!(
+                target: "switch", role = "target(main)", hwnd = w.hwnd,
+                managed = %w.managed.id, z = w.managed.z_order, "switch: resolved window"
+            );
+        }
 
         // If the outgoing workset parks into a sub-screen cell that a stale
         // window from another set still occupies, that window is evacuated to
@@ -209,6 +239,11 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // video and the foreground still ends up on the new workset.
         let mut fullscreen_hwnds: Vec<isize> = Vec::new();
         if let Some(current) = current {
+            tracing::info!(
+                target: "switch", workset = %current.name,
+                windows = current_resolved.len(), evictees = sub_evictees.len(),
+                policy = ?current.parking_policy, "switch: parking outgoing workset"
+            );
             // Clear any stale occupant out of the sub-screen cell first, so the
             // outgoing window is not stacked on top of it.
             self.park_evictees(&sub_evictees, &request);
@@ -258,6 +293,11 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // ignores the rectangle for maximized windows (問題2, 2026-07-23).
         for (resolved, outcome) in target_resolved.iter().zip(&outcomes) {
             let maximized = outcome.show_state == SavedShowState::Maximized;
+            tracing::info!(
+                target: "switch", hwnd = resolved.hwnd, to_rect = ?outcome.rect,
+                maximized, exit_fullscreen = target_was_fullscreen,
+                "switch: restore target window to main"
+            );
             if target_was_fullscreen {
                 self.window_ops
                     .exit_fullscreen(resolved.hwnd, outcome.rect, maximized);
@@ -301,6 +341,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // Step 10 (ready-confirmed) is a no-op placeholder until Phase 8 hooks
         // agent-status confirmation here.
 
+        tracing::info!(
+            target: "switch", to = %target.name, transaction = %transaction_id,
+            focused = ?focused_hwnd, "switch: completed"
+        );
         Ok(SwitchOutcome {
             transaction_id,
             new_current_workset_id: target.id,
@@ -453,6 +497,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // sizes each window to its cell — a plain `SetWindowPos` won't resize a
         // still-maximized window (問題2, 2026-07-23).
         for (hwnd, rect) in &moves {
+            tracing::info!(
+                target: "switch", hwnd = *hwnd, cell = ?rect, of = moves.len(),
+                "switch: park window into cell"
+            );
             // `fill`: `rect` is the desired visible cell, expanded by the
             // window's invisible DWM border so it fills flush (no gutter).
             self.window_ops.set_placement(*hwnd, *rect, false, true);
@@ -587,6 +635,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
     /// PLAN.md §3.8 failure path: restores every journaled window to its
     /// pre-switch placement. `current_workset_id` is never touched here.
     fn rollback(&self, mut journal: SwitchJournal, reason: String) -> SwitchError {
+        tracing::warn!(
+            target: "switch", %reason, windows = journal.windows.len(),
+            "switch: FAILED, rolling back to pre-switch layout"
+        );
         let mut unrecoverable = Vec::new();
 
         for entry in &journal.windows {
