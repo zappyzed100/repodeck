@@ -1931,6 +1931,17 @@ fn wire_workset_manager(
                 .iter()
                 .flat_map(|s| s.monitor_ids.iter().cloned())
                 .collect();
+            // Only sets with live windows reserve a cell (see allocate_parking).
+            let worksets_with_windows: std::collections::HashSet<uuid::Uuid> = config
+                .worksets
+                .iter()
+                .filter(|w| {
+                    w.windows.iter().any(|mw| {
+                        matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                    })
+                })
+                .map(|w| w.id)
+                .collect();
             let allocation = allocate_parking(&AllocationInput {
                 worksets: &config.worksets,
                 current_workset_id: None,
@@ -1940,6 +1951,7 @@ fn wire_workset_manager(
                 saved_monitors: &config.monitors,
                 sub_screen_monitor_ids: &sub_screen_monitor_ids,
                 previous_assignments: &previous,
+                worksets_with_windows: &worksets_with_windows,
             });
 
             let mut rects = std::collections::HashMap::new();

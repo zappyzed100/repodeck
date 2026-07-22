@@ -188,16 +188,26 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             live_monitors = request.live_monitors.len(),
             "switch: begin"
         );
+        let title_of = |hwnd: isize| -> String {
+            request
+                .live_windows
+                .iter()
+                .find(|lw| lw.hwnd == hwnd)
+                .map(|lw| lw.title.clone())
+                .unwrap_or_default()
+        };
         for w in &current_resolved {
             tracing::info!(
                 target: "switch", role = "current(park)", hwnd = w.hwnd,
-                managed = %w.managed.id, z = w.managed.z_order, "switch: resolved window"
+                managed = %w.managed.id, z = w.managed.z_order, title = %title_of(w.hwnd),
+                "switch: resolved window"
             );
         }
         for w in &target_resolved {
             tracing::info!(
                 target: "switch", role = "target(main)", hwnd = w.hwnd,
-                managed = %w.managed.id, z = w.managed.z_order, "switch: resolved window"
+                managed = %w.managed.id, z = w.managed.z_order, title = %title_of(w.hwnd),
+                "switch: resolved window"
             );
         }
 
@@ -244,6 +254,20 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 windows = current_resolved.len(), evictees = sub_evictees.len(),
                 policy = ?current.parking_policy, "switch: parking outgoing workset"
             );
+            // Only sets that actually have live windows on screen should reserve
+            // a parking cell — otherwise a set whose apps are closed still eats
+            // space and crams the live windows into needlessly small cells
+            // (2026-07-23 bug: 「空きがあるのに1/4で退避」).
+            let worksets_with_windows: std::collections::HashSet<Uuid> = request
+                .worksets
+                .iter()
+                .filter(|w| {
+                    w.windows.iter().any(|mw| {
+                        matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                    })
+                })
+                .map(|w| w.id)
+                .collect();
             // Clear any stale occupant out of the sub-screen cell first, so the
             // outgoing window is not stacked on top of it.
             self.park_evictees(&sub_evictees, &request);
@@ -252,6 +276,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 &current_resolved,
                 &request,
                 &mut runtime.auto_slot_assignments,
+                &worksets_with_windows,
             ) {
                 Ok(hwnds) => fullscreen_hwnds = hwnds,
                 Err(reason) => return Err(self.rollback(journal, reason)),
@@ -383,6 +408,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         resolved: &[ResolvedWindow],
         request: &SwitchRequest,
         auto_slot_assignments: &mut HashMap<String, String>,
+        worksets_with_windows: &std::collections::HashSet<Uuid>,
     ) -> Result<Vec<isize>, String> {
         // Sub-screen policy bypasses the auto-cell allocator: the workset parks
         // into its own non-overlapping cell of the named area. Worksets sharing
@@ -424,6 +450,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             saved_monitors: request.saved_monitors,
             sub_screen_monitor_ids: &sub_screen_monitor_ids,
             previous_assignments: &previous,
+            worksets_with_windows,
         });
         *auto_slot_assignments = encode_assignments(&allocation.new_auto_slot_assignments);
 

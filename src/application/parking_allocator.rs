@@ -70,6 +70,10 @@ pub struct AllocationInput<'a> {
     pub sub_screen_monitor_ids: &'a [String],
     /// Decoded from `RuntimeState.auto_slot_assignments`.
     pub previous_assignments: &'a HashMap<Uuid, ParkingSlotId>,
+    /// Ids of worksets that currently have at least one live window on screen.
+    /// Only these reserve an auto parking cell — a set whose apps are all closed
+    /// must not consume space and shrink the live windows' cells (2026-07-23).
+    pub worksets_with_windows: &'a HashSet<Uuid>,
 }
 
 pub struct AllocationResult {
@@ -138,12 +142,16 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         assignments.insert(workset.id, assignment);
     }
 
-    // Auto-pool worksets (§4.4 step 4), deterministic order.
+    // Auto-pool worksets (§4.4 step 4), deterministic order. A set with no live
+    // window is skipped entirely: it has nothing to park, so reserving a cell
+    // for it would only shrink the sets that do have windows.
     let mut auto_pool: Vec<&Workset> = input
         .worksets
         .iter()
         .filter(|w| {
-            Some(w.id) != input.current_workset_id && w.parking_policy == ParkingPolicy::Auto
+            Some(w.id) != input.current_workset_id
+                && w.parking_policy == ParkingPolicy::Auto
+                && input.worksets_with_windows.contains(&w.id)
         })
         .collect();
     auto_pool.sort_by_key(|w| (w.sort_order, w.id));
@@ -356,6 +364,12 @@ mod tests {
         w
     }
 
+    /// Test default: treat every workset as having live windows (the filter is
+    /// exercised on its own where it matters).
+    fn all_ids(worksets: &[Workset]) -> HashSet<Uuid> {
+        worksets.iter().map(|w| w.id).collect()
+    }
+
     #[test]
     fn two_monitors_no_parking_room_minimizes_overflow() {
         let live = vec![monitor("MAIN", 0, 1920), monitor("SIDE", 1920, 1920)];
@@ -373,6 +387,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         assert!(matches!(
@@ -401,6 +416,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &["SUB".to_string()],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         assert_eq!(result.assignments[&a.id], ParkAssignment::Minimized);
@@ -434,6 +450,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         let placed = |w: &Workset| match &result.assignments[&w.id] {
@@ -446,6 +463,45 @@ mod tests {
         // Full monitor size (1920×1080), not a 960×540 quarter.
         assert_eq!((rect_a.width, rect_a.height), (1920, 1080));
         assert_eq!((rect_b.width, rect_b.height), (1920, 1080));
+    }
+
+    #[test]
+    fn a_set_with_no_live_windows_does_not_reserve_a_cell() {
+        // Regression (2026-07-23): a set whose apps are all closed must not
+        // reserve a parking cell — otherwise it shrinks the live sets. Here only
+        // `a` has live windows, so it gets a whole monitor and `b` gets nothing.
+        let live = vec![
+            monitor("MAIN", 0, 1920),
+            monitor("SIDE1", 1920, 1920),
+            monitor("SIDE2", 3840, 1920),
+        ];
+        let a = auto_workset(0);
+        let b = auto_workset(1);
+        let worksets = vec![a.clone(), b.clone()];
+        let only_a: HashSet<Uuid> = [a.id].into_iter().collect();
+
+        let result = allocate_parking(&AllocationInput {
+            worksets: &worksets,
+            current_workset_id: None,
+            fixed_slots: &[],
+            main_monitor_ids: &["MAIN".to_string()],
+            live_monitors: &live,
+            saved_monitors: &[],
+            sub_screen_monitor_ids: &[],
+            previous_assignments: &HashMap::new(),
+            worksets_with_windows: &only_a,
+        });
+
+        match &result.assignments[&a.id] {
+            ParkAssignment::AutoSlot { rect, .. } => {
+                assert_eq!((rect.width, rect.height), (1920, 1080), "live set fills a whole monitor");
+            }
+            other => panic!("expected AutoSlot whole monitor, got {other:?}"),
+        }
+        assert!(
+            !result.assignments.contains_key(&b.id),
+            "a set with no live windows must not be assigned a cell"
+        );
     }
 
     #[test]
@@ -473,6 +529,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         let mut assigned_slots: Vec<&ParkingSlotId> = Vec::new();
@@ -503,6 +560,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &first.new_auto_slot_assignments,
+            worksets_with_windows: &all_ids(&worksets),
         });
         assert_eq!(second.assignments, first.assignments);
     }
@@ -541,6 +599,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         let fixed_target = ParkingSlotId {
@@ -593,6 +652,7 @@ mod tests {
             saved_monitors: &[],
             sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         assert_eq!(result.assignments[&workset.id], ParkAssignment::Minimized);
@@ -629,6 +689,7 @@ mod tests {
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
             previous_assignments: &previous,
+            worksets_with_windows: &all_ids(&worksets),
         });
 
         let side_cells = auto_split_cells(
