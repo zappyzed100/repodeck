@@ -362,7 +362,7 @@ fn hotkey_thread_reports_already_registered_when_the_combo_is_taken() {
 
     let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
     let events_for_thread = events.clone();
-    let _hotkey_thread = HotkeyThread::spawn(config, move |event| {
+    let _hotkey_thread = HotkeyThread::spawn(config, 0x28, 0x26, move |event| {
         let label = match event {
             HotkeyEvent::Pressed => "pressed",
             HotkeyEvent::CyclePressed { .. } => "cycle",

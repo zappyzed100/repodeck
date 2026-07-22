@@ -1,4 +1,6 @@
+pub mod app_launch;
 pub mod autostart;
+pub mod browser_url;
 pub mod display_reset;
 pub mod dpi;
 pub mod enumerate;
@@ -7,5 +9,6 @@ pub mod monitor;
 pub mod placement;
 pub mod popup_window;
 pub mod power_watch;
+pub mod session;
 pub mod win32_error;
 pub mod window_ops_impl;

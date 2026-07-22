@@ -135,8 +135,16 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         };
 
         let mut runtime = runtime_store::load(&self.data_dir);
-        let decisions =
-            workset_service::resolve_all_matches(request.worksets, request.live_windows); // step 3
+        // Step 3: resolve, preferring each window's tracked session HWND binding
+        // over volatile title/URL matching, then learn/refresh those bindings.
+        let decisions = workset_service::resolve_all_matches_with_bindings(
+            request.worksets,
+            request.live_windows,
+            &runtime.window_bindings,
+        );
+        for (id, hwnd) in workset_service::bindings_from_decisions(&decisions) {
+            runtime.window_bindings.insert(id, hwnd);
+        }
 
         // Step 2: switching to the already-current workset is a no-op focus.
         if runtime.current_workset_id == Some(target.id) {
@@ -557,6 +565,7 @@ mod tests {
                 show_state,
             },
             z_order,
+            launch_spec: None,
         }
     }
 

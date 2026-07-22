@@ -1,6 +1,7 @@
 pub mod agent_status_service;
 pub mod crash_recovery;
 pub mod display_recovery_service;
+pub mod launch_service;
 pub mod layout_service;
 pub mod main_placement;
 pub mod monitor_resolution;

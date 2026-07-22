@@ -142,6 +142,7 @@ mod tests {
                 show_state: SavedShowState::Normal,
             },
             z_order: 0,
+            launch_spec: None,
         };
         Workset {
             id: Uuid::new_v4(),

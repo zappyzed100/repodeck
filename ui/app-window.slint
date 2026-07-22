@@ -38,6 +38,15 @@ export component AppWindow inherits Window {
     in property <string> hotkey-status-text: "";
     in property <bool> hotkey-status-is-warning: false;
 
+    // 押しっぱなし切替（Alt+Tab方式）のサイクルキー。メインホットキーの
+    // 修飾キーと組み合わせて使う。表示ラベルと、キャプチャ対象
+    // (0=なし / 1=次 / 2=前) をRust側が管理する。
+    in property <string> cycle-next-display: "";
+    in property <string> cycle-prev-display: "";
+    in-out property <int> cycle-capturing: 0;
+    callback cycle-capture-started(which: int);
+    callback cycle-captured(which: int, key-text: string);
+
     // Codex連携 (PLAN.md §6.5, Phase 8).
     in property <bool> codex-hook-exe-found: false;
     in property <string> codex-hook-snippet: "";
@@ -126,6 +135,37 @@ export component AppWindow inherits Window {
             }
         }
 
+        // サイクルキーのキャプチャ。修飾キーは不要（メインホットキーの
+        // 修飾キーを継承する）ので、次に押された非修飾キーだけを記録する。
+        cycle-capture-scope := FocusScope {
+            x: 0;
+            y: 0;
+            width: 0;
+            height: 0;
+            enabled: root.cycle-capturing != 0;
+
+            focus-changed-event => {
+                if (!self.has-focus && root.cycle-capturing != 0) {
+                    root.cycle-capturing = 0;
+                }
+            }
+
+            key-pressed(event) => {
+                if (root.cycle-capturing == 0) {
+                    return reject;
+                }
+                if (event.text == Key.Escape) {
+                    root.cycle-capturing = 0;
+                    return accept;
+                }
+                if (root.is-modifier-key(event.text)) {
+                    return accept;
+                }
+                root.cycle-captured(root.cycle-capturing, event.text);
+                return accept;
+            }
+        }
+
         VerticalLayout {
             padding: Theme.space-lg;
             spacing: Theme.space-md;
@@ -175,6 +215,55 @@ export component AppWindow inherits Window {
                 font-size: 12px;
                 color: root.hotkey-status-is-warning ? Theme.danger : Theme.success;
                 wrap: word-wrap;
+            }
+
+            Text {
+                text: "押しっぱなし切替（Alt+Tab方式）: 上記の修飾キーを押したまま下のキーを叩くとセットを送り、修飾キーを離すと確定します。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                Text {
+                    text: "次のセット: " + root.cycle-next-display;
+                    font-size: 12px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                GlassButton {
+                    text: root.cycle-capturing == 1 ? "入力待ち…" : "キーを変更";
+                    clicked => {
+                        if (root.cycle-capturing == 0) {
+                            root.cycle-capturing = 1;
+                            cycle-capture-scope.focus();
+                            root.cycle-capture-started(1);
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                Text {
+                    text: "前のセット: " + root.cycle-prev-display;
+                    font-size: 12px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                GlassButton {
+                    text: root.cycle-capturing == 2 ? "入力待ち…" : "キーを変更";
+                    clicked => {
+                        if (root.cycle-capturing == 0) {
+                            root.cycle-capturing = 2;
+                            cycle-capture-scope.focus();
+                            root.cycle-capture-started(2);
+                        }
+                    }
+                }
             }
 
             Rectangle { height: Theme.space-sm; }

@@ -50,6 +50,35 @@ pub struct ManagedWindow {
     pub matcher: WindowMatcher,
     pub main_placement: SavedPlacement,
     pub z_order: i32,
+    /// How to re-launch this window's app if it has been closed (the
+    /// "閉じたアプリを開き直す" feature). `None` for windows registered before
+    /// this field existed, or apps whose launch couldn't be determined.
+    #[serde(default)]
+    pub launch_spec: Option<LaunchSpec>,
+}
+
+/// How to relaunch a managed window's application after it was closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchSpec {
+    /// The executable to run (the window's recorded `executable_path`).
+    pub program: PathBuf,
+    /// Arguments: the repository folder/`.code-workspace` for VS Code, the URL
+    /// for a browser, empty otherwise.
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub kind: LaunchKind,
+}
+
+/// The app family a [`LaunchSpec`] targets, deciding how its args are built at
+/// registration and how it's relaunched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchKind {
+    #[default]
+    Generic,
+    VsCode,
+    Browser,
 }
 
 /// Where a [`Workset`] goes when it is not the current (main-screen) set (PLAN.md §2.4).

@@ -25,19 +25,58 @@ use crate::domain::config::{HotkeyConfig, HotkeyModifier};
 
 /// The primary Quick Switcher toggle hotkey.
 const HOTKEY_ID: i32 = 1;
-/// Alt+Tab-style "hold the modifiers, tap an arrow to cycle" hotkeys: the
-/// same modifiers as [`HOTKEY_ID`] combined with Down/Up. Registered
-/// best-effort (only when the main hotkey has a modifier), so a conflict with
-/// another app's Ctrl+Alt+Arrow just disables cycling rather than failing.
+/// Alt+Tab-style "hold the modifiers, tap a key to cycle" hotkeys: the same
+/// modifiers as [`HOTKEY_ID`] combined with the user's configured next/prev
+/// keys (default Down/Up). Registered best-effort (only when the main hotkey
+/// has a modifier), so a conflict with another app's combo just disables
+/// cycling rather than failing.
 const CYCLE_NEXT_HOTKEY_ID: i32 = 2;
 const CYCLE_PREV_HOTKEY_ID: i32 = 3;
 
-/// `VK_UP` / `VK_DOWN` — the arrow keys the cycle hotkeys bind to.
-const VK_UP: u32 = 0x26;
-const VK_DOWN: u32 = 0x28;
-
 const WM_APP_REBIND: u32 = WM_APP + 1;
 const WM_APP_SHUTDOWN: u32 = WM_APP + 2;
+
+/// The full key set the hotkey thread registers: the main toggle hotkey plus
+/// the two hold-to-cycle keys, all sharing the main modifiers.
+#[derive(Clone, Copy)]
+struct RegisteredHotkeys {
+    mods: HOT_KEY_MODIFIERS,
+    vk: u32,
+    cycle_next_vk: u32,
+    cycle_prev_vk: u32,
+}
+
+impl RegisteredHotkeys {
+    fn from_config(config: &HotkeyConfig, cycle_next_vk: u32, cycle_prev_vk: u32) -> Self {
+        let (mods, vk) = to_win32(config);
+        Self {
+            mods,
+            vk,
+            cycle_next_vk,
+            cycle_prev_vk,
+        }
+    }
+
+    /// Packs all four values into a `(WPARAM, LPARAM)` pair for the rebind
+    /// thread-message (x64: `usize`/`isize` are 64-bit, two `u32`s each).
+    fn pack(self) -> (WPARAM, LPARAM) {
+        let w = (self.mods.0 as usize) | ((self.cycle_next_vk as usize) << 32);
+        let l = ((u64::from(self.vk)) | (u64::from(self.cycle_prev_vk) << 32)) as isize;
+        (WPARAM(w), LPARAM(l))
+    }
+
+    fn unpack(w: WPARAM, l: LPARAM) -> Self {
+        let lo_hi = |v: u64| ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32);
+        let (mods, cycle_next_vk) = lo_hi(w.0 as u64);
+        let (vk, cycle_prev_vk) = lo_hi(l.0 as u64);
+        Self {
+            mods: HOT_KEY_MODIFIERS(mods),
+            vk,
+            cycle_next_vk,
+            cycle_prev_vk,
+        }
+    }
+}
 
 /// Maps the app's own hotkey config to Win32's modifier flags + virtual-key
 /// code. Always includes `MOD_NOREPEAT`: without it, holding the combo down
@@ -189,8 +228,14 @@ pub struct HotkeyThread {
 
 impl HotkeyThread {
     /// Spawns the dedicated Win32 message-loop thread and attempts the
-    /// initial registration.
-    pub fn spawn(initial: HotkeyConfig, on_event: impl Fn(HotkeyEvent) + Send + 'static) -> Self {
+    /// initial registration. `cycle_next_vk`/`cycle_prev_vk` are the hold-to-
+    /// cycle keys, combined with `initial`'s modifiers.
+    pub fn spawn(
+        initial: HotkeyConfig,
+        cycle_next_vk: u32,
+        cycle_prev_vk: u32,
+        on_event: impl Fn(HotkeyEvent) + Send + 'static,
+    ) -> Self {
         let (thread_id_tx, thread_id_rx) = mpsc::sync_channel(1);
 
         let join_handle = std::thread::spawn(move || {
@@ -198,8 +243,9 @@ impl HotkeyThread {
             let thread_id = unsafe { GetCurrentThreadId() };
             let _ = thread_id_tx.send(thread_id);
 
-            let mut current = to_win32(&initial);
-            match register_all(current.0, current.1) {
+            let mut current =
+                RegisteredHotkeys::from_config(&initial, cycle_next_vk, cycle_prev_vk);
+            match register_all(current) {
                 Ok(()) => on_event(HotkeyEvent::Registered),
                 Err(err) => on_event(HotkeyEvent::RegisterFailed(err)),
             }
@@ -218,23 +264,18 @@ impl HotkeyThread {
         }
     }
 
-    /// Requests a rebind. Delivered asynchronously via the hotkey thread's
-    /// own message queue (`RegisterHotKey`/`UnregisterHotKey` must run on the
-    /// thread that owns the registering message queue); the result arrives
-    /// later as a `HotkeyEvent::Registered`/`RegisterFailed` passed to the
-    /// closure given to `spawn`.
-    pub fn rebind(&self, new_config: HotkeyConfig) {
-        let (mods, vk) = to_win32(&new_config);
+    /// Requests a rebind of the main hotkey and both cycle keys. Delivered
+    /// asynchronously via the hotkey thread's own message queue
+    /// (`RegisterHotKey`/`UnregisterHotKey` must run on the thread that owns
+    /// the registering message queue); the result arrives later as a
+    /// `HotkeyEvent::Registered`/`RegisterFailed` passed to the closure given
+    /// to `spawn`.
+    pub fn rebind(&self, new_config: HotkeyConfig, cycle_next_vk: u32, cycle_prev_vk: u32) {
+        let (wparam, lparam) =
+            RegisteredHotkeys::from_config(&new_config, cycle_next_vk, cycle_prev_vk).pack();
         // SAFETY: `self.thread_id` is this struct's own live hotkey thread;
-        // wparam/lparam just carry the two plain values `to_win32` produced.
-        let _ = unsafe {
-            PostThreadMessageW(
-                self.thread_id,
-                WM_APP_REBIND,
-                WPARAM(mods.0 as usize),
-                LPARAM(vk as isize),
-            )
-        };
+        // wparam/lparam carry the packed registration values.
+        let _ = unsafe { PostThreadMessageW(self.thread_id, WM_APP_REBIND, wparam, lparam) };
     }
 }
 
@@ -250,7 +291,7 @@ impl Drop for HotkeyThread {
 }
 
 fn run_message_loop(
-    current: &mut (HOT_KEY_MODIFIERS, u32),
+    current: &mut RegisteredHotkeys,
     on_event: &(impl Fn(HotkeyEvent) + Send + 'static),
 ) {
     let mut msg = MSG::default();
@@ -270,9 +311,9 @@ fn run_message_loop(
                 _ => {}
             },
             WM_APP_REBIND => {
-                let requested = (HOT_KEY_MODIFIERS(msg.wParam.0 as u32), msg.lParam.0 as u32);
+                let requested = RegisteredHotkeys::unpack(msg.wParam, msg.lParam);
                 unregister_all();
-                match register_all(requested.0, requested.1) {
+                match register_all(requested) {
                     Ok(()) => {
                         *current = requested;
                         on_event(HotkeyEvent::Registered);
@@ -280,7 +321,7 @@ fn run_message_loop(
                     Err(err) => {
                         // Self-heal: re-register the last-known-good combo so
                         // the app never ends up with zero hotkeys registered.
-                        let _ = register_all(current.0, current.1);
+                        let _ = register_all(*current);
                         on_event(HotkeyEvent::RegisterFailed(err));
                         on_event(HotkeyEvent::Registered);
                     }
@@ -331,17 +372,23 @@ fn has_real_modifier(mods: HOT_KEY_MODIFIERS) -> bool {
 /// the cycle hotkeys sharing the same modifiers may legitimately collide with
 /// another app (e.g. a GPU driver's Ctrl+Alt+Arrow), in which case cycling is
 /// simply unavailable this session.
-fn register_all(mods: HOT_KEY_MODIFIERS, vk: u32) -> Result<(), HotkeyRegisterError> {
+fn register_all(spec: RegisteredHotkeys) -> Result<(), HotkeyRegisterError> {
+    let RegisteredHotkeys {
+        mods,
+        vk,
+        cycle_next_vk,
+        cycle_prev_vk,
+    } = spec;
     register_or_classify(mods, vk)?;
     if has_real_modifier(mods) {
-        // Skip the arrow whose combo would duplicate the main hotkey itself.
-        if vk != VK_DOWN {
+        // Skip a cycle key whose combo would duplicate the main hotkey itself.
+        if cycle_next_vk != vk {
             // SAFETY: thread-message hotkey on this thread's own queue.
-            let _ = unsafe { RegisterHotKey(None, CYCLE_NEXT_HOTKEY_ID, mods, VK_DOWN) };
+            let _ = unsafe { RegisterHotKey(None, CYCLE_NEXT_HOTKEY_ID, mods, cycle_next_vk) };
         }
-        if vk != VK_UP {
+        if cycle_prev_vk != vk && cycle_prev_vk != cycle_next_vk {
             // SAFETY: as above.
-            let _ = unsafe { RegisterHotKey(None, CYCLE_PREV_HOTKEY_ID, mods, VK_UP) };
+            let _ = unsafe { RegisterHotKey(None, CYCLE_PREV_HOTKEY_ID, mods, cycle_prev_vk) };
         }
     }
     Ok(())

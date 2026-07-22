@@ -28,6 +28,17 @@ pub struct RuntimeState {
     pub agent_runs: Vec<AgentRun>,
     pub last_seen_monitor_fingerprint: Option<String>,
     pub last_clean_shutdown: bool,
+    /// Session token (OS-boot-derived) the `window_bindings` below were captured
+    /// under. If it no longer matches the current boot, the bindings hold stale
+    /// HWNDs (numbers reassigned/recycled after a reboot) and are discarded.
+    #[serde(default)]
+    pub window_binding_session: Option<i64>,
+    /// Managed-window id → the live HWND it was last confidently bound to this
+    /// session. Lets a switch re-find a window whose title/URL changed (e.g. a
+    /// browser playing different videos) without content matching. Validated
+    /// (alive + exe/class) before use.
+    #[serde(default)]
+    pub window_bindings: HashMap<Uuid, isize>,
 }
 
 impl Default for RuntimeState {
@@ -39,6 +50,8 @@ impl Default for RuntimeState {
             agent_runs: Vec::new(),
             last_seen_monitor_fingerprint: None,
             last_clean_shutdown: true,
+            window_binding_session: None,
+            window_bindings: HashMap::new(),
         }
     }
 }

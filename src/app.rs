@@ -23,6 +23,7 @@ use windows::core::HSTRING;
 use crate::application::agent_status_service;
 use crate::application::crash_recovery::{self, JournalRecoveryChoice};
 use crate::application::display_recovery_service::{self, RecoveryDecision};
+use crate::application::launch_service;
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
 use crate::application::monitor_watch_service;
 use crate::application::popup_placement;
@@ -1099,6 +1100,29 @@ fn refresh_color_choices(
     manager.set_selected_color(state.selected_color);
 }
 
+/// Builds the relaunch spec for a window being registered: VS Code gets the
+/// workset's repository path, a browser gets its live address-bar URL (read via
+/// UI Automation), and anything else just relaunches its bare exe. Returns
+/// `None` if the window has no known executable path.
+fn capture_launch_spec(
+    window: &TopLevelWindow,
+    repository_path: &Path,
+) -> Option<crate::domain::workset::LaunchSpec> {
+    let exe = window.executable_path.as_ref()?;
+    let kind = launch_service::classify(exe);
+    let browser_url = if kind == crate::domain::workset::LaunchKind::Browser {
+        crate::windowing::browser_url::read_browser_url(window.hwnd)
+    } else {
+        None
+    };
+    let repo = (!repository_path.as_os_str().is_empty()).then_some(repository_path);
+    Some(launch_service::build_launch_spec(
+        exe,
+        repo,
+        browser_url.as_deref(),
+    ))
+}
+
 /// Japanese label for a repository kind, shown in the registration screen.
 fn repository_kind_label(kind: crate::domain::workset::RepositoryKind) -> &'static str {
     use crate::domain::workset::RepositoryKind;
@@ -1244,7 +1268,140 @@ fn refresh_selected_workset_detail(
         })
         .collect();
 
+    let missing = count_reopenable_missing(workset, &decisions);
+    manager.set_selected_missing_count(i32::try_from(missing).unwrap_or(0));
     manager.set_selected_workset_windows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+/// Counts a workset's windows that are currently closed (no confident live
+/// match) AND carry a `launch_spec`, i.e. can be reopened.
+fn count_reopenable_missing(
+    workset: &crate::domain::workset::Workset,
+    decisions: &HashMap<uuid::Uuid, MatchDecision>,
+) -> usize {
+    workset
+        .windows
+        .iter()
+        .filter(|w| {
+            w.launch_spec.is_some()
+                && !matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
+        })
+        .count()
+}
+
+thread_local! {
+    /// Keeps the single-shot "reopen closed apps → settle → place" timer alive
+    /// between the launch and the deferred placement.
+    static REOPEN_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+}
+
+/// Switches to `workset_id` so its (now reopened) windows get matched and
+/// placed. If it is already the current workset, the current id is first
+/// cleared so the switch performs a full restore rather than a no-op.
+fn reopen_place_workset(
+    workset_id: uuid::Uuid,
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+    coordinator: &SwitchCoordinator<Win32WindowOps>,
+) {
+    let mut runtime = runtime_store::load(data_dir);
+    if runtime.current_workset_id == Some(workset_id) {
+        runtime.current_workset_id = None;
+        let _ = runtime_store::save(data_dir, &runtime);
+    }
+    let cfg = config.borrow();
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    if let Err(err) = coordinator.switch_to(SwitchRequest {
+        worksets: &cfg.worksets,
+        fixed_slots: &cfg.fixed_slots,
+        sub_screens: &cfg.sub_screens,
+        saved_monitors: &cfg.monitors,
+        main_monitor_ids: &cfg.main_monitor_ids,
+        live_monitors: &live_monitors,
+        live_windows: &live_windows,
+        target_workset_id: workset_id,
+    }) {
+        tracing::warn!(error = %err, "reopen: failed to place workset after relaunch");
+    }
+}
+
+/// What to acquire after launching a switch target's closed windows: the
+/// pre-launch HWND set and, per launched window, its managed id + expected
+/// executable/class so the newly-appeared window can be bound to it.
+struct PendingAcquire {
+    workset_id: uuid::Uuid,
+    before: std::collections::HashSet<isize>,
+    dead: Vec<(uuid::Uuid, PathBuf, String)>,
+}
+
+/// Launches the target workset's closed (unresolved) windows that carry a
+/// launch spec, returning what to acquire afterwards — or `None` if every
+/// window is already open (nothing to launch). Browsers open a fresh window;
+/// VS Code / Codex are only "dead" here if content matching already failed to
+/// find their window, so relaunching them won't duplicate an open one.
+fn launch_missing_for_switch(
+    config: &AppConfig,
+    bindings: &std::collections::HashMap<uuid::Uuid, isize>,
+    live_windows: &[TopLevelWindow],
+    target_id: uuid::Uuid,
+) -> Option<PendingAcquire> {
+    let workset = config.worksets.iter().find(|w| w.id == target_id)?;
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        live_windows,
+        bindings,
+    );
+
+    let mut dead = Vec::new();
+    for w in &workset.windows {
+        let alive = matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }));
+        if !alive && let Some(spec) = &w.launch_spec {
+            match crate::windowing::app_launch::launch(spec) {
+                Ok(()) => dead.push((w.id, spec.program.clone(), w.matcher.window_class.clone())),
+                Err(err) => {
+                    tracing::warn!(error = %err, program = %spec.program.display(), "switch: relaunch failed");
+                }
+            }
+        }
+    }
+
+    if dead.is_empty() {
+        return None;
+    }
+    Some(PendingAcquire {
+        workset_id: target_id,
+        before: live_windows.iter().map(|w| w.hwnd).collect(),
+        dead,
+    })
+}
+
+/// After launched windows have had time to appear, binds each newly-appeared
+/// window (matched by executable + class, in launch order) to the managed
+/// window it was launched for, then places the workset so they move to main.
+fn acquire_launched_and_place(
+    pending: PendingAcquire,
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+    coordinator: &SwitchCoordinator<Win32WindowOps>,
+) {
+    let after = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut claimed: std::collections::HashSet<isize> = std::collections::HashSet::new();
+    let mut runtime = runtime_store::load(data_dir);
+    for (id, exe, class) in &pending.dead {
+        if let Some(w) = after.iter().find(|w| {
+            !pending.before.contains(&w.hwnd)
+                && !claimed.contains(&w.hwnd)
+                && w.window_class == *class
+                && w.executable_path.as_ref() == Some(exe)
+        }) {
+            runtime.window_bindings.insert(*id, w.hwnd);
+            claimed.insert(w.hwnd);
+        }
+    }
+    let _ = runtime_store::save(data_dir, &runtime);
+    reopen_place_workset(pending.workset_id, config, data_dir, coordinator);
 }
 
 fn wire_workset_manager(
@@ -1252,6 +1409,7 @@ fn wire_workset_manager(
     data_dir: PathBuf,
     config: Rc<RefCell<AppConfig>>,
     state: Rc<RefCell<WorksetManagerState>>,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
 ) {
     {
         let mut state = state.borrow_mut();
@@ -1316,6 +1474,82 @@ fn wire_workset_manager(
         }
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
         refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    let coord = coordinator.clone();
+    manager.on_reopen_closed_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let (workset_id, specs) = {
+            let state = s.borrow();
+            let config = c.borrow();
+            let Some(workset) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get(i))
+            else {
+                return;
+            };
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
+            let specs: Vec<crate::domain::workset::LaunchSpec> = workset
+                .windows
+                .iter()
+                .filter(|w| {
+                    !matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
+                })
+                .filter_map(|w| w.launch_spec.clone())
+                .collect();
+            (workset.id, specs)
+        };
+
+        if specs.is_empty() {
+            manager.set_status_text("開き直せる閉じたアプリはありませんでした。".into());
+            manager.set_status_is_warning(false);
+            return;
+        }
+
+        let mut launched = 0;
+        for spec in &specs {
+            match crate::windowing::app_launch::launch(spec) {
+                Ok(()) => launched += 1,
+                Err(err) => {
+                    tracing::warn!(error = %err, program = %spec.program.display(), "reopen: launch failed");
+                }
+            }
+        }
+        manager.set_status_text(
+            format!(
+                "{launched}個のアプリを起動しました。配置を復元しています… （復元完了まで、同じアプリを手動で起動しないでください）"
+            )
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+
+        // Give the apps time to create their windows, then switch to the workset
+        // so the reopened windows get matched and placed.
+        let c2 = c.clone();
+        let dir2 = dir.clone();
+        let coord2 = coord.clone();
+        let m2 = m.clone();
+        let s2 = s.clone();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(2500),
+            move || {
+                reopen_place_workset(workset_id, &c2, &dir2, &coord2);
+                if let Some(manager) = m2.upgrade() {
+                    refresh_selected_workset_detail(&manager, &c2.borrow(), &s2.borrow());
+                    manager.set_status_text("配置を復元しました。".into());
+                    manager.set_status_is_warning(false);
+                }
+            },
+        );
+        REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
     });
 
     let m = manager.as_weak();
@@ -1681,6 +1915,9 @@ fn wire_workset_manager(
         }
 
         let mut managed_windows = Vec::new();
+        // The authoritative HWND for each newly registered window: the user
+        // picked it explicitly, so seed the session binding from it.
+        let mut seed_bindings: Vec<(uuid::Uuid, isize)> = Vec::new();
         for (z_order, window) in checked_windows.iter().enumerate() {
             let hwnd = HWND(window.hwnd as *mut _);
             let show_state = match win_placement::get_show_state(hwnd) {
@@ -1698,7 +1935,12 @@ fn wire_workset_manager(
                 }
             };
             match workset_service::build_managed_window(window, rect, show_state, i32::try_from(z_order).unwrap_or(i32::MAX), &state.monitors, &c.borrow().main_monitor_ids) {
-                Ok(managed_window) => managed_windows.push(managed_window),
+                Ok(mut managed_window) => {
+                    managed_window.launch_spec =
+                        capture_launch_spec(window, repository_path.as_path());
+                    seed_bindings.push((managed_window.id, window.hwnd));
+                    managed_windows.push(managed_window);
+                }
                 Err(err) => tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window not on a main monitor"),
             }
         }
@@ -1745,6 +1987,14 @@ fn wire_workset_manager(
 
         match save_result {
             Ok(()) => {
+                // Seed session HWND bindings from the exact windows the user
+                // picked, so switches re-find them even as titles/URLs change.
+                let mut runtime = runtime_store::load(&dir);
+                for (id, hwnd) in seed_bindings {
+                    runtime.window_bindings.insert(id, hwnd);
+                }
+                let _ = runtime_store::save(&dir, &runtime);
+
                 state.registering = false;
                 manager.set_registering(false);
                 manager.set_status_text("ワークセットを登録しました。".into());
@@ -2145,11 +2395,24 @@ fn wire_quick_switcher(
             return;
         };
 
+        // Pre-launch snapshot, then relaunch any closed windows of the target
+        // (switch = alive windows move, dead windows get launched).
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let pending_acquire = {
+            let config = c.borrow();
+            let runtime = runtime_store::load(&d);
+            launch_missing_for_switch(
+                &config,
+                &runtime.window_bindings,
+                &live_windows,
+                target_workset_id,
+            )
+        };
+
         let close_after_switch = {
             let config = c.borrow();
             let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
-            let live_windows =
-                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
 
             match coord.switch_to(SwitchRequest {
                 worksets: &config.worksets,
@@ -2190,6 +2453,26 @@ fn wire_quick_switcher(
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
         if close_after_switch {
             let _ = switcher.hide();
+        }
+
+        // If we relaunched closed windows, acquire and place them once they've
+        // had time to appear.
+        if let Some(pending) = pending_acquire {
+            let c2 = c.clone();
+            let d2 = d.clone();
+            let coord2 = coord.clone();
+            let pending = RefCell::new(Some(pending));
+            let timer = slint::Timer::default();
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(2500),
+                move || {
+                    if let Some(p) = pending.borrow_mut().take() {
+                        acquire_launched_and_place(p, &c2, &d2, &coord2);
+                    }
+                },
+            );
+            REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
         }
     });
 
@@ -2250,6 +2533,20 @@ fn wire_quick_switcher(
 /// Renders a hotkey as the settings window's read-only display string
 /// (e.g. `"Ctrl+Alt+W"`, `"Ctrl+Alt+Up"`), in canonical Ctrl/Alt/Shift/Win
 /// order regardless of the stored `modifiers` order.
+/// Full combo label for a cycle key, e.g. `"Ctrl+Alt+Down"` — the cycle key
+/// combined with the main hotkey's modifiers (which must be held for it).
+fn cycle_combo_label(main: &HotkeyConfig, cycle_vk: u32) -> String {
+    if win32_hotkey::virtual_key_to_label(cycle_vk).is_some() {
+        let combo = HotkeyConfig {
+            modifiers: main.modifiers.clone(),
+            virtual_key: cycle_vk,
+        };
+        hotkey_display_label(&combo)
+    } else {
+        format!("0x{cycle_vk:02X}")
+    }
+}
+
 fn hotkey_display_label(hotkey: &HotkeyConfig) -> String {
     let mut parts: Vec<String> = [
         (HotkeyModifier::Control, "Ctrl"),
@@ -2283,6 +2580,12 @@ fn wire_settings(
     window.set_hotkey_display(
         hotkey_display_label(&config.borrow().settings.quick_switcher_hotkey).into(),
     );
+    {
+        let cfg = config.borrow();
+        let main = &cfg.settings.quick_switcher_hotkey;
+        window.set_cycle_next_display(cycle_combo_label(main, cfg.settings.cycle_next_key).into());
+        window.set_cycle_prev_display(cycle_combo_label(main, cfg.settings.cycle_prev_key).into());
+    }
 
     {
         let w = window.as_weak();
@@ -2290,6 +2593,71 @@ fn wire_settings(
             let Some(window) = w.upgrade() else { return };
             window.set_hotkey_status_text("".into());
             window.set_hotkey_status_is_warning(false);
+        });
+    }
+
+    {
+        let w = window.as_weak();
+        window.on_cycle_capture_started(move |_which| {
+            let Some(window) = w.upgrade() else { return };
+            window.set_hotkey_status_text("".into());
+            window.set_hotkey_status_is_warning(false);
+        });
+    }
+
+    // Capturing a cycle key: only the key matters (its modifiers are inherited
+    // from the main hotkey), so map the pressed key, persist, and rebind.
+    {
+        let w = window.as_weak();
+        let c = config.clone();
+        let d = data_dir.clone();
+        let ht = hotkey_thread.clone();
+        window.on_cycle_captured(move |which, key_text| {
+            let Some(window) = w.upgrade() else { return };
+            let Some(vk) = win32_hotkey::slint_key_text_to_virtual_key(&key_text) else {
+                window.set_hotkey_status_text(
+                    "このキーは登録できません。別のキーを押してください。".into(),
+                );
+                window.set_hotkey_status_is_warning(true);
+                return;
+            };
+
+            let (spec, cn, cp) = {
+                let mut cfg = c.borrow_mut();
+                if which == 1 {
+                    cfg.settings.cycle_next_key = vk;
+                } else {
+                    cfg.settings.cycle_prev_key = vk;
+                }
+                (
+                    cfg.settings.quick_switcher_hotkey.clone(),
+                    cfg.settings.cycle_next_key,
+                    cfg.settings.cycle_prev_key,
+                )
+            };
+
+            match config_store::save(&d, &c.borrow()) {
+                Ok(()) => {
+                    ht.rebind(spec.clone(), cn, cp);
+                    window.set_cycle_next_display(cycle_combo_label(&spec, cn).into());
+                    window.set_cycle_prev_display(cycle_combo_label(&spec, cp).into());
+                    window.set_cycle_capturing(0);
+                    window.set_hotkey_status_text(
+                        format!(
+                            "次のセット={} / 前のセット={} を保存しました。",
+                            cycle_combo_label(&spec, cn),
+                            cycle_combo_label(&spec, cp)
+                        )
+                        .into(),
+                    );
+                    window.set_hotkey_status_is_warning(false);
+                }
+                Err(err) => {
+                    window
+                        .set_hotkey_status_text(format!("設定の保存に失敗しました: {err}").into());
+                    window.set_hotkey_status_is_warning(true);
+                }
+            }
         });
     }
 
@@ -2368,9 +2736,20 @@ fn wire_settings(
                     }
                 });
                 window.set_hotkey_display(hotkey_display_label(&candidate).into());
+                // The cycle combos inherit the main modifiers, so re-render them.
+                window.set_cycle_next_display(
+                    cycle_combo_label(&candidate, cfg.settings.cycle_next_key).into(),
+                );
+                window.set_cycle_prev_display(
+                    cycle_combo_label(&candidate, cfg.settings.cycle_prev_key).into(),
+                );
                 window.set_hotkey_status_text("保存しました。反映を確認しています…".into());
                 window.set_hotkey_status_is_warning(false);
-                ht.rebind(candidate);
+                ht.rebind(
+                    candidate,
+                    cfg.settings.cycle_next_key,
+                    cfg.settings.cycle_prev_key,
+                );
             }
             Err(err) => {
                 cfg.settings.quick_switcher_hotkey = previous;
@@ -3357,6 +3736,14 @@ pub fn run() -> Result<()> {
     {
         let mut runtime = runtime_store::load(&data_dir);
         runtime.last_clean_shutdown = false;
+        // Discard session HWND bindings from a previous OS boot: after a reboot
+        // those HWND numbers are reassigned and would point at unrelated
+        // windows (PLAN.md §5.4 extension). Bindings survive a RepoDeck-only
+        // restart (same boot session), so switching still re-finds windows.
+        if !crate::windowing::session::is_same_session(runtime.window_binding_session) {
+            runtime.window_bindings.clear();
+            runtime.window_binding_session = Some(crate::windowing::session::boot_session_token());
+        }
         let _ = runtime_store::save(&data_dir, &runtime);
     }
 
@@ -3446,6 +3833,7 @@ pub fn run() -> Result<()> {
         data_dir.clone(),
         config.clone(),
         workset_manager_state,
+        coordinator.clone(),
     );
 
     wire_quick_switcher(
@@ -3501,6 +3889,8 @@ pub fn run() -> Result<()> {
 
     let hotkey_thread = Rc::new(HotkeyThread::spawn(
         config.borrow().settings.quick_switcher_hotkey.clone(),
+        config.borrow().settings.cycle_next_key,
+        config.borrow().settings.cycle_prev_key,
         move |event| {
             let ui_event = match event {
                 HotkeyEvent::Pressed => HotkeyUiEvent::Pressed,
@@ -3629,10 +4019,18 @@ pub fn run() -> Result<()> {
 
     let window_for_settings = window.as_weak();
     let config_for_settings = config.clone();
+    // Installed on first show: the Settings window's HWND only exists once
+    // shown, and suppressing Alt menu-mode there lets Alt-based hotkeys be
+    // captured (see `popup_window::suppress_system_menu_key`).
+    let sysmenu_suppression: RefCell<Option<popup_window::SysMenuSuppression>> = RefCell::new(None);
     tray.on_settings_requested(move || {
         if let Some(window) = window_for_settings.upgrade() {
             refresh_codex_settings_state(&window, &config_for_settings.borrow());
             let _ = window.show();
+            if sysmenu_suppression.borrow().is_none() {
+                *sysmenu_suppression.borrow_mut() =
+                    popup_window::suppress_system_menu_key(window.window());
+            }
         }
     });
 

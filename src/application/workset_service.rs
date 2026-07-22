@@ -189,6 +189,9 @@ pub fn build_managed_window(
             show_state,
         },
         z_order,
+        // Filled in by the caller (registration), which knows the workset's
+        // repository path and can read a browser's URL from its live HWND.
+        launch_spec: None,
     })
 }
 
@@ -229,11 +232,45 @@ pub fn resolve_all_matches(
     worksets: &[Workset],
     live_windows: &[TopLevelWindow],
 ) -> HashMap<Uuid, MatchDecision> {
+    resolve_all_matches_with_bindings(worksets, live_windows, &HashMap::new())
+}
+
+/// Whether a session HWND binding is still trustworthy: the live window at that
+/// HWND must belong to the same executable and window class the managed window
+/// was registered with (guards against Windows recycling the HWND for an
+/// unrelated window). Title/URL are deliberately NOT checked — that volatility
+/// is the whole reason bindings exist.
+fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
+    live.executable_path.as_ref() == Some(&matcher.executable_path)
+        && live.window_class == matcher.window_class
+}
+
+/// Like [`resolve_all_matches`], but first tries each managed window's tracked
+/// session HWND binding (PLAN.md §5.4 extension): if the bound HWND is still
+/// live and passes [`binding_still_valid`], it's used directly, bypassing
+/// content matching. This lets a browser window whose title/URL constantly
+/// change (a video tab) still be re-found. Anything without a usable binding
+/// falls back to the normal scoring matcher.
+pub fn resolve_all_matches_with_bindings(
+    worksets: &[Workset],
+    live_windows: &[TopLevelWindow],
+    bindings: &HashMap<Uuid, isize>,
+) -> HashMap<Uuid, MatchDecision> {
     let mut bound: HashSet<isize> = HashSet::new();
     let mut results = HashMap::new();
 
     for workset in worksets {
         for window in &workset.windows {
+            if let Some(&hwnd) = bindings.get(&window.id)
+                && !bound.contains(&hwnd)
+                && let Some(live) = live_windows.iter().find(|w| w.hwnd == hwnd)
+                && binding_still_valid(&window.matcher, live)
+            {
+                bound.insert(hwnd);
+                results.insert(window.id, MatchDecision::AutoRebind { hwnd });
+                continue;
+            }
+
             let decision = matcher::resolve_best_match(&window.matcher, live_windows, &bound);
             if let MatchDecision::AutoRebind { hwnd } = &decision {
                 bound.insert(*hwnd);
@@ -243,6 +280,18 @@ pub fn resolve_all_matches(
     }
 
     results
+}
+
+/// Extracts the fresh `managed_window_id → HWND` bindings from a resolution
+/// result, so the caller can persist them for next time.
+pub fn bindings_from_decisions(decisions: &HashMap<Uuid, MatchDecision>) -> HashMap<Uuid, isize> {
+    decisions
+        .iter()
+        .filter_map(|(id, decision)| match decision {
+            MatchDecision::AutoRebind { hwnd } => Some((*id, *hwnd)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -565,6 +614,7 @@ mod tests {
                 show_state: SavedShowState::Normal,
             },
             z_order: 0,
+            launch_spec: None,
         };
         let mut managed_b = managed_a.clone();
         managed_b.id = Uuid::new_v4();

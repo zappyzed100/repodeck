@@ -203,12 +203,31 @@ pub struct UserSettings {
     /// configs written before this field was added loadable.
     #[serde(default = "default_auto_display_recovery")]
     pub auto_display_recovery: bool,
+    /// Virtual-key for the "next set" hold-to-cycle hotkey, combined with
+    /// `quick_switcher_hotkey`'s modifiers (Alt+Tab style: hold the modifiers,
+    /// tap this key to advance, release to commit). Default `VK_DOWN` (0x28).
+    #[serde(default = "default_cycle_next_key")]
+    pub cycle_next_key: u32,
+    /// Virtual-key for the "previous set" hold-to-cycle hotkey. Default
+    /// `VK_UP` (0x26).
+    #[serde(default = "default_cycle_prev_key")]
+    pub cycle_prev_key: u32,
 }
 
 /// serde default for [`UserSettings::auto_display_recovery`]: auto-recovery is ON
 /// unless a config explicitly disables it.
 fn default_auto_display_recovery() -> bool {
     true
+}
+
+/// serde/UI default for the "next set" cycle key: `VK_DOWN`.
+pub fn default_cycle_next_key() -> u32 {
+    0x28
+}
+
+/// serde/UI default for the "previous set" cycle key: `VK_UP`.
+pub fn default_cycle_prev_key() -> u32 {
+    0x26
 }
 
 impl Default for UserSettings {
@@ -228,6 +247,8 @@ impl Default for UserSettings {
             notify_ready: true,
             start_with_windows: false,
             auto_display_recovery: default_auto_display_recovery(),
+            cycle_next_key: default_cycle_next_key(),
+            cycle_prev_key: default_cycle_prev_key(),
         }
     }
 }

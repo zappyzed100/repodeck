@@ -175,6 +175,7 @@ mod tests {
                 show_state: PlacementShowState::Normal,
             },
             z_order: 0,
+            launch_spec: None,
         }
     }
 

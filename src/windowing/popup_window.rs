@@ -11,7 +11,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWL_EXSTYLE, GWLP_WNDPROC, GetWindowLongPtrW, SetWindowLongPtrW, WA_INACTIVE,
-    WM_ACTIVATE, WM_DISPLAYCHANGE, WNDPROC, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WM_ACTIVATE, WM_DISPLAYCHANGE, WM_SYSCOMMAND, WNDPROC, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Best-effort forces real OS input focus onto `window` (PLAN.md §4.5's
@@ -235,4 +235,82 @@ pub fn watch_display_changes(
     });
 
     Some(DisplayChangeWatch { hwnd, original_raw })
+}
+
+// A third parallel subclass (same rationale as the two above): swallows the
+// `Alt`-triggered system-menu activation (`WM_SYSCOMMAND` + `SC_KEYMENU`) on a
+// window. Without this, pressing `Alt` inside the Settings window makes Windows
+// enter "menu mode", which briefly deactivates the window — and the hotkey /
+// cycle-key capture's focus-loss handler then cancels the capture, so an
+// `Alt`-based combo can never be recorded.
+thread_local! {
+    static SYSMENU_SUBCLASSES: RefCell<HashMap<isize, WNDPROC>> = RefCell::new(HashMap::new());
+}
+
+/// `SC_KEYMENU` (0xF100): the `WM_SYSCOMMAND` sub-command Windows sends when
+/// `Alt` (or `F10`) is used to activate a window's menu. The low 4 bits are
+/// reserved, so callers mask with `0xFFF0`.
+const SC_KEYMENU: usize = 0xF100;
+
+unsafe extern "system" fn sysmenu_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == SC_KEYMENU {
+        return LRESULT(0);
+    }
+    let original =
+        SYSMENU_SUBCLASSES.with(|map| map.borrow().get(&(hwnd.0 as isize)).copied().flatten());
+    match original {
+        // SAFETY: `original` is the real previous WNDPROC captured in
+        // `suppress_system_menu_key`; the args are exactly what we were called with.
+        Some(_) => unsafe { CallWindowProcW(original, hwnd, msg, wparam, lparam) },
+        None => LRESULT(0),
+    }
+}
+
+/// Un-subclasses the window on drop, restoring its original WNDPROC.
+pub struct SysMenuSuppression {
+    hwnd: HWND,
+    original_raw: isize,
+}
+
+impl Drop for SysMenuSuppression {
+    fn drop(&mut self) {
+        // SAFETY: see `DeactivationWatch::drop`'s identical reasoning.
+        unsafe {
+            let _ = SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.original_raw);
+        }
+        SYSMENU_SUBCLASSES.with(|map| {
+            map.borrow_mut().remove(&(self.hwnd.0 as isize));
+        });
+    }
+}
+
+/// Subclasses `window` to swallow `Alt`/`F10` menu activation so `Alt` can be
+/// captured as a hotkey modifier without the capture being cancelled by the
+/// focus loss Windows' menu mode would otherwise cause. `window` must already
+/// have a live HWND (i.e. have been shown at least once).
+pub fn suppress_system_menu_key(window: &slint::Window) -> Option<SysMenuSuppression> {
+    let hwnd = hwnd_of(window)?;
+    let key = hwnd.0 as isize;
+
+    // SAFETY: `hwnd` is a live window's real handle; `sysmenu_subclass_proc`
+    // matches the `WNDPROC` signature exactly.
+    let original_raw = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            sysmenu_subclass_proc as *const () as isize,
+        )
+    };
+    let original = wndproc_from_isize(original_raw);
+
+    SYSMENU_SUBCLASSES.with(|map| {
+        map.borrow_mut().insert(key, original);
+    });
+
+    Some(SysMenuSuppression { hwnd, original_raw })
 }

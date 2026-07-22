@@ -75,9 +75,12 @@ export component WorksetManager inherits Window {
     in property <[RegistrationCandidate]> main-screen-candidates: [];
     in property <bool> empty-undo-available: false;
 
+    in property <int> selected-missing-count: 0;
+
     callback refresh-requested();
     callback workset-selected(index: int);
     callback delete-workset-requested();
+    callback reopen-closed-requested();
     callback rebind-requested(window-index: int);
 
     callback start-registration();
@@ -175,6 +178,14 @@ export component WorksetManager inherits Window {
                         spacing: Theme.space-xs;
                         SectionLabel { text: "ウィンドウ一覧"; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
+                        GlassButton {
+                            text: root.selected-missing-count > 0
+                                ? "閉じたアプリを開き直す (" + root.selected-missing-count + ")"
+                                : "閉じたアプリを開き直す";
+                            primary: root.selected-missing-count > 0;
+                            enabled: root.selected-missing-count > 0;
+                            clicked => { root.reopen-closed-requested(); }
+                        }
                         GlassButton {
                             text: "このセットを削除";
                             enabled: root.selected-workset-index >= 0;
