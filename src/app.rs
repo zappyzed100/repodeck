@@ -39,6 +39,7 @@ use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier, SortMode};
 use crate::domain::monitor::AutoSplit;
 use crate::domain::placement::SavedShowState;
 use crate::domain::workset::ParkingPolicy;
+use crate::hotkey::mouse_wheel_hook::MouseWheelHook;
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
 use crate::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
@@ -1353,6 +1354,9 @@ fn refresh_selected_workset_detail(
         &config.worksets,
         &live_windows,
         &bindings,
+        // Resolve the set being inspected first, so a window it shares with
+        // another set still shows as resolved here.
+        Some(workset.id),
     );
 
     let rows: Vec<ManagedWindowSummary> = workset
@@ -1452,6 +1456,7 @@ fn launch_missing_for_switch(
         &config.worksets,
         live_windows,
         bindings,
+        Some(target_id),
     );
 
     let mut dead = Vec::new();
@@ -1727,9 +1732,13 @@ fn wire_workset_manager(
     });
 
     // --- "メイン画面を空にする" (moved here from Layout Studio) ---
+    // Runs directly, with no confirmation panel: registered windows on the main
+    // screen are parked to their workset's destination; everything else on main
+    // is minimized.
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_empty_main_screen_requested(move || {
         let Some(manager) = m.upgrade() else { return };
         let mut state = s.borrow_mut();
@@ -1744,54 +1753,61 @@ fn wire_workset_manager(
             return;
         }
 
-        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
-        let main_bounds = resolve_main_monitor_bounds(&state.monitors, &config.main_monitor_ids);
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        state.monitors = live_monitors.clone();
+        let main_bounds = resolve_main_monitor_bounds(&live_monitors, &config.main_monitor_ids);
         let windows =
             enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
         let candidates = layout_service::find_windows_on_main_screen(&windows, &main_bounds);
 
         if candidates.is_empty() {
-            manager.set_status_text("メイン画面に未登録ウィンドウはありませんでした。".into());
+            manager.set_status_text("メイン画面に対象のウィンドウはありませんでした。".into());
             manager.set_status_is_warning(false);
             return;
         }
 
-        use crate::domain::config::UnknownWindowPolicy;
-        match config.settings.unknown_window_policy {
-            UnknownWindowPolicy::LeaveInPlace => {
-                manager.set_status_text(
-                    format!(
-                        "{}個の未登録ウィンドウがありますが、設定方針によりそのままにしました。",
-                        candidates.len()
-                    )
-                    .into(),
-                );
-                manager.set_status_is_warning(false);
+        let (owner_park_rect, owner_fullscreen) =
+            compute_empty_main_destinations(&config, &d, &live_monitors, &windows);
+
+        let mut entries = Vec::new();
+        let mut parked = 0usize;
+        let mut minimized = 0usize;
+        for window in &candidates {
+            let hwnd = HWND(window.hwnd as *mut _);
+            let before_show_state = match win_placement::get_show_state(hwnd) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let before_rect = match win_placement::get_normal_rect(hwnd) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if let Some(rect) = owner_park_rect.get(&window.hwnd) {
+                // Un-maximize + fill the cell (visible bounds, so the invisible
+                // DWM border doesn't leave a gutter between windows).
+                win_placement::set_placement(hwnd, *rect, false, true);
+                if owner_fullscreen.contains(&window.hwnd) {
+                    crate::windowing::key_input::send_fullscreen_keys(hwnd, None);
+                }
+                parked += 1;
+            } else {
+                win_placement::minimize(hwnd);
+                minimized += 1;
             }
-            UnknownWindowPolicy::Ask => {
-                let model_items: Vec<RegistrationCandidate> = candidates
-                    .iter()
-                    .map(|w| RegistrationCandidate {
-                        title: w.title.clone().into(),
-                        process_name: w
-                            .executable_path
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| w.window_class.clone())
-                            .into(),
-                        checked: true,
-                    })
-                    .collect();
-                manager.set_main_screen_candidates(
-                    std::rc::Rc::new(slint::VecModel::from(model_items)).into(),
-                );
-                state.pending_empty_candidates = candidates;
-                manager.set_empty_screen_panel_visible(true);
-                manager.set_status_text("最小化するウィンドウを確認してください。".into());
-                manager.set_status_is_warning(false);
-            }
+            entries.push(UndoEntry {
+                hwnd: window.hwnd,
+                process_id: window.process_id,
+                before_rect,
+                before_show_state,
+            });
         }
+
+        state.empty_undo_snapshot = UndoSnapshot { entries };
+        manager.set_empty_undo_available(!state.empty_undo_snapshot.is_empty());
+        manager.set_empty_screen_panel_visible(false);
+        manager
+            .set_status_text(format!("{parked}個を退避、{minimized}個を最小化しました。").into());
+        manager.set_status_is_warning(false);
     });
 
     let m = manager.as_weak();
@@ -1837,37 +1853,114 @@ fn wire_workset_manager(
             let config = c.borrow();
             let live_windows =
                 enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-            let bindings = runtime_store::load(&d).window_bindings;
+            let runtime = runtime_store::load(&d);
             let decisions = workset_service::resolve_all_matches_with_bindings(
                 &config.worksets,
                 &live_windows,
-                &bindings,
+                &runtime.window_bindings,
+                None,
             );
+
+            // Auto/Fixed worksets park to allocator-assigned cells; SubScreen
+            // worksets to their sub cell. `current_workset_id: None` so the
+            // *active* workset (whose windows are on main) is parked too — the
+            // whole point of emptying the main screen.
+            use crate::application::parking_allocator::{
+                AllocationInput, ParkAssignment, ParkingSlotId, allocate_parking,
+            };
+            let previous: std::collections::HashMap<uuid::Uuid, ParkingSlotId> = runtime
+                .auto_slot_assignments
+                .iter()
+                .filter_map(|(k, v)| {
+                    Some((uuid::Uuid::parse_str(k).ok()?, ParkingSlotId::decode(v)?))
+                })
+                .collect();
+            let sub_screen_monitor_ids: Vec<String> = config
+                .sub_screens
+                .iter()
+                .flat_map(|s| s.monitor_ids.iter().cloned())
+                .collect();
+            let allocation = allocate_parking(&AllocationInput {
+                worksets: &config.worksets,
+                current_workset_id: None,
+                fixed_slots: &config.fixed_slots,
+                main_monitor_ids: &config.main_monitor_ids,
+                live_monitors: &live_monitors,
+                saved_monitors: &config.monitors,
+                sub_screen_monitor_ids: &sub_screen_monitor_ids,
+                previous_assignments: &previous,
+            });
+
             let mut rects = std::collections::HashMap::new();
             let mut fullscreen = std::collections::HashSet::new();
             for workset in &config.worksets {
-                let crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } =
-                    &workset.parking_policy
-                else {
+                use crate::domain::workset::ParkingPolicy;
+                // Where this workset's windows should park, and whether to send
+                // full-screen keys. `None` → its windows fall through to minimize.
+                let dest: Option<(crate::domain::placement::PixelRect, bool)> =
+                    match &workset.parking_policy {
+                        ParkingPolicy::SubScreen { sub_screen_id } => config
+                            .sub_screens
+                            .iter()
+                            .find(|s| s.id == *sub_screen_id)
+                            .and_then(|sub| {
+                                let slot =
+                                    crate::application::switch_coordinator::sub_screen_slot_rect(
+                                        sub,
+                                        &config.worksets,
+                                        workset.id,
+                                        &live_monitors,
+                                    )?;
+                                // Full-screen only for a sole occupant — a shared
+                                // sub-screen can't have overlapping full windows.
+                                let sole = crate::application::switch_coordinator::sub_screen_sharer_count(
+                                    &config.worksets,
+                                    *sub_screen_id,
+                                ) <= 1;
+                                Some((slot, sole && (workset.fullscreen_when_parked || sub.fullscreen)))
+                            }),
+                        _ => match allocation.assignments.get(&workset.id) {
+                            Some(ParkAssignment::AutoSlot { rect, .. })
+                            | Some(ParkAssignment::FixedSlot { rect, .. }) => {
+                                Some((*rect, workset.fullscreen_when_parked))
+                            }
+                            _ => None,
+                        },
+                    };
+                let Some((slot, want_fullscreen)) = dest else {
                     continue;
                 };
-                let Some(sub) = config.sub_screens.iter().find(|s| s.id == *sub_screen_id) else {
-                    continue;
-                };
-                let Some(rect) = crate::application::switch_coordinator::sub_screen_target_rect(
-                    sub,
-                    &live_monitors,
-                ) else {
-                    continue;
-                };
-                let want_fullscreen = workset.fullscreen_when_parked || sub.fullscreen;
+                // Resolve this workset's live windows and their main-screen rects
+                // so they can be shrunk into the cell preserving relative layout.
+                let mut hwnds = Vec::new();
+                let mut main_rects = Vec::new();
                 for w in &workset.windows {
-                    if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id) {
-                        rects.insert(*hwnd, rect);
-                        if want_fullscreen {
-                            fullscreen.insert(*hwnd);
+                    if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id)
+                        && let Some(outcome) =
+                            crate::application::main_placement::resolve_main_restore(
+                                &w.main_placement,
+                                &live_monitors,
+                                &config.main_monitor_ids,
+                            )
+                    {
+                        hwnds.push(*hwnd);
+                        main_rects.push(outcome.rect);
+                    }
+                }
+                if hwnds.is_empty() {
+                    continue;
+                }
+                match crate::application::parking_placement::plan_park_into_slot(&main_rects, slot) {
+                    crate::application::parking_placement::ParkPlan::ShrinkToFit(mapped) => {
+                        for (hwnd, rect) in hwnds.iter().zip(mapped) {
+                            rects.insert(*hwnd, rect);
+                            if want_fullscreen {
+                                fullscreen.insert(*hwnd);
+                            }
                         }
                     }
+                    // Windows too small to park → left out, minimized below.
+                    crate::application::parking_placement::ParkPlan::MinimizeWhole => {}
                 }
             }
             (rects, fullscreen)
@@ -1902,8 +1995,12 @@ fn wire_workset_manager(
                 // Registered in another set with a sub-screen: park it there.
                 win_placement::restore(hwnd);
                 if win_placement::set_window_rect(hwnd, *rect).is_ok() {
-                    if owner_fullscreen.contains(&window.hwnd) {
-                        win_placement::maximize(hwnd);
+                    let want_fs = owner_fullscreen.contains(&window.hwnd);
+                    if want_fs {
+                        // Send the browser's own full-screen key (F) so a parked
+                        // video fills the sub-screen. No refocus target here — the
+                        // main screen is being emptied.
+                        crate::windowing::key_input::send_fullscreen_keys(hwnd, None);
                     }
                     parked += 1;
                 } else {
@@ -2173,6 +2270,19 @@ fn wire_workset_manager(
             }
 
             let errors = config.validate();
+            // Registering the same window in more than one workset is allowed —
+            // at switch time a window simply resolves to whichever workset claims
+            // it first — so it is not a fatal error, only the rest are.
+            let fatal: Vec<String> = errors
+                .iter()
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        crate::domain::config::ConfigValidationError::DuplicateWindowMatcher { .. }
+                    )
+                })
+                .map(config_validation_message)
+                .collect();
             let restore = |config: &mut AppConfig| match &backup {
                 Some((id, original)) => {
                     if let Some(w) = config.worksets.iter_mut().find(|w| &w.id == id) {
@@ -2183,9 +2293,9 @@ fn wire_workset_manager(
                     config.worksets.pop();
                 }
             };
-            if !errors.is_empty() {
+            if !fatal.is_empty() {
                 restore(&mut config);
-                Err(errors.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" / "))
+                Err(fatal.join(" / "))
             } else {
                 match config_store::save(&dir, &config) {
                     Ok(()) => Ok(()),
@@ -2366,10 +2476,12 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
 
     let row_count = i32::try_from(rows.len()).unwrap_or(i32::MAX);
     switcher.set_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    if row_count == 0 {
+    // The slot at index == row_count is the "empty the main screen" action, so
+    // it is a valid selection even when it sits one past the last workset row.
+    if switcher.get_selected_index() > row_count {
+        switcher.set_selected_index(row_count);
+    } else if switcher.get_selected_index() < 0 {
         switcher.set_selected_index(0);
-    } else if switcher.get_selected_index() >= row_count {
-        switcher.set_selected_index(row_count - 1);
     }
 }
 
@@ -2516,6 +2628,158 @@ fn toggle_quick_switcher(switcher: &QuickSwitcher, config: &AppConfig, data_dir:
     } else {
         show_quick_switcher_at_cursor(switcher, config, data_dir);
     }
+}
+
+/// Concise Japanese message for a config validation error, so the registration
+/// banner stays readable rather than dumping the `Display` form (full exe paths
+/// and window classes, which overflow the dialog).
+fn config_validation_message(error: &crate::domain::config::ConfigValidationError) -> String {
+    use crate::domain::config::ConfigValidationError as E;
+    match error {
+        E::WorksetNameLength { .. } => "セット名は1〜80文字にしてください。".to_string(),
+        E::DuplicateWindowMatcher {
+            registered_title, ..
+        } => format!("「{registered_title}」は既に別のセットに登録されています。"),
+        other => other.to_string(),
+    }
+}
+
+/// Maps each registered window's live HWND to the rect it should park into when
+/// the main screen is emptied, plus the set that additionally wants the browser
+/// full-screen keys. Two tracks (development-plan.md「退避の優先順位ルール」):
+///
+/// - **Sub-screen-designated** worksets go to their own sub cell (subdivided
+///   1→2→4 among worksets sharing that sub); full-screen when sole occupant.
+/// - **Everything else** (Auto/Fixed worksets' windows) is distributed across
+///   the *non-sub* parking screens by `distribute_parking`: emptiest screen
+///   first, each screen subdivided by its window count, never overlapping. What
+///   doesn't fit anywhere is absent here (→ minimized by the caller).
+fn compute_empty_main_destinations(
+    config: &AppConfig,
+    data_dir: &std::path::Path,
+    live_monitors: &[MonitorInfo],
+    live_windows: &[TopLevelWindow],
+) -> (
+    std::collections::HashMap<isize, crate::domain::placement::PixelRect>,
+    std::collections::HashSet<isize>,
+) {
+    use crate::application::main_placement::resolve_main_restore;
+    use crate::application::parking_placement::{ParkPlan, plan_park_into_slot};
+    use crate::application::switch_coordinator as sc;
+    use crate::domain::placement::PixelRect;
+    use crate::domain::workset::ParkingPolicy;
+
+    let runtime = runtime_store::load(data_dir);
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        live_windows,
+        &runtime.window_bindings,
+        None,
+    );
+
+    let mut rects = std::collections::HashMap::new();
+    let mut fullscreen = std::collections::HashSet::new();
+    // Non-designated registered windows, collected for distribution: (hwnd, its
+    // main-screen rect for aspect-preserving shrink).
+    let mut to_distribute: Vec<(isize, PixelRect)> = Vec::new();
+
+    for workset in &config.worksets {
+        // Resolve this workset's live on-main windows once.
+        let mut resolved: Vec<(isize, PixelRect)> = Vec::new();
+        for w in &workset.windows {
+            if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id)
+                && let Some(outcome) =
+                    resolve_main_restore(&w.main_placement, live_monitors, &config.main_monitor_ids)
+            {
+                resolved.push((*hwnd, outcome.rect));
+            }
+        }
+        if resolved.is_empty() {
+            continue;
+        }
+
+        let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy else {
+            // Non-designated → distribute across the non-sub parking screens.
+            to_distribute.extend(resolved);
+            continue;
+        };
+        // Designated → its own sub cell.
+        let dest = config
+            .sub_screens
+            .iter()
+            .find(|s| s.id == *sub_screen_id)
+            .and_then(|sub| {
+                let slot =
+                    sc::sub_screen_slot_rect(sub, &config.worksets, workset.id, live_monitors)?;
+                let sole = sc::sub_screen_sharer_count(&config.worksets, *sub_screen_id) <= 1;
+                Some((
+                    slot,
+                    sole && (workset.fullscreen_when_parked || sub.fullscreen),
+                ))
+            });
+        let Some((slot, want_fullscreen)) = dest else {
+            continue;
+        };
+        // Same algorithm as a normal switch: subdivide the sub cell among the
+        // workset's windows so each fills its own flush cell (projecting the
+        // whole main layout kept the original gaps and looked broken).
+        let cells = sc::subdivide_for_count(slot, resolved.len());
+        for (i, (hwnd, main_rect)) in resolved.iter().enumerate() {
+            let Some(&cell) = cells.get(i) else {
+                continue; // beyond capacity → minimized by the caller
+            };
+            if let ParkPlan::ShrinkToFit(mapped) =
+                plan_park_into_slot(std::slice::from_ref(main_rect), cell)
+                && let Some(&rect) = mapped.first()
+            {
+                rects.insert(*hwnd, rect);
+                if want_fullscreen {
+                    fullscreen.insert(*hwnd);
+                }
+            }
+        }
+    }
+
+    // Parking screens = live monitors that are non-main, non-sub, non-excluded.
+    let sub_ids: std::collections::HashSet<&str> = config
+        .sub_screens
+        .iter()
+        .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
+        .collect();
+    let parking_screens: Vec<PixelRect> = live_monitors
+        .iter()
+        .filter(|m| {
+            !config
+                .main_monitor_ids
+                .iter()
+                .any(|id| id == &m.device_name)
+        })
+        .filter(|m| !sub_ids.contains(m.device_name.as_str()))
+        .filter(|m| {
+            !config
+                .monitors
+                .iter()
+                .any(|s| s.stable_id == m.device_name && s.excluded)
+        })
+        .map(|m| m.work_area_px)
+        .collect();
+
+    let hwnds: Vec<isize> = to_distribute.iter().map(|(h, _)| *h).collect();
+    let main_rect_of: std::collections::HashMap<isize, PixelRect> =
+        to_distribute.into_iter().collect();
+    let (placements, _overflow) = sc::distribute_parking(&parking_screens, &hwnds);
+    for (hwnd, cell) in placements {
+        // Shrink the single window into its cell, preserving aspect; too small
+        // → left out (minimized).
+        if let Some(main_rect) = main_rect_of.get(&hwnd)
+            && let ParkPlan::ShrinkToFit(mapped) = plan_park_into_slot(&[*main_rect], cell)
+            && let Some(rect) = mapped.first()
+        {
+            rects.insert(hwnd, *rect);
+        }
+    }
+
+    (rects, fullscreen)
 }
 
 /// Single entry point for "メイン画面を空にする" shared by the tray menu, the
@@ -3312,6 +3576,11 @@ enum HotkeyUiEvent {
     Cycle {
         forward: bool,
     },
+    /// A Ctrl+Shift+MouseWheel tick — drives the switcher like `Cycle` but the
+    /// release-to-commit watches Ctrl+Shift rather than the configured hotkey.
+    WheelCycle {
+        forward: bool,
+    },
     Registered,
     RegisterFailed(String),
 }
@@ -3322,6 +3591,12 @@ thread_local! {
     /// timer's own callback can drop it — the standard Slint self-stopping
     /// timer idiom. `None` whenever no hold-to-cycle session is in flight.
     static CYCLE_TIMER: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+
+    /// The virtual-key codes whose release commits the in-flight cycle session.
+    /// Set per gesture — the configured hotkey's modifiers for the keyboard
+    /// cycle, or Ctrl+Shift for the mouse-wheel gesture — so one release timer
+    /// serves both.
+    static CYCLE_WATCH_VKS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The Win32 virtual-key codes to poll for each configured hotkey modifier.
@@ -3349,21 +3624,23 @@ fn key_is_down(vk: i32) -> bool {
     (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
-/// True once every configured modifier of the current hotkey has been
-/// released — the moment a hold-to-cycle session commits.
-fn cycle_modifiers_released(hotkey: &HotkeyConfig) -> bool {
-    let vks = hotkey_modifier_vks(hotkey);
-    // A hotkey with no modifiers can't be "held"; treat as never-released so
-    // no phantom commit fires (cycle hotkeys aren't registered in that case).
-    !vks.is_empty() && vks.into_iter().all(|vk| !key_is_down(vk))
+/// True once every watched modifier of the in-flight cycle session has been
+/// released — the moment it commits. The watched set is whatever the gesture
+/// stored in `CYCLE_WATCH_VKS` (hotkey modifiers, or Ctrl+Shift for the wheel).
+fn cycle_watch_released() -> bool {
+    CYCLE_WATCH_VKS.with(|vks| {
+        let vks = vks.borrow();
+        // An empty set can't be "held"; treat as never-released so no phantom
+        // commit fires.
+        !vks.is_empty() && vks.iter().all(|&vk| !key_is_down(vk))
+    })
 }
 
-/// Moves the Quick Switcher selection one row, wrapping at either end.
+/// Moves the Quick Switcher selection one row, wrapping at either end. The slot
+/// one past the last row (index == row_count) is the "empty the main screen"
+/// action, so the cycle includes it.
 fn cycle_move_selection(switcher: &QuickSwitcher, forward: bool) {
-    let len = switcher.get_rows().row_count();
-    if len == 0 {
-        return;
-    }
+    let len = switcher.get_rows().row_count() + 1;
     let current = usize::try_from(switcher.get_selected_index().max(0)).unwrap_or(0) % len;
     let next = if forward {
         (current + 1) % len
@@ -3385,7 +3662,11 @@ fn commit_cycle_selection(ctx: &CrossThreadUiContext) {
     if let Some(switcher) = ctx.quick_switcher.upgrade() {
         let rows = switcher.get_rows();
         let idx = switcher.get_selected_index();
-        if idx >= 0
+        let row_count = rows.row_count();
+        if idx >= 0 && (idx as usize) >= row_count {
+            // The slot past the last row is the "empty the main screen" action.
+            switcher.invoke_empty_main_requested();
+        } else if idx >= 0
             && let Some(row) = rows.row_data(idx as usize)
         {
             // Reuses the fully-wired switch path (journal, rollback, hide).
@@ -3395,9 +3676,11 @@ fn commit_cycle_selection(ctx: &CrossThreadUiContext) {
     }
 }
 
-/// Starts the release-watching timer for a hold-to-cycle session, unless one
-/// is already running.
-fn start_cycle_release_timer() {
+/// Starts the release-watching timer for a hold-to-cycle session, watching
+/// `watch_vks` for release. Updates the watched set even if a timer is already
+/// running (the latest gesture defines the commit condition).
+fn start_cycle_release_timer(watch_vks: Vec<i32>) {
+    CYCLE_WATCH_VKS.with(|c| *c.borrow_mut() = watch_vks);
     if CYCLE_TIMER.with(|holder| holder.borrow().is_some()) {
         return;
     }
@@ -3411,9 +3694,7 @@ fn start_cycle_release_timer() {
             let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
                 return;
             };
-            let released =
-                cycle_modifiers_released(&ctx.config.borrow().settings.quick_switcher_hotkey);
-            if released {
+            if cycle_watch_released() {
                 // Drop the timer first so it can't re-fire while the switch runs.
                 holder_for_cb.borrow_mut().take();
                 commit_cycle_selection(&ctx);
@@ -3421,6 +3702,25 @@ fn start_cycle_release_timer() {
         },
     );
     *holder.borrow_mut() = Some(timer);
+}
+
+/// Shared body of the keyboard-cycle and wheel-cycle gestures: shows the
+/// switcher (preselecting the current workset on first open), moves the
+/// selection, and arms the release timer for `watch_vks`.
+fn drive_cycle(ctx: &CrossThreadUiContext, forward: bool, watch_vks: Vec<i32>) {
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        if !switcher.window().is_visible() {
+            show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+            // Start from the current workset so the first tap lands on its
+            // neighbour, exactly like Alt+Tab starting on the next window.
+            let state = runtime_store::load(&ctx.data_dir);
+            if let Some(id) = state.current_workset_id {
+                select_row_for_workset(&switcher, id);
+            }
+        }
+        cycle_move_selection(&switcher, forward);
+        start_cycle_release_timer(watch_vks);
+    }
 }
 
 struct CrossThreadUiContext {
@@ -3451,20 +3751,12 @@ fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
             }
         }
         HotkeyUiEvent::Cycle { forward } => {
-            if let Some(switcher) = ctx.quick_switcher.upgrade() {
-                if !switcher.window().is_visible() {
-                    show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
-                    // Start from the current workset so the first tap lands on
-                    // its neighbour, exactly like Alt+Tab starting on the next
-                    // window rather than the current one.
-                    let state = runtime_store::load(&ctx.data_dir);
-                    if let Some(id) = state.current_workset_id {
-                        select_row_for_workset(&switcher, id);
-                    }
-                }
-                cycle_move_selection(&switcher, forward);
-                start_cycle_release_timer();
-            }
+            let watch = hotkey_modifier_vks(&ctx.config.borrow().settings.quick_switcher_hotkey);
+            drive_cycle(&ctx, forward, watch);
+        }
+        HotkeyUiEvent::WheelCycle { forward } => {
+            // Ctrl+Shift held during the wheel gesture — release either to commit.
+            drive_cycle(&ctx, forward, vec![0x11, 0x10]); // VK_CONTROL, VK_SHIFT
         }
         HotkeyUiEvent::Registered => {
             ctx.pending_hotkey_rollback.borrow_mut().take();
@@ -4081,6 +4373,16 @@ pub fn run() -> Result<()> {
             let _ = slint::invoke_from_event_loop(move || handle_hotkey_ui_event(ui_event));
         },
     ));
+
+    // Ctrl+Shift+MouseWheel opens and drives the Quick Switcher system-wide.
+    // Kept alive for the process lifetime; its `Drop` unhooks and stops the
+    // thread. Each wheel tick marshals onto the UI thread like the hotkey.
+    let _mouse_wheel_hook = MouseWheelHook::spawn(move |forward| {
+        let _ = slint::invoke_from_event_loop(move || {
+            handle_hotkey_ui_event(HotkeyUiEvent::WheelCycle { forward });
+        });
+    });
+
     wire_settings(&window, data_dir.clone(), config.clone(), hotkey_thread);
     wire_codex_settings(&window, config.clone());
     wire_about_and_autostart(&window, config.clone(), data_dir.clone());

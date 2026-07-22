@@ -62,6 +62,11 @@ pub struct AllocationInput<'a> {
     pub main_monitor_ids: &'a [String],
     pub live_monitors: &'a [MonitorInfo],
     pub saved_monitors: &'a [SavedMonitor],
+    /// Device names of every monitor a sub-screen (退避先エリア) uses. These are
+    /// reserved for their designated worksets and excluded from the auto pool,
+    /// so a non-designated workset never parks onto a sub-screen (確定仕様
+    /// 2026-07-22: 「サブ以外の退避先の画面に詰める」).
+    pub sub_screen_monitor_ids: &'a [String],
     /// Decoded from `RuntimeState.auto_slot_assignments`.
     pub previous_assignments: &'a HashMap<Uuid, ParkingSlotId>,
 }
@@ -143,6 +148,13 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
                 .saved_monitors
                 .iter()
                 .any(|s| s.stable_id == m.device_name && s.excluded)
+        })
+        // Sub-screen monitors are reserved for their designated worksets.
+        .filter(|m| {
+            !input
+                .sub_screen_monitor_ids
+                .iter()
+                .any(|id| id == &m.device_name)
         })
         .cloned()
         .collect();
@@ -312,6 +324,7 @@ mod tests {
             main_monitor_ids: &["MAIN".to_string()],
             live_monitors: &live,
             saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
         });
 
@@ -320,6 +333,30 @@ mod tests {
             ParkAssignment::AutoSlot { .. }
         ));
         assert_eq!(result.assignments[&b.id], ParkAssignment::Minimized);
+    }
+
+    #[test]
+    fn sub_screen_monitors_are_excluded_from_the_auto_pool() {
+        // The only non-main monitor is reserved by a sub-screen, so an auto
+        // workset has nowhere to park and is minimized rather than dumped onto
+        // the sub (確定仕様 2026-07-22).
+        let live = vec![monitor("MAIN", 0, 1920), monitor("SUB", 1920, 1920)];
+        let saved = vec![saved_monitor("SUB", AutoSplit::One)];
+        let a = auto_workset(0);
+        let worksets = vec![a.clone()];
+
+        let result = allocate_parking(&AllocationInput {
+            worksets: &worksets,
+            current_workset_id: None,
+            fixed_slots: &[],
+            main_monitor_ids: &["MAIN".to_string()],
+            live_monitors: &live,
+            saved_monitors: &saved,
+            sub_screen_monitor_ids: &["SUB".to_string()],
+            previous_assignments: &HashMap::new(),
+        });
+
+        assert_eq!(result.assignments[&a.id], ParkAssignment::Minimized);
     }
 
     #[test]
@@ -345,6 +382,7 @@ mod tests {
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live,
             saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
         });
 
@@ -374,6 +412,7 @@ mod tests {
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live,
             saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
             previous_assignments: &first.new_auto_slot_assignments,
         });
         assert_eq!(second.assignments, first.assignments);
@@ -411,6 +450,7 @@ mod tests {
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live,
             saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
         });
 
@@ -462,6 +502,7 @@ mod tests {
             main_monitor_ids: &["MAIN".to_string()],
             live_monitors: &live,
             saved_monitors: &[],
+            sub_screen_monitor_ids: &[],
             previous_assignments: &HashMap::new(),
         });
 
@@ -497,6 +538,7 @@ mod tests {
             main_monitor_ids: &main_monitor_ids,
             live_monitors: &live,
             saved_monitors: &saved,
+            sub_screen_monitor_ids: &[],
             previous_assignments: &previous,
         });
 

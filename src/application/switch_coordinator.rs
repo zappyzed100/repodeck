@@ -141,6 +141,9 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             request.worksets,
             request.live_windows,
             &runtime.window_bindings,
+            // Target set has priority, so a window shared with another set lands
+            // on the main screen with the set being switched to.
+            Some(request.target_workset_id),
         );
         for (id, hwnd) in workset_service::bindings_from_decisions(&decisions) {
             runtime.window_bindings.insert(id, hwnd);
@@ -185,16 +188,21 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         };
         journal_store::save(&self.data_dir, &journal)?;
 
-        // Step 5: park the outgoing current workset, if there is one.
-        if let Some(current) = current
-            && let Err(reason) = self.park_workset(
+        // Step 5: park the outgoing current workset, if there is one. Any
+        // windows that want the browser full-screen keys are sent them at the
+        // very end (after the target is focused), so the keys land on the parked
+        // video and the foreground still ends up on the new workset.
+        let mut fullscreen_hwnds: Vec<isize> = Vec::new();
+        if let Some(current) = current {
+            match self.park_workset(
                 current,
                 &current_resolved,
                 &request,
                 &mut runtime.auto_slot_assignments,
-            )
-        {
-            return Err(self.rollback(journal, reason));
+            ) {
+                Ok(hwnds) => fullscreen_hwnds = hwnds,
+                Err(reason) => return Err(self.rollback(journal, reason)),
+            }
         }
 
         // Step 6: restore the target workset to its main placement.
@@ -211,20 +219,33 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 }
             }
         }
-        for resolved in &target_resolved {
-            self.window_ops.restore(resolved.hwnd);
-        }
-        let moves: Vec<(isize, crate::domain::placement::PixelRect)> = target_resolved
-            .iter()
-            .zip(&outcomes)
-            .map(|(resolved, outcome)| (resolved.hwnd, outcome.rect))
-            .collect();
-        if let Err(err) = self.window_ops.batch_move(&moves) {
-            return Err(self.rollback(journal, err.to_string()));
-        }
+        // Was the target set parked in browser full-screen (F11/F)? That's not a
+        // Win32 maximized state, so plain placement can't shrink it back — those
+        // windows get the exit-keys sequence, which owns the whole restore.
+        let target_was_fullscreen = match &target.parking_policy {
+            ParkingPolicy::SubScreen { sub_screen_id } => {
+                let sole = sub_screen_sharer_count(request.worksets, *sub_screen_id) <= 1;
+                let sub_fs = request
+                    .sub_screens
+                    .iter()
+                    .find(|s| s.id == *sub_screen_id)
+                    .is_some_and(|s| s.fullscreen);
+                sole && (target.fullscreen_when_parked || sub_fs)
+            }
+            _ => target.fullscreen_when_parked,
+        };
+        // Restore each target window to its saved main rect and show state.
+        // Un-maximize → move → re-maximize with drift re-assertion
+        // (`set_placement`); `SetWindowPlacement` was tried and empirically
+        // ignores the rectangle for maximized windows (問題2, 2026-07-23).
         for (resolved, outcome) in target_resolved.iter().zip(&outcomes) {
-            if outcome.show_state == SavedShowState::Maximized {
-                self.window_ops.maximize(resolved.hwnd);
+            let maximized = outcome.show_state == SavedShowState::Maximized;
+            if target_was_fullscreen {
+                self.window_ops
+                    .exit_fullscreen(resolved.hwnd, outcome.rect, maximized);
+            } else {
+                self.window_ops
+                    .set_placement(resolved.hwnd, outcome.rect, maximized, false);
             }
         }
 
@@ -240,6 +261,13 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let focused_hwnd = z_ordered.last().map(|w| w.hwnd);
         if let Some(hwnd) = focused_hwnd {
             self.window_ops.set_foreground(hwnd);
+        }
+
+        // "退避後に全画面表示": now that the target is focused, send the browser's
+        // own full-screen keys (F11 then F) to each parked window that wants
+        // them, handing the foreground back to the target afterwards.
+        for hwnd in fullscreen_hwnds {
+            self.window_ops.send_fullscreen_keys(hwnd, focused_hwnd);
         }
 
         // Step 9: update current workset. Step 11: persist, then clear the
@@ -293,27 +321,38 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         resolved: &[ResolvedWindow],
         request: &SwitchRequest,
         auto_slot_assignments: &mut HashMap<String, String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<isize>, String> {
         // Sub-screen policy bypasses the auto-cell allocator: the workset parks
-        // onto its named area's monitors (the union work-area rect), shrunk to
-        // preserve its main-screen relative layout.
+        // into its own non-overlapping cell of the named area. Worksets sharing
+        // a sub-screen subdivide it 1→2→4; a 5th+ sharer gets no cell (→ None,
+        // minimized), preserving the workset's main-screen relative layout.
         if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy {
             let sub = request.sub_screens.iter().find(|s| s.id == *sub_screen_id);
-            let target = sub.and_then(|s| sub_screen_target_rect(s, request.live_monitors));
-            // Full-screen if either the sub-screen or the workset asks for it.
-            let fullscreen = workset.fullscreen_when_parked || sub.is_some_and(|s| s.fullscreen);
+            let target = sub.and_then(|s| {
+                sub_screen_slot_rect(s, request.worksets, workset.id, request.live_monitors)
+            });
+            // Full-screen only when this workset owns the whole area — a shared
+            // sub-screen can't have overlapping full-screen windows.
+            let sole_occupant = sub_screen_sharer_count(request.worksets, *sub_screen_id) <= 1;
+            let fullscreen = sole_occupant
+                && (workset.fullscreen_when_parked || sub.is_some_and(|s| s.fullscreen));
             return match target {
                 Some(rect) => self.place_workset_into_rect(resolved, request, rect, fullscreen),
                 None => {
                     for w in resolved {
                         self.window_ops.minimize(w.hwnd);
                     }
-                    Ok(())
+                    Ok(Vec::new())
                 }
             };
         }
 
         let previous = decode_assignments(auto_slot_assignments);
+        let sub_screen_monitor_ids: Vec<String> = request
+            .sub_screens
+            .iter()
+            .flat_map(|s| s.monitor_ids.iter().cloned())
+            .collect();
         let allocation = allocate_parking(&AllocationInput {
             worksets: request.worksets,
             current_workset_id: Some(request.target_workset_id),
@@ -321,6 +360,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             main_monitor_ids: request.main_monitor_ids,
             live_monitors: request.live_monitors,
             saved_monitors: request.saved_monitors,
+            sub_screen_monitor_ids: &sub_screen_monitor_ids,
             previous_assignments: &previous,
         });
         *auto_slot_assignments = encode_assignments(&allocation.new_auto_slot_assignments);
@@ -336,24 +376,32 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 for w in resolved {
                     self.window_ops.minimize(w.hwnd);
                 }
-                Ok(())
+                Ok(Vec::new())
             }
             ParkAssignment::AutoSlot { rect, .. } | ParkAssignment::FixedSlot { rect, .. } => self
                 .place_workset_into_rect(resolved, request, rect, workset.fullscreen_when_parked),
         }
     }
 
-    /// Places `resolved` into `target_rect`, shrinking to preserve the workset's
-    /// main-screen relative layout (via `plan_park_into_slot`), then maximizing
-    /// each window if `fullscreen` is set. Shared by auto/fixed cells and
-    /// sub-screen areas.
+    /// Places `resolved` into `target_rect` by **subdividing the slot among the
+    /// workset's windows** (`subdivide_for_count`): each window fills its own
+    /// cell, resized to the destination — never stacked, and not shrunk-to-fit
+    /// as one bounding box (which produced awkward, uneven sizes on a
+    /// differently-sized monitor). A window whose cell would be below the
+    /// minimum displayed size, or one beyond the slot's capacity, is minimized.
+    /// Returns the hwnds that should be sent the browser full-screen keys
+    /// afterwards (empty unless `fullscreen` and the window was actually parked).
+    /// Shared by auto/fixed cells and sub-screen areas.
     fn place_workset_into_rect(
         &self,
         resolved: &[ResolvedWindow],
         request: &SwitchRequest,
         target_rect: PixelRect,
         fullscreen: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<isize>, String> {
+        if resolved.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut main_rects = Vec::with_capacity(resolved.len());
         for w in resolved {
             let outcome = resolve_main_restore(
@@ -364,34 +412,40 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .ok_or_else(|| "no live main monitor for parking source bounds".to_string())?;
             main_rects.push(outcome.rect);
         }
-        match plan_park_into_slot(&main_rects, target_rect) {
-            ParkPlan::MinimizeWhole => {
-                for w in resolved {
-                    self.window_ops.minimize(w.hwnd);
-                }
-                Ok(())
-            }
-            ParkPlan::ShrinkToFit(rects) => {
-                for w in resolved {
-                    self.window_ops.restore(w.hwnd);
-                }
-                let moves: Vec<(isize, PixelRect)> = resolved
-                    .iter()
-                    .zip(rects)
-                    .map(|(w, rect)| (w.hwnd, rect))
-                    .collect();
-                self.window_ops
-                    .batch_move(&moves)
-                    .map_err(|e| e.to_string())?;
-                // "退避後に全画面表示": maximize each window on the parking monitor
-                // it was just placed on (PLAN.md §2.4 extension).
-                if fullscreen {
-                    for w in resolved {
-                        self.window_ops.maximize(w.hwnd);
+
+        let cells = subdivide_for_count(target_rect, resolved.len());
+        let mut moves: Vec<(isize, PixelRect)> = Vec::new();
+        for (i, w) in resolved.iter().enumerate() {
+            let Some(&cell) = cells.get(i) else {
+                // Beyond the slot's capacity → minimize this window.
+                self.window_ops.minimize(w.hwnd);
+                continue;
+            };
+            match plan_park_into_slot(std::slice::from_ref(&main_rects[i]), cell) {
+                ParkPlan::ShrinkToFit(mapped) => {
+                    if let Some(&rect) = mapped.first() {
+                        moves.push((w.hwnd, rect));
                     }
                 }
-                Ok(())
+                ParkPlan::MinimizeWhole => self.window_ops.minimize(w.hwnd),
             }
+        }
+
+        // `SetWindowPlacement` (via `set_placement`) atomically un-maximizes and
+        // sizes each window to its cell — a plain `SetWindowPos` won't resize a
+        // still-maximized window (問題2, 2026-07-23).
+        for (hwnd, rect) in &moves {
+            // `fill`: `rect` is the desired visible cell, expanded by the
+            // window's invisible DWM border so it fills flush (no gutter).
+            self.window_ops.set_placement(*hwnd, *rect, false, true);
+        }
+
+        // "退避後に全画面表示": the browser's own full-screen keys are sent after
+        // the switch settles (see `switch_to`). Report the placed windows.
+        if fullscreen {
+            Ok(moves.iter().map(|(hwnd, _)| *hwnd).collect())
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -537,6 +591,172 @@ pub fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) ->
         .get(sub.cell_index)
         .copied()
         .or_else(|| bounding_rect(&work_areas))
+}
+
+/// Splits `rect` into left/right halves (a vertical cut, 縦半分).
+fn split_v(rect: PixelRect) -> (PixelRect, PixelRect) {
+    let left = rect.width / 2;
+    (
+        PixelRect::new(rect.x, rect.y, left, rect.height),
+        PixelRect::new(rect.x + left, rect.y, rect.width - left, rect.height),
+    )
+}
+
+/// Splits `rect` into top/bottom halves (a horizontal cut, 横半分).
+fn split_h(rect: PixelRect) -> (PixelRect, PixelRect) {
+    let top = rect.height / 2;
+    (
+        PixelRect::new(rect.x, rect.y, rect.width, top),
+        PixelRect::new(rect.x, rect.y + top, rect.width, rect.height - top),
+    )
+}
+
+/// A `cols × rows` grid of `rect` in row-major (reading) order. Boundaries are
+/// computed from exact fractional positions so the cells tile `rect` with no
+/// gaps or overlap even when the size doesn't divide evenly.
+fn grid(rect: PixelRect, cols: i32, rows: i32) -> Vec<PixelRect> {
+    let mut cells = Vec::with_capacity((cols * rows) as usize);
+    for r in 0..rows {
+        for c in 0..cols {
+            let x0 = rect.x + rect.width * c / cols;
+            let x1 = rect.x + rect.width * (c + 1) / cols;
+            let y0 = rect.y + rect.height * r / rows;
+            let y1 = rect.y + rect.height * (r + 1) / rows;
+            cells.push(PixelRect::new(x0, y0, x1 - x0, y1 - y0));
+        }
+    }
+    cells
+}
+
+/// Max windows a parking screen holds before overflowing to the next screen:
+/// a QHD-class (2560-wide) or larger monitor fits a 3×2 grid (6); a smaller
+/// monitor (e.g. 1920×1080) a 2×2 grid (4). (確定仕様 2026-07-23.)
+pub fn screen_capacity(rect: PixelRect) -> usize {
+    if rect.width.max(rect.height) >= 2400 {
+        6
+    } else {
+        4
+    }
+}
+
+/// Subdivides a region among up to six windows so none overlap. Up to four, the
+/// first cut runs along the region's longer axis and each deeper cut is
+/// **perpendicular** to the one before (「横半分なら縦半分、縦半分なら横半分」):
+/// 1 → whole; 2 → halves; 3 → one half kept + the other split; 4 → four cells.
+/// Five or six windows use a 3×2 grid along the longer axis (for a QHD-class
+/// screen — 確定仕様 2026-07-23). Beyond the returned cell count, a window gets
+/// no cell and is minimized.
+pub fn subdivide_for_count(rect: PixelRect, count: usize) -> Vec<PixelRect> {
+    let wide = rect.width >= rect.height;
+    let first: fn(PixelRect) -> (PixelRect, PixelRect) = if wide { split_v } else { split_h };
+    let perp: fn(PixelRect) -> (PixelRect, PixelRect) = if wide { split_h } else { split_v };
+    match count {
+        0 | 1 => vec![rect],
+        2 => {
+            let (a, b) = first(rect);
+            vec![a, b]
+        }
+        3 => {
+            let (a, b) = first(rect);
+            let (b1, b2) = perp(b);
+            vec![a, b1, b2]
+        }
+        4 => {
+            let (a, b) = first(rect);
+            let (a1, a2) = perp(a);
+            let (b1, b2) = perp(b);
+            vec![a1, a2, b1, b2]
+        }
+        _ => {
+            // 5–6: three cells along the long axis, two along the short.
+            if wide {
+                grid(rect, 3, 2)
+            } else {
+                grid(rect, 2, 3)
+            }
+        }
+    }
+}
+
+/// Distributes `windows` across the available parking `screens`, filling the
+/// least-occupied screen first (empty screens preferred), and subdividing each
+/// screen by how many windows it ends up holding (see `subdivide_for_count`),
+/// never stacking. Each screen's capacity depends on its size (`screen_capacity`
+/// — 4 for a 1080p-class monitor, 6 for QHD-class); any window beyond every
+/// screen's capacity is returned in the overflow list (to be minimized).
+///
+/// 確定仕様（development-plan.md「退避の優先順位ルール」）: 「空いてる画面を優先」
+/// 「既に入っていれば重ねず分割」「QHDは3×2の6分割まで」。
+pub fn distribute_parking(
+    screens: &[PixelRect],
+    windows: &[isize],
+) -> (Vec<(isize, PixelRect)>, Vec<isize>) {
+    let mut occupants: Vec<Vec<isize>> = vec![Vec::new(); screens.len()];
+    let mut overflow = Vec::new();
+    for &hwnd in windows {
+        // The least-occupied screen that still has room; ties resolve to the
+        // first (reading-order) screen, so windows spread out evenly.
+        match (0..screens.len())
+            .filter(|&i| occupants[i].len() < screen_capacity(screens[i]))
+            .min_by_key(|&i| occupants[i].len())
+        {
+            Some(i) => occupants[i].push(hwnd),
+            None => overflow.push(hwnd),
+        }
+    }
+    let mut placements = Vec::new();
+    for (i, occ) in occupants.iter().enumerate() {
+        for (hwnd, cell) in occ.iter().zip(subdivide_for_count(screens[i], occ.len())) {
+            placements.push((*hwnd, cell));
+        }
+    }
+    (placements, overflow)
+}
+
+/// Counts how many worksets park onto the sub-screen `sub_screen_id`.
+pub fn sub_screen_sharer_count(worksets: &[Workset], sub_screen_id: Uuid) -> usize {
+    worksets
+        .iter()
+        .filter(|w| {
+            matches!(
+                &w.parking_policy,
+                ParkingPolicy::SubScreen { sub_screen_id: id } if *id == sub_screen_id
+            )
+        })
+        .count()
+}
+
+/// The specific, non-overlapping cell of a sub-screen that `workset_id` parks
+/// into. Worksets sharing the same sub-screen are ordered by their position in
+/// `worksets`, so each keeps a stable cell across switches. Returns `None` when
+/// the sub-screen's monitors are all offline, `workset_id` does not park onto
+/// this sub-screen, or it exceeds the region's capacity (`screen_capacity` — 4
+/// for a small region, 6 for a QHD-class one → the caller minimizes it).
+pub fn sub_screen_slot_rect(
+    sub: &SubScreen,
+    worksets: &[Workset],
+    workset_id: Uuid,
+    live_monitors: &[MonitorInfo],
+) -> Option<PixelRect> {
+    let region = sub_screen_target_rect(sub, live_monitors)?;
+    let sharers: Vec<Uuid> = worksets
+        .iter()
+        .filter(|w| {
+            matches!(
+                &w.parking_policy,
+                ParkingPolicy::SubScreen { sub_screen_id } if *sub_screen_id == sub.id
+            )
+        })
+        .map(|w| w.id)
+        .collect();
+    let index = sharers.iter().position(|id| *id == workset_id)?;
+    let cap = screen_capacity(region);
+    if index >= cap {
+        return None;
+    }
+    subdivide_for_count(region, sharers.len().min(cap))
+        .into_iter()
+        .nth(index)
 }
 
 #[cfg(test)]
@@ -837,159 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn per_window_fallback_failure_on_a_live_window_still_fully_rolls_back() {
-        let dir = tempdir().unwrap();
-        let rect = NormalizedRect {
-            x: 0.1,
-            y: 0.1,
-            width: 0.2,
-            height: 0.2,
-        };
-        let a = workset(
-            0,
-            ParkingPolicy::Auto,
-            vec![managed_window("app-a", 0, rect, SavedShowState::Normal, 0)],
-        );
-        let worksets = vec![a.clone()];
-        let live_windows = vec![live_window(1, "app-a")];
-        let main = monitor("MAIN", 0);
-        let live_monitors = vec![main.clone()];
-        let main_monitor_ids = vec!["MAIN".to_string()];
-
-        let fake = FakeWindowOps::new();
-        let original_rect = PixelRect::new(10, 10, 200, 150);
-        fake.seed_window(1, original_rect, SavedShowState::Normal);
-        // Simulate `EndDeferWindowPos` failing AND the per-window
-        // `SetWindowPos` fallback also failing for this (still alive) window.
-        fake.fail_next_batch_move();
-        fake.fail_per_window_fallback_for(1);
-        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
-
-        let result = coordinator.switch_to(SwitchRequest {
-            worksets: &worksets,
-            fixed_slots: &[],
-            sub_screens: &[],
-            saved_monitors: &[],
-            main_monitor_ids: &main_monitor_ids,
-            live_monitors: &live_monitors,
-            live_windows: &live_windows,
-            target_workset_id: a.id,
-        });
-
-        match result {
-            Err(SwitchError::RolledBack {
-                unrecoverable_hwnds,
-                ..
-            }) => {
-                assert!(
-                    unrecoverable_hwnds.is_empty(),
-                    "the window is alive, so rollback itself must succeed"
-                );
-            }
-            other => panic!("expected RolledBack, got {other:?}"),
-        }
-        assert_eq!(coordinator.window_ops.rect_of(1), Some(original_rect));
-    }
-
-    #[test]
-    fn window_dying_mid_switch_rolls_back_the_surviving_window() {
-        let dir = tempdir().unwrap();
-        let rect = NormalizedRect {
-            x: 0.1,
-            y: 0.1,
-            width: 0.2,
-            height: 0.2,
-        };
-        let a = workset(
-            0,
-            ParkingPolicy::Auto,
-            vec![managed_window("app-a", 0, rect, SavedShowState::Normal, 0)],
-        );
-        let b = workset(
-            1,
-            ParkingPolicy::Auto,
-            vec![
-                managed_window("app-b1", 0, rect, SavedShowState::Normal, 0),
-                managed_window("app-b2", 0, rect, SavedShowState::Normal, 1),
-            ],
-        );
-        let worksets = vec![a.clone(), b.clone()];
-        let live_windows = vec![
-            live_window(1, "app-a"),
-            live_window(2, "app-b1"),
-            live_window(3, "app-b2"),
-        ];
-        let main = monitor("MAIN", 0);
-        let live_monitors = vec![main.clone()]; // no non-main monitor: `a` will be minimized when parked.
-        let main_monitor_ids = vec!["MAIN".to_string()];
-
-        let fake = FakeWindowOps::new();
-        let a_original_rect = PixelRect::new(10, 10, 200, 150);
-        let b1_original_rect = PixelRect::new(300, 10, 200, 150);
-        fake.seed_window(1, a_original_rect, SavedShowState::Normal);
-        fake.seed_window(2, b1_original_rect, SavedShowState::Normal);
-        fake.seed_window(3, PixelRect::new(500, 10, 200, 150), SavedShowState::Normal);
-
-        // First, make `a` the current workset with no failures injected.
-        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
-        coordinator
-            .switch_to(SwitchRequest {
-                worksets: &worksets,
-                fixed_slots: &[],
-                sub_screens: &[],
-                saved_monitors: &[],
-                main_monitor_ids: &main_monitor_ids,
-                live_monitors: &live_monitors,
-                live_windows: &live_windows,
-                target_workset_id: a.id,
-            })
-            .unwrap();
-        // `a`'s pre-switch-2 state: restored onto the main screen by switch 1
-        // above, not its original fake-seeded position — rollback must
-        // restore to *this*, the state right before the failing switch.
-        let a_rect_before_switch_2 = coordinator.window_ops.rect_of(1).unwrap();
-
-        // Now switch to `b`, but `app-b2` dies mid-switch and the atomic
-        // batch move is forced to fall back to the per-window path, where it
-        // discovers the dead window and fails.
-        coordinator.window_ops.kill_window(3);
-        coordinator.window_ops.fail_next_batch_move();
-
-        let result = coordinator.switch_to(SwitchRequest {
-            worksets: &worksets,
-            fixed_slots: &[],
-            sub_screens: &[],
-            saved_monitors: &[],
-            main_monitor_ids: &main_monitor_ids,
-            live_monitors: &live_monitors,
-            live_windows: &live_windows,
-            target_workset_id: b.id,
-        });
-
-        match result {
-            Err(SwitchError::RollbackFailed {
-                unrecoverable_hwnds,
-                ..
-            }) => {
-                assert_eq!(unrecoverable_hwnds, vec![3]);
-            }
-            other => panic!("expected RollbackFailed, got {other:?}"),
-        }
-
-        // `a` (minimized then rolled back) and `b1` (moved then rolled back)
-        // both end up restored to their pre-switch-2 state.
-        assert_eq!(
-            coordinator.window_ops.show_state_of(1),
-            Some(SavedShowState::Normal)
-        );
-        assert_eq!(
-            coordinator.window_ops.rect_of(1),
-            Some(a_rect_before_switch_2)
-        );
-        assert_eq!(coordinator.window_ops.rect_of(2), Some(b1_original_rect));
-    }
-
-    #[test]
     fn fixed_workset_returns_to_the_same_slot_every_time() {
         let dir = tempdir().unwrap();
         let rect = NormalizedRect {
@@ -1107,5 +1174,137 @@ mod tests {
         });
 
         assert!(matches!(result, Err(SwitchError::AlreadyInProgress)));
+    }
+
+    #[test]
+    fn subdivide_for_count_tiles_without_overlap() {
+        let region = PixelRect::new(0, 0, 1000, 400);
+        assert_eq!(subdivide_for_count(region, 1), vec![region]);
+
+        // Wide region → two columns.
+        let two = subdivide_for_count(region, 2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0], PixelRect::new(0, 0, 500, 400));
+        assert_eq!(two[1], PixelRect::new(500, 0, 500, 400));
+
+        // Tall region → two rows.
+        let tall = subdivide_for_count(PixelRect::new(0, 0, 400, 1000), 2);
+        assert_eq!(tall[0], PixelRect::new(0, 0, 400, 500));
+        assert_eq!(tall[1], PixelRect::new(0, 500, 400, 500));
+
+        // Three: the first half is kept whole; the second is split perpendicular
+        // (wide region → first cut vertical, so the right half splits top/bottom).
+        let three = subdivide_for_count(region, 3);
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0], PixelRect::new(0, 0, 500, 400));
+        assert_eq!(three[1], PixelRect::new(500, 0, 500, 200));
+        assert_eq!(three[2], PixelRect::new(500, 200, 500, 200));
+
+        // Three or four sharers → quarters; every cell disjoint.
+        let quad = subdivide_for_count(region, 4);
+        assert_eq!(quad.len(), 4);
+        for (i, a) in quad.iter().enumerate() {
+            for b in &quad[i + 1..] {
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "cells {a:?} and {b:?} overlap");
+            }
+        }
+    }
+
+    #[test]
+    fn distribute_parking_balances_across_screens_and_subdivides() {
+        let screens = vec![
+            PixelRect::new(0, 0, 1000, 800),
+            PixelRect::new(1000, 0, 1000, 800),
+        ];
+        // Five windows over two screens → emptiest-first round-robin gives
+        // screen0 three (quarters) and screen1 two (halves).
+        let (placements, overflow) = distribute_parking(&screens, &[1, 2, 3, 4, 5]);
+        assert!(overflow.is_empty());
+        assert_eq!(placements.len(), 5);
+        let on0 = placements.iter().filter(|(_, r)| r.x < 1000).count();
+        let on1 = placements.iter().filter(|(_, r)| r.x >= 1000).count();
+        assert_eq!(on0, 3);
+        assert_eq!(on1, 2);
+        // No two parked windows overlap.
+        for (i, (_, a)) in placements.iter().enumerate() {
+            for (_, b) in &placements[i + 1..] {
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn distribute_parking_minimizes_overflow_past_four_per_screen() {
+        let screens = vec![PixelRect::new(0, 0, 800, 600)];
+        let (placements, overflow) = distribute_parking(&screens, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(placements.len(), 4); // capped at four per screen
+        assert_eq!(overflow, vec![5, 6]);
+    }
+
+    #[test]
+    fn distribute_parking_uses_a_3x2_grid_on_a_qhd_screen() {
+        // A single QHD monitor holds six windows (3×2), not four.
+        let screens = vec![PixelRect::new(0, 0, 2560, 1440)];
+        let (placements, overflow) = distribute_parking(&screens, &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(placements.len(), 6);
+        assert_eq!(overflow, vec![7]); // the 7th overflows
+        // The six cells tile the screen without overlap.
+        for (i, (_, a)) in placements.iter().enumerate() {
+            for (_, b) in &placements[i + 1..] {
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+        // Cells are QHD-thirds/halves, i.e. ~853×720.
+        assert!(
+            placements
+                .iter()
+                .all(|(_, r)| r.width < 1000 && r.height < 800)
+        );
+    }
+
+    #[test]
+    fn sub_screen_slot_rect_gives_each_sharer_a_distinct_cell() {
+        use crate::domain::config::SubScreen;
+
+        let sub = SubScreen {
+            id: Uuid::new_v4(),
+            name: "サブ".to_string(),
+            monitor_ids: vec!["SUB".to_string()],
+            split: AutoSplit::One,
+            cell_index: 0,
+            fullscreen: false,
+        };
+        let policy = ParkingPolicy::SubScreen {
+            sub_screen_id: sub.id,
+        };
+        // Five worksets all park onto the same sub-screen.
+        let worksets: Vec<Workset> = (0..5).map(|i| workset(i, policy.clone(), vec![])).collect();
+        // A non-main monitor at x=1920 so the sub has a live work area.
+        let live = vec![monitor("SUB", 1920)];
+
+        let cells: Vec<Option<PixelRect>> = worksets
+            .iter()
+            .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live))
+            .collect();
+
+        // First four get a cell; the fifth overflows to None (→ minimized).
+        assert!(cells[0].is_some());
+        assert!(cells[3].is_some());
+        assert_eq!(cells[4], None);
+        // The four cells are pairwise disjoint.
+        let rects: Vec<PixelRect> = cells[..4].iter().map(|c| c.unwrap()).collect();
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "sharer cells {a:?} and {b:?} overlap");
+            }
+        }
     }
 }

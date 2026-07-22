@@ -1,12 +1,13 @@
 //! Reading and changing a single window's placement, plus batched moves
 //! (PLAN.md §4.5 `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`).
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, HDWP, HWND_TOP,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WINDOWPLACEMENT,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, GetWindowRect,
+    HDWP, HWND_TOP, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowPos, ShowWindow, WINDOWPLACEMENT,
 };
 
 use crate::domain::placement::{PixelRect, SavedShowState};
@@ -71,6 +72,164 @@ pub fn set_window_rect(hwnd: HWND, rect: PixelRect) -> Result<(), WindowError> {
     .map_err(|e| WindowError::win32("SetWindowPos", e))
 }
 
+/// The window's *visible* on-screen bounds — `GetWindowRect` minus the
+/// invisible DWM frame (drop-shadow / resize border, ~7px on Chromium/most
+/// apps). `None` if the window is gone or DWM has no answer.
+fn visible_bounds(hwnd: HWND) -> Option<PixelRect> {
+    let mut r = RECT::default();
+    // SAFETY: `hwnd` may be stale; the call just fails then.
+    if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            std::ptr::from_mut(&mut r).cast(),
+            u32::try_from(std::mem::size_of::<RECT>()).unwrap_or(0),
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    Some(PixelRect::new(
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+    ))
+}
+
+/// The invisible DWM frame margins `(left, top, right, bottom)` of `hwnd`: how
+/// far the real window frame (`GetWindowRect`) extends *beyond* its visible
+/// bounds on each edge. To make a window's *visible* area exactly fill a cell,
+/// expand the cell by these margins before `SetWindowPos` — otherwise adjacent
+/// flush cells leave a ~2×border gap (verified against a hand-snapped layout,
+/// 2026-07-23: a "half" cell of 960 needs a 974 frame, offset −7/+7).
+fn frame_margins(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut frame = RECT::default();
+    // SAFETY: `hwnd` may be stale; the call just fails then.
+    if unsafe { GetWindowRect(hwnd, &mut frame) }.is_err() {
+        return (0, 0, 0, 0);
+    }
+    let Some(v) = visible_bounds(hwnd) else {
+        return (0, 0, 0, 0);
+    };
+    (
+        v.x - frame.left,
+        v.y - frame.top,
+        frame.right - v.right(),
+        frame.bottom - v.bottom(),
+    )
+}
+
+/// Moves `hwnd` to `rect` or maximizes it on `rect`'s monitor, reliably even
+/// when the window is currently maximized on another monitor. When `fill` is
+/// set, `rect` is treated as the desired *visible* area and the window's frame
+/// is expanded by its invisible DWM margins so the visible content fills `rect`
+/// edge-to-edge (used for parking cells); otherwise `rect` is the frame rect
+/// (used to restore a saved main placement).
+///
+/// Implementation notes (empirically verified, 2026-07-23): `SetWindowPlacement`
+/// with a new `rcNormalPosition` is *ignored* for a currently-maximized window,
+/// so the working sequence is un-maximize (without activating) → `SetWindowPos`
+/// → optionally re-maximize. Some apps (Chromium: VS Code, Brave) re-assert
+/// their own remembered bounds asynchronously, so a background thread re-applies
+/// until it sticks.
+pub fn set_placement(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) {
+    apply_placement(hwnd, rect, maximized, fill);
+
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        // Long tail (≈6.5s cumulative): a browser leaving F11 full-screen
+        // restores its own remembered bounds noticeably after our first apply,
+        // so keep winning the race until it stops re-asserting.
+        for delay_ms in [300u64, 500, 700, 1000, 1500, 2500] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let hwnd = HWND(raw as *mut _);
+            match placement_settled(hwnd, rect, maximized, fill) {
+                None => break, // window is gone; nothing left to do
+                Some(true) => break,
+                Some(false) => {
+                    // App re-asserted its own bounds after our apply; re-apply
+                    // to keep winning the race until it settles.
+                    apply_placement(hwnd, rect, maximized, fill);
+                }
+            }
+        }
+    });
+}
+
+/// One pass of the working sequence: leave maximized/minimized state without
+/// stealing focus, apply the rectangle (expanded to fill if `fill`), then
+/// re-maximize if asked.
+fn apply_placement(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) {
+    if get_show_state(hwnd).is_ok_and(|s| s != SavedShowState::Normal) {
+        // SW_SHOWNOACTIVATE leaves maximized/minimized for the normal state
+        // without activating (SW_RESTORE would steal focus on every re-apply).
+        // SAFETY: `hwnd` is a live handle.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    }
+    let target = if fill && !maximized {
+        let (ml, mt, mr, mb) = frame_margins(hwnd);
+        PixelRect::new(
+            rect.x - ml,
+            rect.y - mt,
+            rect.width + ml + mr,
+            rect.height + mt + mb,
+        )
+    } else {
+        rect
+    };
+    let _ = set_window_rect(hwnd, target);
+    if maximized {
+        // SAFETY: `hwnd` is a live handle.
+        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    }
+}
+
+/// Whether the window currently matches the requested placement. `None` when
+/// the window no longer exists.
+fn placement_settled(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) -> Option<bool> {
+    let mut frame = RECT::default();
+    // SAFETY: `hwnd` may be stale; GetWindowRect just fails in that case.
+    if unsafe { GetWindowRect(hwnd, &mut frame) }.is_err() {
+        return None;
+    }
+    if maximized {
+        // Close enough = maximized on the right monitor (centers roughly agree).
+        let (cx, cy) = (
+            (frame.left + frame.right) / 2,
+            (frame.top + frame.bottom) / 2,
+        );
+        let (tx, ty) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+        let on_target_monitor = (cx - tx).abs() < 800 && (cy - ty).abs() < 600;
+        Some(
+            on_target_monitor && get_show_state(hwnd).is_ok_and(|s| s == SavedShowState::Maximized),
+        )
+    } else {
+        // `fill` compares the *visible* bounds against the cell; otherwise the
+        // frame rect against the saved rect. Tolerances absorb rounding.
+        let actual = if fill {
+            match visible_bounds(hwnd) {
+                Some(v) => v,
+                None => return Some(false),
+            }
+        } else {
+            PixelRect::new(
+                frame.left,
+                frame.top,
+                frame.right - frame.left,
+                frame.bottom - frame.top,
+            )
+        };
+        Some(
+            (actual.x - rect.x).abs() < 24
+                && (actual.y - rect.y).abs() < 24
+                && (actual.width - rect.width).abs() < 48
+                && (actual.height - rect.height).abs() < 48,
+        )
+    }
+}
+
 /// Restores `hwnd` from maximized/minimized to its normal state, without activating it.
 pub fn restore(hwnd: HWND) {
     // SAFETY: `hwnd` is a live handle. `ShowWindow`'s return value reports the
@@ -79,7 +238,7 @@ pub fn restore(hwnd: HWND) {
     let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
 }
 
-/// Maximizes `hwnd`.
+/// Maximizes `hwnd` on whichever monitor its restored position currently sits.
 pub fn maximize(hwnd: HWND) {
     // SAFETY: see `restore`.
     let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };

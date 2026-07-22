@@ -32,11 +32,22 @@ use super::protocol::MAX_EVENT_BYTES;
 /// Exact pipe name Codex hooks / `repodeck-hook.exe` target (PLAN.md §6.4).
 pub const PIPE_NAME: &str = r"\\.\pipe\RepoDeck.AgentEvents.v1";
 
-/// Owner-only DACL: one Allow ACE, generic-all, to the Owner Rights
-/// placeholder SID — no Everyone, no other users, no built-in groups. A
-/// process running as SYSTEM/an admin can still bypass any DACL; that's a
-/// Windows platform constant, not a gap in this design.
-const PIPE_SDDL: &str = "D:P(A;;GA;;;OW)";
+/// Pipe security allowing the non-elevated hook to reach an elevated server.
+///
+/// `repodeck.exe` self-elevates (see `windowing::elevation`), but Codex spawns
+/// `repodeck-hook.exe` non-elevated (medium integrity). Two things would then
+/// block the hook from writing to this pipe:
+///   1. An owner-only DACL — an elevated process's owner is often the
+///      Administrators group, not the interactive user, so the medium hook
+///      would not match it. We grant Authenticated Users instead.
+///   2. The object's mandatory integrity — created by a high-integrity process
+///      it defaults to High, and the default "no write up" policy blocks the
+///      medium hook. We stamp a Low integrity label so any user process can
+///      write.
+///
+/// The events are already untrusted input that the server validates, and this
+/// is a single-user desktop tool, so widening write access here is acceptable.
+const PIPE_SDDL: &str = "D:P(A;;GA;;;AU)S:(ML;;NW;;;LW)";
 
 const MAX_PIPE_INSTANCES: u32 = 16;
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;

@@ -13,7 +13,28 @@ pub trait WindowOps {
     fn get_normal_rect(&self, hwnd: isize) -> Result<PixelRect, WindowError>;
     fn restore(&self, hwnd: isize);
     fn maximize(&self, hwnd: isize);
+
+    /// Places `hwnd` at `rect` (or maximized on `rect`'s monitor), reliably even
+    /// when it is currently maximized elsewhere. When `fill` is set, `rect` is
+    /// the desired *visible* area and the frame is expanded by the window's
+    /// invisible DWM margins so the visible content fills it edge-to-edge (for
+    /// parking cells); otherwise `rect` is the frame rect (restoring a saved main
+    /// placement). See `windowing::placement::set_placement`.
+    fn set_placement(&self, hwnd: isize, rect: PixelRect, maximized: bool, fill: bool);
     fn minimize(&self, hwnd: isize);
+
+    /// Sends the browser's own full-screen keys (`F11` then `F`) to a parked
+    /// window so a video fills the screen ("退避後に全画面表示"), momentarily
+    /// focusing it and then handing the foreground back to `refocus`. Best-effort
+    /// and asynchronous — see `windowing::key_input::send_fullscreen_keys`.
+    fn send_fullscreen_keys(&self, hwnd: isize, refocus: Option<isize>);
+
+    /// Exits a browser full-screen (reverse keys) and places `hwnd` at
+    /// `restore_rect` (maximized there if `maximized`), for a full-screen-parked
+    /// window returning to the main screen (`SW_RESTORE` can't undo a page/video
+    /// full-screen). Best-effort and asynchronous — see
+    /// `windowing::key_input::send_exit_fullscreen_keys`.
+    fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool);
 
     /// Atomic batch move (PLAN.md §4.5). Implementations fall back to
     /// per-window moves if the atomic path fails, per §4.5's documented
@@ -86,23 +107,10 @@ pub(crate) mod fake {
             );
         }
 
-        /// Simulates the window closing mid-switch.
-        pub(crate) fn kill_window(&self, hwnd: isize) {
-            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
-                state.alive = false;
-            }
-        }
-
         /// The next `batch_move` call falls back to the per-window path,
         /// simulating an `EndDeferWindowPos` failure.
         pub(crate) fn fail_next_batch_move(&self) {
             *self.fail_next_batch_move.borrow_mut() = true;
-        }
-
-        /// The per-window fallback also fails for `hwnd` (simulating
-        /// `SetWindowPos` itself failing once the batch path already has).
-        pub(crate) fn fail_per_window_fallback_for(&self, hwnd: isize) {
-            self.fail_per_window_fallback_for.borrow_mut().push(hwnd);
         }
 
         pub(crate) fn rect_of(&self, hwnd: isize) -> Option<PixelRect> {
@@ -145,6 +153,27 @@ pub(crate) mod fake {
             if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
                 state.show_state = SavedShowState::Maximized;
             }
+        }
+
+        fn set_placement(&self, hwnd: isize, rect: PixelRect, maximized: bool, _fill: bool) {
+            if let Some(state) = self.windows.borrow_mut().get_mut(&hwnd) {
+                state.rect = rect;
+                state.show_state = if maximized {
+                    SavedShowState::Maximized
+                } else {
+                    SavedShowState::Normal
+                };
+            }
+        }
+
+        fn send_fullscreen_keys(&self, _hwnd: isize, _refocus: Option<isize>) {
+            // Key synthesis isn't modeled by the fake; nothing to assert.
+        }
+
+        fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool) {
+            // Modeled as an immediate placement so restore tests still observe
+            // the final state; the key synthesis itself isn't modeled.
+            self.set_placement(hwnd, restore_rect, maximized, false);
         }
 
         fn minimize(&self, hwnd: isize) {

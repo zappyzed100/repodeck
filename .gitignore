@@ -1,2 +1,5 @@
 /target/
 /dist/
+
+# tracing daily rolling logs (repodeck.YYYY-MM-DD)
+/repodeck.20*-*-*

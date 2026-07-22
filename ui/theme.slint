@@ -161,16 +161,21 @@ export component StatusBanner inherits Rectangle {
     in property <bool> is-warning: false;
 
     visible: root.text != "";
-    height: root.text != "" ? 34px : 0px;
+    // Grows to fit wrapped text instead of clipping a long error to one line;
+    // `clip` still guards against any spill past the pill's rounded corners.
+    height: root.text != "" ? row.preferred-height : 0px;
+    clip: true;
     border-radius: Theme.radius-md;
     background: root.is-warning ? rgba(255, 69, 58, 0.16) : rgba(48, 209, 88, 0.16);
     border-width: 1px;
     border-color: root.is-warning ? Theme.danger : Theme.success;
     animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
 
-    HorizontalLayout {
+    row := HorizontalLayout {
         padding-left: Theme.space-sm;
         padding-right: Theme.space-sm;
+        padding-top: 8px;
+        padding-bottom: 8px;
         spacing: Theme.space-sm;
         alignment: start;
 
@@ -179,7 +184,7 @@ export component StatusBanner inherits Rectangle {
             Rectangle {
                 width: 10px;
                 height: 10px;
-                y: (parent.height - self.height) / 2;
+                y: 4px;
                 border-radius: 5px;
                 background: root.is-warning ? Theme.danger : Theme.success;
             }
@@ -190,7 +195,6 @@ export component StatusBanner inherits Rectangle {
             font-size: 13px;
             font-weight: 600;
             color: root.is-warning ? Theme.danger : Theme.success;
-            vertical-alignment: center;
             wrap: word-wrap;
             horizontal-stretch: 1;
         }

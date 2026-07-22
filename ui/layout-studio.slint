@@ -59,10 +59,14 @@ export component LayoutStudio inherits Window {
     // window's real size after a user resize/maximize, so `canvas-frame`
     // below (and everything else) stays pinned at 1000x680 in a corner of
     // the larger OS window instead of actually filling it.
-    preferred-width: 1200px;
-    preferred-height: 800px;
-    min-width: 900px;
-    min-height: 640px;
+    // Opens large enough to show every element without scrolling (the content's
+    // natural size is ~940×780 — see the ScrollView's viewport minimums below).
+    preferred-width: 1240px;
+    preferred-height: 860px;
+    // Lowered so the window can shrink below the content's natural size; the
+    // content is wrapped in a ScrollView (below) that then shows scrollbars.
+    min-width: 560px;
+    min-height: 440px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -115,14 +119,30 @@ export component LayoutStudio inherits Window {
         border-color: Theme.hairline-bright;
     }
 
-    VerticalLayout {
-        padding: Theme.space-md;
-        spacing: Theme.space-sm;
+    // Wraps all content so it can scroll (both axes) when the window is smaller
+    // than the content's natural size. `viewport-*` is max(visible, a content
+    // minimum): the content fills the window when there's room, and stays at
+    // its minimum (scrollbars appear) when the window is smaller.
+    content-scroll := ScrollView {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        // The content's natural size — the window opens at least this big, and
+        // shrinking below it reveals the scrollbars rather than clipping.
+        viewport-width: max(self.visible-width, 940px);
+        viewport-height: max(self.visible-height, 780px);
 
-        // --- Toolbar ---
-        HorizontalLayout {
-            spacing: Theme.space-xs;
-            height: 36px;
+        VerticalLayout {
+            width: content-scroll.viewport-width;
+            height: content-scroll.viewport-height;
+            padding: Theme.space-md;
+            spacing: Theme.space-sm;
+
+            // --- Toolbar ---
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                height: 36px;
 
             GlassButton {
                 text: "モニター一覧を更新";
@@ -215,7 +235,7 @@ export component LayoutStudio inherits Window {
                     // see the comment on `LayoutStudio` above), so the window
                     // would visibly resize every time the selection changes.
                     Rectangle {
-                        height: 460px;
+                        height: 540px;
                         if root.selected-has-monitor: VerticalLayout {
                             spacing: Theme.space-sm;
                             alignment: start;
@@ -287,16 +307,17 @@ export component LayoutStudio inherits Window {
                                 wrap: word-wrap;
                             }
                             ScrollView {
-                                height: 170px;
+                                height: 200px;
                                 VerticalLayout {
                                     spacing: Theme.space-xs;
                                     for sub[i] in root.sub-screen-rows: Rectangle {
-                                        height: 50px;
+                                        height: 90px;
+                                        clip: true;
                                         border-radius: Theme.radius-sm;
                                         background: Theme.glass-panel-soft;
                                         VerticalLayout {
-                                            padding: 4px;
-                                            spacing: 2px;
+                                            padding: 6px;
+                                            spacing: 4px;
                                             HorizontalLayout {
                                                 spacing: Theme.space-xs;
                                                 GlassCheckbox {
@@ -319,7 +340,6 @@ export component LayoutStudio inherits Window {
                                             }
                                             HorizontalLayout {
                                                 spacing: Theme.space-xs;
-                                                Text { text: "領域"; font-size: 10px; color: Theme.text-tertiary; vertical-alignment: center; }
                                                 GlassButton {
                                                     text: sub.region-label;
                                                     clicked => { root.sub-screen-cycle-region(i); }
@@ -359,6 +379,7 @@ export component LayoutStudio inherits Window {
         StatusBanner {
             text: root.status-text;
             is-warning: root.status-is-warning;
+        }
         }
     }
 

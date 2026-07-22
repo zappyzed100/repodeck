@@ -33,6 +33,22 @@ impl WindowOps for Win32WindowOps {
         placement::maximize(hwnd_of(hwnd));
     }
 
+    fn set_placement(&self, hwnd: isize, rect: PixelRect, maximized: bool, fill: bool) {
+        placement::set_placement(hwnd_of(hwnd), rect, maximized, fill);
+    }
+
+    fn send_fullscreen_keys(&self, hwnd: isize, refocus: Option<isize>) {
+        crate::windowing::key_input::send_fullscreen_keys(hwnd_of(hwnd), refocus.map(hwnd_of));
+    }
+
+    fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool) {
+        crate::windowing::key_input::send_exit_fullscreen_keys(
+            hwnd_of(hwnd),
+            restore_rect,
+            maximized,
+        );
+    }
+
     fn minimize(&self, hwnd: isize) {
         placement::minimize(hwnd_of(hwnd));
     }
@@ -47,11 +63,23 @@ impl WindowOps for Win32WindowOps {
         })();
 
         // PLAN.md §4.5: fall back to per-window `SetWindowPos` if the atomic
-        // batch fails at any point.
+        // batch fails at any point. A single window that cannot be moved — most
+        // commonly one owned by an elevated process, where `SetWindowPos`
+        // returns ERROR_ACCESS_DENIED under UIPI, or a window that just closed —
+        // is skipped (logged) rather than aborting the whole switch. Otherwise
+        // one admin-privileged app (e.g. Libre Hardware Monitor) in a workset
+        // would roll the entire switch back and nothing would move.
         if attempt.is_err() {
             for &(hwnd, rect) in moves {
-                placement::set_window_rect(hwnd_of(hwnd), rect)
-                    .map_err(|source| WindowOpsError::PerWindowFailed { hwnd, source })?;
+                if let Err(source) = placement::set_window_rect(hwnd_of(hwnd), rect) {
+                    tracing::warn!(
+                        error = %source,
+                        hwnd,
+                        "batch move: skipping a window that could not be moved \
+                         (likely an elevated process — access denied — or a \
+                         window that closed mid-switch)"
+                    );
+                }
             }
         }
         Ok(())

@@ -232,7 +232,7 @@ pub fn resolve_all_matches(
     worksets: &[Workset],
     live_windows: &[TopLevelWindow],
 ) -> HashMap<Uuid, MatchDecision> {
-    resolve_all_matches_with_bindings(worksets, live_windows, &HashMap::new())
+    resolve_all_matches_with_bindings(worksets, live_windows, &HashMap::new(), None)
 }
 
 /// Whether a session HWND binding is still trustworthy: the live window at that
@@ -251,15 +251,32 @@ fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
 /// content matching. This lets a browser window whose title/URL constantly
 /// change (a video tab) still be re-found. Anything without a usable binding
 /// falls back to the normal scoring matcher.
+///
+/// `priority_workset_id`, when given, is resolved first so that a window shared
+/// by several worksets binds to it: on a switch this is the target set, so the
+/// shared window lands on the main screen (with the activated set) instead of
+/// being claimed and parked by another set. The same physical window may be
+/// registered in multiple worksets — that is allowed and simply means the
+/// window follows whichever set is active.
 pub fn resolve_all_matches_with_bindings(
     worksets: &[Workset],
     live_windows: &[TopLevelWindow],
     bindings: &HashMap<Uuid, isize>,
+    priority_workset_id: Option<Uuid>,
 ) -> HashMap<Uuid, MatchDecision> {
     let mut bound: HashSet<isize> = HashSet::new();
     let mut results = HashMap::new();
 
-    for workset in worksets {
+    // The priority workset first, then the rest in their original order.
+    let ordered = priority_workset_id
+        .and_then(|id| worksets.iter().find(|w| w.id == id))
+        .into_iter()
+        .chain(
+            worksets
+                .iter()
+                .filter(|w| Some(w.id) != priority_workset_id),
+        );
+    for workset in ordered {
         for window in &workset.windows {
             if let Some(&hwnd) = bindings.get(&window.id)
                 && !bound.contains(&hwnd)
@@ -655,5 +672,79 @@ mod tests {
         // also claim it (the shared HWND cannot belong to two AutoRebinds).
         assert_eq!(*decision_a, MatchDecision::AutoRebind { hwnd: 1 });
         assert_ne!(*decision_b, MatchDecision::AutoRebind { hwnd: 1 });
+    }
+
+    #[test]
+    fn priority_workset_claims_a_shared_window_before_earlier_order() {
+        // Both worksets register the *same* window (shared): identical matcher.
+        let matcher = WindowMatcher {
+            executable_path: PathBuf::from(r"C:\code.exe"),
+            process_name: "code.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "repodeck".to_string(),
+            title_contains: None,
+            title_regex: None,
+        };
+        let managed_a = ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: matcher.clone(),
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: crate::domain::placement::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.1,
+                    height: 0.1,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 800, 600),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+        };
+        let mut managed_b = managed_a.clone();
+        managed_b.id = Uuid::new_v4();
+
+        let workset_a = build_workset(
+            "A".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\a"),
+            RepositoryKind::Git,
+            0,
+            vec![managed_a.clone()],
+        );
+        let workset_b = build_workset(
+            "B".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\b"),
+            RepositoryKind::Git,
+            1,
+            vec![managed_b.clone()],
+        );
+        let b_id = workset_b.id;
+        let live = [window_with(
+            1,
+            r"C:\code.exe",
+            "Chrome_WidgetWin_1",
+            "repodeck",
+        )];
+
+        // B is the priority (e.g. the switch target), so it claims the shared
+        // window even though A comes first in order.
+        let decisions = resolve_all_matches_with_bindings(
+            &[workset_a, workset_b],
+            &live,
+            &HashMap::new(),
+            Some(b_id),
+        );
+        assert_eq!(
+            decisions[&managed_b.id],
+            MatchDecision::AutoRebind { hwnd: 1 }
+        );
+        assert_ne!(
+            decisions[&managed_a.id],
+            MatchDecision::AutoRebind { hwnd: 1 }
+        );
     }
 }

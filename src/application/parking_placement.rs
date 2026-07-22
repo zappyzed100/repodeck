@@ -7,7 +7,10 @@ use crate::domain::placement::{PixelRect, affine_map, bounding_rect};
 pub const MIN_PARKED_WIDTH: i32 = 120;
 pub const MIN_PARKED_HEIGHT: i32 = 68;
 /// Inset applied to a parking slot's rect before mapping windows into it.
-pub const PARKING_SLOT_INSET_PX: i32 = 8;
+/// Zero since 2026-07-23: with per-window subdivided cells, an 8px inset put a
+/// 16px gutter between neighbouring cells and the user read the gaps as the
+/// split "not working" — cells now tile flush.
+pub const PARKING_SLOT_INSET_PX: i32 = 0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParkPlan {
