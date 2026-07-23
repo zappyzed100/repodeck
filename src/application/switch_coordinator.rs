@@ -296,7 +296,46 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             _ => target.fullscreen_when_parked,
         };
         // Restore each target window to its saved main rect and show state.
+        // If two target windows' saved placements overlap — e.g. a main monitor
+        // is gone and several fall back to the same one — tile the target windows
+        // across the available main monitors instead, so they never stack
+        // (spec §1.2 / 2026-07-23: 「画面の上に一画面」防止).
+        let main_screens: Vec<PixelRect> = request
+            .main_monitor_ids
+            .iter()
+            .filter_map(|id| {
+                request
+                    .live_monitors
+                    .iter()
+                    .find(|m| &m.device_name == id)
+                    .map(|m| m.work_area_px)
+            })
+            .collect();
+        let any_overlap = outcomes.iter().enumerate().any(|(i, o)| {
+            outcomes[i + 1..].iter().any(|p| {
+                o.rect.x < p.rect.right()
+                    && p.rect.x < o.rect.right()
+                    && o.rect.y < p.rect.bottom()
+                    && p.rect.y < o.rect.bottom()
+            })
+        });
+        let tiled: std::collections::HashMap<isize, PixelRect> =
+            if any_overlap && !main_screens.is_empty() && !target_was_fullscreen {
+                let hwnds: Vec<isize> = target_resolved.iter().map(|w| w.hwnd).collect();
+                distribute_parking(&main_screens, &hwnds).0.into_iter().collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+
         for (resolved, outcome) in target_resolved.iter().zip(&outcomes) {
+            if let Some(cell) = tiled.get(&resolved.hwnd) {
+                tracing::info!(
+                    target: "switch", hwnd = resolved.hwnd, tiled = ?cell,
+                    "switch: main placements overlapped — tiling target across main"
+                );
+                self.window_ops.set_placement(resolved.hwnd, *cell, false, true);
+                continue;
+            }
             let maximized = outcome.show_state == SavedShowState::Maximized;
             tracing::info!(
                 target: "switch", hwnd = resolved.hwnd, to_rect = ?outcome.rect,
@@ -1646,6 +1685,30 @@ mod tests {
     }
 
     #[test]
+    fn three_windows_on_one_monitor_are_three_equal_quarters() {
+        // 3 windows forced onto a single HD monitor use the 2×2 grid's first
+        // three cells — all equal quarters (960×540). The third is NOT full size.
+        let hd = PixelRect::new(0, 0, 1920, 1080);
+        let (placements, overflow) = distribute_parking(&[hd], &[1, 2, 3]);
+        assert!(overflow.is_empty());
+        assert_eq!(placements.len(), 3);
+        for (_, r) in &placements {
+            assert_eq!(
+                (r.width, r.height),
+                (960, 540),
+                "a cell of 3-on-one-monitor is {r:?}, not a quarter"
+            );
+        }
+        for (i, (_, a)) in placements.iter().enumerate() {
+            for (_, b) in &placements[i + 1..] {
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
     fn capped_capacity_keeps_partial_regions_above_the_full_min_cell() {
         let qhd = PixelRect::new(0, 0, 2560, 1440);
         let hd = PixelRect::new(0, 0, 1920, 1080);
@@ -1707,6 +1770,77 @@ mod tests {
         ];
         let evictees = stale_sub_occupants(cell, &incoming, &managed);
         assert_eq!(evictees, vec![20, 40]);
+    }
+
+    #[test]
+    fn active_windows_tile_and_never_overlap_with_one_effective_main_monitor() {
+        // main_monitor_ids lists two monitors, but only MAIN0 is actually live.
+        // A 2-window set whose windows both map to main (the second falls back to
+        // MAIN0) must TILE MAIN0 into halves, not stack two full-size windows —
+        // otherwise one is drawn on top of the other (2026-07-23).
+        let monitors = vec![
+            mon_wh("MAIN0", 0, 0, 1920, 1080),
+            mon_wh("PARK1", -1920, 0, 1920, 1080),
+        ];
+        let main_ids = vec!["MAIN0".to_string(), "MAIN1".to_string()]; // MAIN1 offline
+        let full = NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let s = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![
+                managed_window("wa", 0, full, SavedShowState::Maximized, 0),
+                managed_window("wb", 1, full, SavedShowState::Maximized, 1),
+            ],
+        );
+        let other = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window("oc", 0, full, SavedShowState::Maximized, 0)],
+        );
+        let worksets = vec![s.clone(), other];
+        let wins = [(100isize, "wa"), (101, "wb"), (102, "oc")];
+
+        let fake = FakeWindowOps::new();
+        for (h, _) in &wins {
+            fake.seed_window(*h, PixelRect::new(0, 0, 800, 600), SavedShowState::Normal);
+        }
+        let dir = tempdir().unwrap();
+        let coord = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+        let live: Vec<TopLevelWindow> = wins
+            .iter()
+            .map(|(h, e)| {
+                let mut lw = live_window(*h, e);
+                lw.rect_px = coord.window_ops.rect_of(*h).unwrap();
+                lw
+            })
+            .collect();
+
+        coord
+            .switch_to(SwitchRequest {
+                worksets: &worksets,
+                fixed_slots: &[],
+                sub_screens: &[],
+                saved_monitors: &[],
+                main_monitor_ids: &main_ids,
+                live_monitors: &monitors,
+                live_windows: &live,
+                target_workset_id: s.id,
+            })
+            .unwrap();
+
+        let ra = coord.window_ops.rect_of(100).unwrap();
+        let rb = coord.window_ops.rect_of(101).unwrap();
+        let overlap =
+            ra.x < rb.right() && rb.x < ra.right() && ra.y < rb.bottom() && rb.y < ra.bottom();
+        assert!(!overlap, "active windows stack on the single main monitor: {ra:?} vs {rb:?}");
+        // Both are on MAIN0 (its work area == bounds in this fake topology).
+        let main0 = PixelRect::new(0, 0, 1920, 1080);
+        for r in [ra, rb] {
+            assert!(
+                r.x >= main0.x && r.right() <= main0.right() && r.y >= main0.y && r.bottom() <= main0.bottom(),
+                "window {r:?} is not within the single main monitor"
+            );
+        }
     }
 
     fn mon_wh(device_name: &str, x: i32, y: i32, w: i32, h: i32) -> MonitorInfo {
