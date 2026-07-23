@@ -22,6 +22,17 @@ path = "src/bin/repodeck-hook.rs"
 name = "repodeck-simtest"
 path = "src/bin/repodeck-simtest.rs"
 
+# Debug-only window/agent-state logger. Gated behind `debug-tools` so the
+# standard `cargo build --release` never builds it; run
+# `cargo build --release --features debug-tools` to produce it.
+[[bin]]
+name = "repodeck-winstate"
+path = "src/bin/repodeck-winstate.rs"
+required-features = ["debug-tools"]
+
+[features]
+debug-tools = []
+
 [dependencies]
 slint = { version = "1.17", features = ["system-tray", "raw-window-handle-06"] }
 serde = { version = "1", features = ["derive"] }
