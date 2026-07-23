@@ -754,18 +754,12 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let screens = self.general_parking_screens(request);
         let (placements, overflow) = distribute_parking_capped(&screens, hwnds);
         for (hwnd, cell) in placements {
-            // Skip a window already at its cell (from a previous switch). This
-            // avoids re-issuing a placement — and its 2.5s re-assert loop — for
-            // every already-correct window each switch, which otherwise makes the
-            // parking monitors flicker as old and new re-assert threads compete.
-            let already_placed = request
-                .live_windows
-                .iter()
-                .find(|w| w.hwnd == hwnd)
-                .is_some_and(|w| roughly_at(w.rect_px, cell));
-            if already_placed {
-                continue;
-            }
+            // Re-place every window every switch (no "already there → skip"): a
+            // window can drift after its placement (its own resize, a display
+            // event) once the 6.5s re-assert has ended, and only a fresh placement
+            // brings it back. The per-window placement generation stops the old
+            // and new re-assert threads from fighting, so this doesn't flicker
+            // (2026-07-23).
             tracing::info!(
                 target: "parking", hwnd, cell = ?cell, windows = hwnds.len(),
                 "auto-park: place window into cell"
@@ -969,19 +963,6 @@ pub fn screen_capacity(rect: PixelRect) -> usize {
     } else {
         4
     }
-}
-
-/// Whether a window's current frame is essentially already at `target` (its
-/// desired visible cell). Loose tolerance: the frame includes the invisible DWM
-/// border (~8px), so an already-placed window sits slightly outside its visible
-/// cell — far tighter than the gap between two distinct cells, so different cells
-/// never compare equal. Used to skip re-placing already-correct parked windows.
-fn roughly_at(current: PixelRect, target: PixelRect) -> bool {
-    const TOL: i32 = 40;
-    (current.x - target.x).abs() <= TOL
-        && (current.y - target.y).abs() <= TOL
-        && (current.width - target.width).abs() <= TOL
-        && (current.height - target.height).abs() <= TOL
 }
 
 /// Cells for `count` windows on `rect`, using **equal-size grid cells** and
