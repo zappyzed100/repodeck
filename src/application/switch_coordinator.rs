@@ -264,15 +264,21 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // very end (after the target is focused), so the keys land on the parked
         // video and the foreground still ends up on the new workset.
         let mut fullscreen_hwnds: Vec<isize> = Vec::new();
-        // The sets that reserve a parking cell are exactly the non-target live
-        // sets (a set whose apps are all closed reserves nothing, so it can't
-        // shrink the others — 2026-07-23).
         let worksets_with_windows: std::collections::HashSet<Uuid> =
             parking.iter().map(|(w, _)| w.id).collect();
         // Clear any stale foreign window out of the outgoing set's sub cell first.
         self.park_evictees(&sub_evictees, &request);
-        // Re-place every non-target live set into its current allocated cell.
+        // Auto sets park by window (spec §2): pool all their windows and
+        // distribute them across the general parking monitors together, so a
+        // monitor is split by its actual window count. Sub/Fixed sets park into
+        // their designated area per-set. All non-target live sets are re-placed
+        // every switch, so nothing lingers at a stale size/position.
+        let mut auto_windows: Vec<isize> = Vec::new();
         for (w, resolved) in &parking {
+            if matches!(w.parking_policy, ParkingPolicy::Auto) {
+                auto_windows.extend(resolved.iter().map(|r| r.hwnd));
+                continue;
+            }
             tracing::info!(
                 target: "switch", workset = %w.name, windows = resolved.len(),
                 policy = ?w.parking_policy, "switch: parking set"
@@ -288,6 +294,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 Err(reason) => return Err(self.rollback(journal, reason)),
             }
         }
+        self.park_auto_windows(&auto_windows, &request);
 
         // Step 6: restore the target workset to its main placement.
         let mut outcomes = Vec::with_capacity(target_resolved.len());
@@ -616,20 +623,15 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .collect()
     }
 
-    /// Moves `evictees` off a sub-screen cell into general (non-sub) parking,
-    /// distributed to keep total parked area largest (`distribute_parking`).
-    /// A window that fits nowhere is minimized. Called before the outgoing
-    /// workset is parked into that cell.
-    fn park_evictees(&self, evictees: &[ResolvedWindow], request: &SwitchRequest) {
-        if evictees.is_empty() {
-            return;
-        }
+    /// The general parking monitors' work areas: every live monitor that is not
+    /// a main monitor, not a sub-screen monitor, and not excluded (spec §2/§5).
+    fn general_parking_screens(&self, request: &SwitchRequest) -> Vec<PixelRect> {
         let sub_monitor_ids: std::collections::HashSet<&str> = request
             .sub_screens
             .iter()
             .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
             .collect();
-        let screens: Vec<PixelRect> = request
+        request
             .live_monitors
             .iter()
             .filter(|m| !request.main_monitor_ids.iter().any(|id| id == &m.device_name))
@@ -641,24 +643,44 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             })
             .filter(|m| !sub_monitor_ids.contains(m.device_name.as_str()))
             .map(|m| m.work_area_px)
-            .collect();
+            .collect()
+    }
 
+    /// Parks Auto-policy windows **by window** (spec §2): pool every auto set's
+    /// windows and distribute them across the general parking monitors, each
+    /// monitor subdivided by how many windows land on it (`distribute_parking`
+    /// picks the monitor that keeps each window largest). Each window fills its
+    /// cell; anything past capacity (HD 4 / QHD 6 per monitor) is minimized.
+    fn park_auto_windows(&self, hwnds: &[isize], request: &SwitchRequest) {
+        if hwnds.is_empty() {
+            return;
+        }
+        let screens = self.general_parking_screens(request);
+        let (placements, overflow) = distribute_parking(&screens, hwnds);
+        for (hwnd, cell) in placements {
+            tracing::info!(
+                target: "parking", hwnd, cell = ?cell, windows = hwnds.len(),
+                "auto-park: place window into cell"
+            );
+            self.window_ops.set_placement(hwnd, cell, false, true);
+        }
+        for hwnd in overflow {
+            tracing::info!(target: "parking", hwnd, "auto-park: no room, minimizing");
+            self.window_ops.minimize(hwnd);
+        }
+    }
+
+    /// Moves `evictees` off a sub-screen cell into general parking. A window that
+    /// fits nowhere is minimized. Called before an outgoing set parks into a sub.
+    fn park_evictees(&self, evictees: &[ResolvedWindow], request: &SwitchRequest) {
+        if evictees.is_empty() {
+            return;
+        }
+        let screens = self.general_parking_screens(request);
         let hwnds: Vec<isize> = evictees.iter().map(|w| w.hwnd).collect();
         let (placements, overflow) = distribute_parking(&screens, &hwnds);
         for (hwnd, cell) in placements {
-            let src = request
-                .live_windows
-                .iter()
-                .find(|w| w.hwnd == hwnd)
-                .map(|w| w.rect_px);
-            match src.map(|s| plan_park_into_slot(std::slice::from_ref(&s), cell)) {
-                Some(ParkPlan::ShrinkToFit(mapped)) => {
-                    if let Some(&rect) = mapped.first() {
-                        self.window_ops.set_placement(hwnd, rect, false, true);
-                    }
-                }
-                _ => self.window_ops.minimize(hwnd),
-            }
+            self.window_ops.set_placement(hwnd, cell, false, true);
         }
         for hwnd in overflow {
             self.window_ops.minimize(hwnd);
@@ -813,24 +835,6 @@ pub fn sub_screen_target_rect(sub: &SubScreen, live_monitors: &[MonitorInfo]) ->
         .or_else(|| bounding_rect(&work_areas))
 }
 
-/// Splits `rect` into left/right halves (a vertical cut, 縦半分).
-fn split_v(rect: PixelRect) -> (PixelRect, PixelRect) {
-    let left = rect.width / 2;
-    (
-        PixelRect::new(rect.x, rect.y, left, rect.height),
-        PixelRect::new(rect.x + left, rect.y, rect.width - left, rect.height),
-    )
-}
-
-/// Splits `rect` into top/bottom halves (a horizontal cut, 横半分).
-fn split_h(rect: PixelRect) -> (PixelRect, PixelRect) {
-    let top = rect.height / 2;
-    (
-        PixelRect::new(rect.x, rect.y, rect.width, top),
-        PixelRect::new(rect.x, rect.y + top, rect.width, rect.height - top),
-    )
-}
-
 /// A `cols × rows` grid of `rect` in row-major (reading) order. Boundaries are
 /// computed from exact fractional positions so the cells tile `rect` with no
 /// gaps or overlap even when the size doesn't divide evenly.
@@ -859,43 +863,38 @@ pub fn screen_capacity(rect: PixelRect) -> usize {
     }
 }
 
-/// Subdivides a region among up to six windows so none overlap. Up to four, the
-/// first cut runs along the region's longer axis and each deeper cut is
-/// **perpendicular** to the one before (「横半分なら縦半分、縦半分なら横半分」):
-/// 1 → whole; 2 → halves; 3 → one half kept + the other split; 4 → four cells.
-/// Five or six windows use a 3×2 grid along the longer axis (for a QHD-class
-/// screen — 確定仕様 2026-07-23). Beyond the returned cell count, a window gets
-/// no cell and is minimized.
+/// Cells for `count` windows on `rect`, using **equal-size grid cells** and
+/// filling the first `count` of them — the layout progression 確定 2026-07-23
+/// (`screen-layout-spec.md` §2.2/§2.3):
+/// 1→whole; 2→halves along the long axis; 3–4→a 2×2 grid (3 fills three cells,
+/// one left empty); 5–6→a 3×2 grid (5 fills five). Every returned cell is the
+/// same size, and the split is kept as square as possible (2 columns, 2×2,
+/// 3×2). So e.g. HD 1920×1080 gives 1920×1080 / 960×1080 / 960×540 / 960×540 for
+/// 1..4 windows. Beyond six a window gets no cell and is minimized by the caller.
 pub fn subdivide_for_count(rect: PixelRect, count: usize) -> Vec<PixelRect> {
     let wide = rect.width >= rect.height;
-    let first: fn(PixelRect) -> (PixelRect, PixelRect) = if wide { split_v } else { split_h };
-    let perp: fn(PixelRect) -> (PixelRect, PixelRect) = if wide { split_h } else { split_v };
-    match count {
+    let full = match count {
         0 | 1 => vec![rect],
         2 => {
-            let (a, b) = first(rect);
-            vec![a, b]
+            if wide {
+                grid(rect, 2, 1)
+            } else {
+                grid(rect, 1, 2)
+            }
         }
-        3 => {
-            let (a, b) = first(rect);
-            let (b1, b2) = perp(b);
-            vec![a, b1, b2]
-        }
-        4 => {
-            let (a, b) = first(rect);
-            let (a1, a2) = perp(a);
-            let (b1, b2) = perp(b);
-            vec![a1, a2, b1, b2]
-        }
+        3 | 4 => grid(rect, 2, 2),
         _ => {
-            // 5–6: three cells along the long axis, two along the short.
             if wide {
                 grid(rect, 3, 2)
             } else {
                 grid(rect, 2, 3)
             }
         }
-    }
+    };
+    // Fill only the first `count` cells; the rest of the grid stays empty (e.g.
+    // 3 windows on a 2×2 grid → three equal cells, one empty).
+    let used = count.clamp(1, full.len());
+    full.into_iter().take(used).collect()
 }
 
 /// The area of the *smallest* cell a region is cut into for `count` windows.
@@ -1450,13 +1449,15 @@ mod tests {
         assert_eq!(tall[0], PixelRect::new(0, 0, 400, 500));
         assert_eq!(tall[1], PixelRect::new(0, 500, 400, 500));
 
-        // Three: the first half is kept whole; the second is split perpendicular
-        // (wide region → first cut vertical, so the right half splits top/bottom).
+        // Three: a 2×2 grid with the first three (equal) cells filled, one left
+        // empty — every cell the same size (spec §2.2/§2.3).
         let three = subdivide_for_count(region, 3);
         assert_eq!(three.len(), 3);
-        assert_eq!(three[0], PixelRect::new(0, 0, 500, 400));
+        assert_eq!(three[0], PixelRect::new(0, 0, 500, 200));
         assert_eq!(three[1], PixelRect::new(500, 0, 500, 200));
-        assert_eq!(three[2], PixelRect::new(500, 200, 500, 200));
+        assert_eq!(three[2], PixelRect::new(0, 200, 500, 200));
+        // All three cells are the same size.
+        assert!(three.iter().all(|c| c.width == 500 && c.height == 200));
 
         // Three or four sharers → quarters; every cell disjoint.
         let quad = subdivide_for_count(region, 4);
@@ -1595,8 +1596,9 @@ mod tests {
         let region = sub_screen_target_rect(&sub, &live).unwrap();
         let region_area = i64::from(region.width) * i64::from(region.height);
 
-        // 1..=4 worksets sharing the sub-screen each get a cell; together the
-        // cells tile the region exactly — no overlaps, no gaps.
+        // Sharers each get a distinct, non-overlapping, equal-size cell within
+        // the sub region. Counts that fill a whole grid (1, 2, 4) cover the region
+        // exactly; 3 uses three of a 2×2 grid, leaving one cell empty (spec §2.3).
         for n in 1..=4i32 {
             let worksets: Vec<Workset> =
                 (0..n).map(|i| workset(i, policy.clone(), vec![])).collect();
@@ -1611,11 +1613,19 @@ mod tests {
                     assert!(!overlap, "{n} sharers: {a:?} overlaps {b:?}");
                 }
             }
+            // Cells are all the same size and stay inside the region.
+            let first = cells[0];
+            assert!(cells.iter().all(|c| c.width == first.width && c.height == first.height));
             let covered: i64 = cells
                 .iter()
                 .map(|r| i64::from(r.width) * i64::from(r.height))
                 .sum();
-            assert_eq!(covered, region_area, "{n} sharers must tile the sub region exactly");
+            let expected = if n == 3 { region_area * 3 / 4 } else { region_area };
+            // Allow ±1px rounding across the grid boundaries.
+            assert!(
+                (covered - expected).abs() <= i64::from(region.width) + i64::from(region.height),
+                "{n} sharers coverage {covered} vs expected ~{expected}"
+            );
         }
     }
 
