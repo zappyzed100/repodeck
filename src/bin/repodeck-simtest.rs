@@ -380,7 +380,7 @@ fn check(
                 let Some(mon) = monitor_of_center(ctx.monitors, rect.center()) else {
                     continue;
                 };
-                let is_main = ctx.main_ids.iter().any(|id| *id == mon.device_name);
+                let is_main = ctx.main_ids.contains(&mon.device_name);
                 let Some(vis) = visible_bounds(*hwnd) else {
                     continue;
                 };
@@ -492,13 +492,12 @@ fn parse_intents(slice: &str) -> Vec<(isize, Intent)> {
             if let (Some(h), Some(r)) = (field_isize(line, "hwnd="), parse_rect(line)) {
                 out.push((h, Intent::Main(r)));
             }
-        } else if line.contains("park window into cell")
+        } else if (line.contains("park window into cell")
             || line.contains("place window into cell")
-            || line.contains("tiling target across main")
+            || line.contains("tiling target across main"))
+            && let (Some(h), Some(r)) = (field_isize(line, "hwnd="), parse_rect(line))
         {
-            if let (Some(h), Some(r)) = (field_isize(line, "hwnd="), parse_rect(line)) {
-                out.push((h, Intent::Fill(r)));
-            }
+            out.push((h, Intent::Fill(r)));
         }
     }
     out
