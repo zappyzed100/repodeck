@@ -322,7 +322,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let tiled: std::collections::HashMap<isize, PixelRect> =
             if any_overlap && !main_screens.is_empty() && !target_was_fullscreen {
                 let hwnds: Vec<isize> = target_resolved.iter().map(|w| w.hwnd).collect();
-                distribute_parking(&main_screens, &hwnds).0.into_iter().collect()
+                distribute_parking(&main_screens, &hwnds)
+                    .0
+                    .into_iter()
+                    .collect()
             } else {
                 std::collections::HashMap::new()
             };
@@ -333,7 +336,8 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                     target: "switch", hwnd = resolved.hwnd, tiled = ?cell,
                     "switch: main placements overlapped — tiling target across main"
                 );
-                self.window_ops.set_placement(resolved.hwnd, *cell, false, true);
+                self.window_ops
+                    .set_placement(resolved.hwnd, *cell, false, true);
                 continue;
             }
             let maximized = outcome.show_state == SavedShowState::Maximized;
@@ -639,7 +643,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .filter(|w| w.id != request.target_workset_id)
             .filter(|w| {
                 w.windows.iter().any(|mw| {
-                    matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                    matches!(
+                        decisions.get(&mw.id),
+                        Some(MatchDecision::AutoRebind { .. })
+                    )
                 })
             })
             .map(|w| w.id)
@@ -703,7 +710,11 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         use crate::application::layout_service::auto_split_cells;
         let mut screens = Vec::new();
         for m in request.live_monitors {
-            if request.main_monitor_ids.iter().any(|id| id == &m.device_name) {
+            if request
+                .main_monitor_ids
+                .iter()
+                .any(|id| id == &m.device_name)
+            {
                 continue;
             }
             if request
@@ -1065,7 +1076,12 @@ pub fn distribute_parking_capped(
     for &hwnd in windows {
         let best = (0..screens.len())
             .filter(|&i| occupants[i].len() < screens[i].1)
-            .max_by_key(|&i| (smallest_cell_area(screens[i].0, occupants[i].len() + 1), -(i as i64)));
+            .max_by_key(|&i| {
+                (
+                    smallest_cell_area(screens[i].0, occupants[i].len() + 1),
+                    -(i as i64),
+                )
+            });
         match best {
             Some(i) => occupants[i].push(hwnd),
             None => overflow.push(hwnd),
@@ -1764,7 +1780,12 @@ mod tests {
             mon_wh("PARK1", -1920, 0, 1920, 1080),
         ];
         let main_ids = vec!["MAIN0".to_string(), "MAIN1".to_string()]; // MAIN1 offline
-        let full = NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let full = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
         let s = workset(
             0,
             ParkingPolicy::Auto,
@@ -1813,12 +1834,18 @@ mod tests {
         let rb = coord.window_ops.rect_of(101).unwrap();
         let overlap =
             ra.x < rb.right() && rb.x < ra.right() && ra.y < rb.bottom() && rb.y < ra.bottom();
-        assert!(!overlap, "active windows stack on the single main monitor: {ra:?} vs {rb:?}");
+        assert!(
+            !overlap,
+            "active windows stack on the single main monitor: {ra:?} vs {rb:?}"
+        );
         // Both are on MAIN0 (its work area == bounds in this fake topology).
         let main0 = PixelRect::new(0, 0, 1920, 1080);
         for r in [ra, rb] {
             assert!(
-                r.x >= main0.x && r.right() <= main0.right() && r.y >= main0.y && r.bottom() <= main0.bottom(),
+                r.x >= main0.x
+                    && r.right() <= main0.right()
+                    && r.y >= main0.y
+                    && r.bottom() <= main0.bottom(),
                 "window {r:?} is not within the single main monitor"
             );
         }
@@ -1867,7 +1894,12 @@ mod tests {
             cell_index: 0,
             fullscreen: false,
         };
-        let full = NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+        let full = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
 
         // 15 sets × 2 windows; sets 0,1 park onto the sub, the rest are Auto.
         // Each window has a unique exe/title so it matches exactly one entry.
@@ -1876,14 +1908,22 @@ mod tests {
         let mut hwnd = 100isize;
         for s in 0..15 {
             let policy = if s < 2 {
-                ParkingPolicy::SubScreen { sub_screen_id: sub.id }
+                ParkingPolicy::SubScreen {
+                    sub_screen_id: sub.id,
+                }
             } else {
                 ParkingPolicy::Auto
             };
             let mut mws = Vec::new();
             for (idx, ab) in ["a", "b"].iter().enumerate() {
                 let exe = format!("s{s:02}{ab}");
-                mws.push(managed_window(&exe, idx, full, SavedShowState::Normal, idx as i32));
+                mws.push(managed_window(
+                    &exe,
+                    idx,
+                    full,
+                    SavedShowState::Normal,
+                    idx as i32,
+                ));
                 wins.push((hwnd, exe));
                 hwnd += 1;
             }
@@ -2001,7 +2041,11 @@ mod tests {
             // layout allows). This is what catches a *suboptimal* (not merely
             // invalid) placement.
             let park = [
-                mon_rects[2], mon_rects[3], mon_rects[4], mon_rects[5], mon_rects[6],
+                mon_rects[2],
+                mon_rects[3],
+                mon_rects[4],
+                mon_rects[5],
+                mon_rects[6],
             ];
             let caps: Vec<usize> = park.iter().map(|m| screen_capacity(*m)).collect();
             let mut occ = [0usize; 5];
@@ -2103,12 +2147,20 @@ mod tests {
             }
             // Cells are all the same size and stay inside the region.
             let first = cells[0];
-            assert!(cells.iter().all(|c| c.width == first.width && c.height == first.height));
+            assert!(
+                cells
+                    .iter()
+                    .all(|c| c.width == first.width && c.height == first.height)
+            );
             let covered: i64 = cells
                 .iter()
                 .map(|r| i64::from(r.width) * i64::from(r.height))
                 .sum();
-            let expected = if n == 3 { region_area * 3 / 4 } else { region_area };
+            let expected = if n == 3 {
+                region_area * 3 / 4
+            } else {
+                region_area
+            };
             // Allow ±1px rounding across the grid boundaries.
             assert!(
                 (covered - expected).abs() <= i64::from(region.width) + i64::from(region.height),

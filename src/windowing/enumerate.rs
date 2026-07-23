@@ -126,7 +126,8 @@ fn describe_candidate(hwnd: HWND, exclude_process_id: u32) -> Option<TopLevelWin
     } else {
         get_window_rect(hwnd)?
     };
-    if !minimized && (rect_px.width < MIN_CANDIDATE_WIDTH || rect_px.height < MIN_CANDIDATE_HEIGHT) {
+    if !minimized && (rect_px.width < MIN_CANDIDATE_WIDTH || rect_px.height < MIN_CANDIDATE_HEIGHT)
+    {
         return None;
     }
 

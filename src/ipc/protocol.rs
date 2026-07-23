@@ -108,7 +108,11 @@ pub fn parse_and_adapt(raw: &[u8]) -> Result<NormalizedEvent, ProtocolError> {
 
     // Codex carries a per-turn id; Claude Code does not. Use it as the source
     // label so downstream logs/telemetry can tell the two apart.
-    let source = if hook.turn_id.is_empty() { "claude" } else { "codex" };
+    let source = if hook.turn_id.is_empty() {
+        "claude"
+    } else {
+        "codex"
+    };
 
     Ok(NormalizedEvent {
         schema_version: SCHEMA_VERSION,

@@ -50,10 +50,13 @@ pub const TEST_CONTROL_PIPE_NAME: &str = r"\\.\pipe\RepoDeck.TestControl.v1";
 ///      it defaults to High, and the default "no write up" policy blocks the
 ///      medium hook. We stamp a Low integrity label so any user process can
 ///      write.
+///   3. Codex Desktop may launch hooks from a packaged/AppContainer context.
+///      Such a token also needs an explicit All Application Packages (`AC`)
+///      allow ACE even when Authenticated Users is present.
 ///
 /// The events are already untrusted input that the server validates, and this
 /// is a single-user desktop tool, so widening write access here is acceptable.
-const PIPE_SDDL: &str = "D:P(A;;GA;;;AU)S:(ML;;NW;;;LW)";
+const PIPE_SDDL: &str = "D:P(A;;GA;;;AU)(A;;GA;;;AC)S:(ML;;NW;;;LW)";
 
 const MAX_PIPE_INSTANCES: u32 = 16;
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
@@ -278,5 +281,12 @@ mod tests {
     #[test]
     fn pipe_name_matches_the_exact_spec_string() {
         assert_eq!(PIPE_NAME, r"\\.\pipe\RepoDeck.AgentEvents.v1");
+    }
+
+    #[test]
+    fn pipe_acl_allows_authenticated_and_packaged_hook_processes() {
+        assert!(PIPE_SDDL.contains("(A;;GA;;;AU)"));
+        assert!(PIPE_SDDL.contains("(A;;GA;;;AC)"));
+        assert!(PIPE_SDDL.contains("S:(ML;;NW;;;LW)"));
     }
 }

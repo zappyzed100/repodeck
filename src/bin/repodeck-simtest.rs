@@ -75,11 +75,17 @@ impl Options {
         while i < args.len() {
             match args[i].as_str() {
                 "--iters" => {
-                    iters = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(iters);
+                    iters = args
+                        .get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(iters);
                     i += 1;
                 }
                 "--warmup" => {
-                    warmup = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(warmup);
+                    warmup = args
+                        .get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(warmup);
                     i += 1;
                 }
                 "--settle-ms" => {
@@ -129,7 +135,9 @@ struct TestWorkset {
 /// windows the current config actually manages are checked (stray windows and
 /// worksets sliced out for a smaller size are ignored).
 fn is_configured(title: &str, valid: &[String]) -> bool {
-    valid.iter().any(|t| !t.is_empty() && title.contains(t.as_str()))
+    valid
+        .iter()
+        .any(|t| !t.is_empty() && title.contains(t.as_str()))
 }
 
 fn run(opts: &Options) -> Result<Report, String> {
@@ -181,7 +189,10 @@ fn run(opts: &Options) -> Result<Report, String> {
     // re-asserts its own bounds can take >8s to settle; measuring across that
     // would be a false "drift". Results here are discarded.
     if opts.warmup > 0 {
-        eprintln!("[simtest] warm-up: {} switches (no measurement)", opts.warmup);
+        eprintln!(
+            "[simtest] warm-up: {} switches (no measurement)",
+            opts.warmup
+        );
         for i in 0..opts.warmup {
             let target = i % worksets.len();
             send_switch(&worksets[target].id)?;
@@ -322,12 +333,15 @@ enum Intent {
     Minimize,
 }
 
-fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelWindow]) -> Vec<Failure> {
+fn check(
+    ctx: &CheckCtx,
+    intents: &[(isize, Intent)],
+    test_windows: &[&TopLevelWindow],
+) -> Vec<Failure> {
     use std::collections::HashMap;
     let by_hwnd: HashMap<isize, &TopLevelWindow> =
         test_windows.iter().map(|w| (w.hwnd, *w)).collect();
-    let intent_hwnds: std::collections::HashSet<isize> =
-        intents.iter().map(|(h, _)| *h).collect();
+    let intent_hwnds: std::collections::HashSet<isize> = intents.iter().map(|(h, _)| *h).collect();
     let mut out = Vec::new();
     let mut fail = |window: &str, problem: &str, detail: Option<(PixelRect, PixelRect)>| {
         out.push(Failure {
@@ -355,7 +369,11 @@ fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelW
                     continue;
                 };
                 if !rect_matches(&vis, cell, 30, 60) {
-                    fail(&w.title, "drifted from its parking cell", Some((vis, *cell)));
+                    fail(
+                        &w.title,
+                        "drifted from its parking cell",
+                        Some((vis, *cell)),
+                    );
                 }
             }
             Intent::Main(rect) => {
@@ -420,7 +438,12 @@ fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelW
 
 /// Shrinks a rect by `m` on every side (used to drop boundary-sliver overlaps).
 fn erode(r: PixelRect, m: i32) -> PixelRect {
-    PixelRect::new(r.x + m, r.y + m, (r.width - 2 * m).max(0), (r.height - 2 * m).max(0))
+    PixelRect::new(
+        r.x + m,
+        r.y + m,
+        (r.width - 2 * m).max(0),
+        (r.height - 2 * m).max(0),
+    )
 }
 
 fn rect_matches(a: &PixelRect, b: &PixelRect, pos_tol: i32, size_tol: i32) -> bool {
@@ -711,7 +734,9 @@ impl Report {
         use std::collections::BTreeMap;
         let mut groups: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
         for f in &self.failures {
-            let e = groups.entry((f.window.clone(), f.problem.clone())).or_insert((0, f.iter));
+            let e = groups
+                .entry((f.window.clone(), f.problem.clone()))
+                .or_insert((0, f.iter));
             e.0 += 1;
         }
         for ((window, problem), (count, first_iter)) in &groups {

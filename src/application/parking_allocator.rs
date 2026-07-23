@@ -253,7 +253,10 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         }
         let cells = subdivide_for_count(monitor.work_area_px, occupants[i].len());
         for (cell_index, workset) in occupants[i].iter().enumerate() {
-            let rect = cells.get(cell_index).copied().unwrap_or(monitor.work_area_px);
+            let rect = cells
+                .get(cell_index)
+                .copied()
+                .unwrap_or(monitor.work_area_px);
             let slot = ParkingSlotId {
                 monitor_id: monitor.device_name.clone(),
                 cell_index,
@@ -447,7 +450,10 @@ mod tests {
         };
         let (rect_a, mon_a) = placed(&a);
         let (rect_b, mon_b) = placed(&b);
-        assert_ne!(mon_a, mon_b, "the two worksets spread onto different monitors");
+        assert_ne!(
+            mon_a, mon_b,
+            "the two worksets spread onto different monitors"
+        );
         // Full monitor size (1920×1080), not a 960×540 quarter.
         assert_eq!((rect_a.width, rect_a.height), (1920, 1080));
         assert_eq!((rect_b.width, rect_b.height), (1920, 1080));
@@ -482,7 +488,11 @@ mod tests {
 
         match &result.assignments[&a.id] {
             ParkAssignment::AutoSlot { rect, .. } => {
-                assert_eq!((rect.width, rect.height), (1920, 1080), "live set fills a whole monitor");
+                assert_eq!(
+                    (rect.width, rect.height),
+                    (1920, 1080),
+                    "live set fills a whole monitor"
+                );
             }
             other => panic!("expected AutoSlot whole monitor, got {other:?}"),
         }
@@ -834,7 +844,10 @@ mod tests {
             .map(|r| i64::from(r.width) * i64::from(r.height))
             .min()
             .unwrap();
-        assert!(min_cell >= i64::from(960 * 1080), "live sets get at least halves");
+        assert!(
+            min_cell >= i64::from(960 * 1080),
+            "live sets get at least halves"
+        );
         assert!(!any_overlap(&cells));
     }
 

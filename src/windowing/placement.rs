@@ -145,7 +145,9 @@ pub fn set_placement(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) {
     // leaving windows at the wrong size / overlapping and making the parking
     // monitors flicker (2026-07-23).
     let my_generation = {
-        let mut map = PLACEMENT_GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = PLACEMENT_GENERATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let g = map.entry(raw).or_insert(0);
         *g = g.wrapping_add(1);
         *g

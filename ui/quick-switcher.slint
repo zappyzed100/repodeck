@@ -16,10 +16,19 @@ export struct QuickSwitcherRow {
     agent-status-label: string,
     agent-elapsed-text: string,
     // Git working-tree status (empty for non-git repos, filled by a background
-    // refresh): current branch, "変更N" change count, and "最終commit" age.
+    // refresh): current branch, "変更N" change count, "↑N未push" unpushed
+    // commits, and "最終commit" age.
     branch-text: string,
     changed-text: string,
+    unpushed-text: string,
     last-commit-text: string,
+    // GitHub status via `gh` (filled by a slower background refresh): the
+    // current branch's open PR ("PR #18" / "PR ×N"), and the latest CI run
+    // (`ci-symbol` ✓/✕/●/— + `ci-text` 成功/失敗/実行中/未実行, `ci-color`).
+    pr-text: string,
+    ci-symbol: string,
+    ci-text: string,
+    ci-color: color,
 }
 
 export component QuickSwitcher inherits Window {
@@ -27,8 +36,8 @@ export component QuickSwitcher inherits Window {
     icon: @image-url("../assets/repodeck-icon.svg");
     no-frame: true;
     always-on-top: true;
-    width: 620px;
-    height: 720px;
+    width: 680px;
+    height: 840px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -209,7 +218,7 @@ export component QuickSwitcher inherits Window {
                         // Scroll so the selected row is always visible even with
                         // more rows than fit (kept roughly centred). row-h = row
                         // height (62) + inter-row spacing.
-                        property <length> row-h: 62px + Theme.space-xs;
+                        property <length> row-h: 84px + Theme.space-xs;
                         property <length> content-h: root.rows.length * self.row-h;
                         y: -Math.clamp(
                             Math.min(root.selected-index, root.rows.length) * self.row-h
@@ -219,7 +228,7 @@ export component QuickSwitcher inherits Window {
                         );
 
                         for row[i] in root.rows: Rectangle {
-                        height: 62px;
+                        height: 84px;
                         border-radius: Theme.radius-md;
                         // The up/down selection is shown by the accent border;
                         // the current workset by the filled background.
@@ -303,6 +312,16 @@ export component QuickSwitcher inherits Window {
                                         font-size: 11px;
                                         color: Theme.text-tertiary;
                                     }
+                                    if row.unpushed-text != "": Text {
+                                        text: "·";
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.unpushed-text != "": Text {
+                                        text: row.unpushed-text;
+                                        font-size: 11px;
+                                        color: Theme.accent;
+                                    }
                                     if row.last-commit-text != "": Text {
                                         text: "·";
                                         font-size: 11px;
@@ -312,6 +331,37 @@ export component QuickSwitcher inherits Window {
                                         text: row.last-commit-text;
                                         font-size: 11px;
                                         color: Theme.text-tertiary;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+
+                                // Line 3: GitHub — open PR for this branch and
+                                // the latest CI result. Hidden when gh has
+                                // nothing to show for the repo.
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    if row.pr-text != "": Text {
+                                        text: row.pr-text;
+                                        font-size: 11px;
+                                        color: Theme.text-secondary;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.pr-text != "" && row.ci-text != "": Text {
+                                        text: "·";
+                                        font-size: 11px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.ci-text != "": Text {
+                                        text: row.ci-symbol;
+                                        font-size: 12px;
+                                        color: row.ci-color;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.ci-text != "": Text {
+                                        text: "CI " + row.ci-text;
+                                        font-size: 11px;
+                                        color: Theme.text-secondary;
+                                        vertical-alignment: center;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }

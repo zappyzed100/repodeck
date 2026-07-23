@@ -88,9 +88,7 @@ pub fn extract_vscode_folder(command_line: &str) -> Option<String> {
     tokenize_command_line(command_line)
         .into_iter()
         .skip(1) // the executable itself
-        .find(|token| {
-            !token.is_empty() && !token.starts_with('-') && !token.contains("://")
-        })
+        .find(|token| !token.is_empty() && !token.starts_with('-') && !token.contains("://"))
 }
 
 /// Builds the relaunch spec for a window given its executable, the owning
@@ -209,7 +207,9 @@ mod tests {
     #[test]
     fn extract_vscode_folder_reads_the_positional_path() {
         assert_eq!(
-            extract_vscode_folder(r#""C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe" "D:\work\my repo""#),
+            extract_vscode_folder(
+                r#""C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe" "D:\work\my repo""#
+            ),
             Some(r"D:\work\my repo".to_string())
         );
     }

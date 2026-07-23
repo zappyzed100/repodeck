@@ -7,22 +7,24 @@
 //!
 //! Reads the live state of a VS Code window (this one) once a second: window
 //! geometry / show-state / monitor and the folder it has open (read from the
-//! process command line, exactly like `capture_launch_spec`), plus its **git**
-//! state (branch + dirty count) and whether **Claude Code** is running or
-//! waiting for input — inferred from how recently this session's transcript
-//! (`~/.claude/projects/<slug>/<id>.jsonl`) was appended to. For the accurate,
-//! production path to Claude Code's state, use the hook integration
-//! (`ipc::protocol` + `repodeck-hook`) instead.
+//! process command line, exactly like `capture_launch_spec`), plus the **git**
+//! state read by RepoDeck's production git-status service and the **agent**
+//! execution state persisted by the production hook integration
+//! (`repodeck-hook` -> named pipe -> `runtime.json`).
 //!
-//! Usage: `repodeck-winstate [--title repodeck] [--secs 30] [--out path]`.
+//! Usage: `repodeck-winstate [--title repodeck] [--folder path] [--secs 30]
+//!        [--out path] [--data-dir path]`.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use repodeck::application::launch_service;
+use repodeck::application::{
+    agent_status_service, gh_status_service, git_status_service, launch_service,
+};
 use repodeck::domain::placement::PixelRect;
 use repodeck::domain::workset::LaunchKind;
+use repodeck::persistence::{config_store, runtime_store};
 use repodeck::windowing::enumerate::enumerate_top_level_windows;
 use repodeck::windowing::monitor::enumerate_monitors;
 use repodeck::windowing::{placement, process_info};
@@ -40,6 +42,7 @@ fn main() {
     let mut folder_fallback = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
+    let mut data_dir = repodeck::app::local_app_data_dir().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -62,6 +65,10 @@ fn main() {
                 out = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--data-dir" => {
+                data_dir = args.get(i + 1).map(PathBuf::from);
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
@@ -78,144 +85,239 @@ fn main() {
         None => Box::new(std::io::stdout()),
     };
 
+    // One-shot "home dashboard" for the target repo: the full per-repository
+    // picture the home screen is meant to show, including the slower network
+    // fields (open PRs / CI) fetched once so they stay out of the 1s loop.
+    if let Some(folder) = folder_fallback.as_deref() {
+        for line in home_dashboard(Path::new(folder), data_dir.as_deref()) {
+            let _ = writeln!(sink, "{line}");
+        }
+        let _ = sink.flush();
+    }
+
     eprintln!("[winstate] watching VS Code window title~=\"{title}\" for {secs}s, 1 line/sec");
     let start = Instant::now();
     let mut tick = 0u64;
-    while start.elapsed().as_secs() < secs {
-        let line = capture_line(&title, folder_fallback.as_deref(), tick);
+    while tick < secs {
+        let line = capture_line(
+            &title,
+            folder_fallback.as_deref(),
+            data_dir.as_deref(),
+            tick,
+        );
         let _ = writeln!(sink, "{line}");
         let _ = sink.flush();
         if out.is_some() {
             eprintln!("{line}");
         }
         tick += 1;
-        std::thread::sleep(Duration::from_secs(1));
+        if tick < secs {
+            // Keep a fixed one-second cadence. Sleeping a full second after
+            // capture would make each period "capture time + 1 second" and
+            // silently lose samples whenever git/window inspection is slow.
+            let next_tick = start + Duration::from_secs(tick);
+            std::thread::sleep(next_tick.saturating_duration_since(Instant::now()));
+        }
     }
     eprintln!("[winstate] done ({tick} samples)");
 }
 
 /// Builds one state line for the target VS Code window, re-reading everything
 /// live each tick (the window may move, resize, minimize, or change folder).
-fn capture_line(title_needle: &str, folder_fallback: Option<&str>, tick: u64) -> String {
+fn capture_line(
+    title_needle: &str,
+    folder_fallback: Option<&str>,
+    data_dir: Option<&Path>,
+    tick: u64,
+) -> String {
     let stamp = format!("t={tick:>4}s");
 
-    let windows = match enumerate_top_level_windows(std::process::id()) {
-        Ok(w) => w,
-        Err(e) => return format!("{stamp} ERROR enumerate: {e}"),
-    };
-
+    let windows = enumerate_top_level_windows(std::process::id());
     // "This window": a VS Code window whose title contains the needle.
-    let Some(w) = windows.iter().find(|w| {
-        w.executable_path
-            .as_deref()
-            .map(launch_service::classify)
-            .map(|k| k == LaunchKind::VsCode)
-            .unwrap_or(false)
-            && w.title.contains(title_needle)
-    }) else {
-        return format!("{stamp} (no VS Code window matching \"{title_needle}\" — minimized/closed?)");
+    let window = windows.as_ref().ok().and_then(|windows| {
+        windows.iter().find(|window| {
+            window
+                .executable_path
+                .as_deref()
+                .map(launch_service::classify)
+                .map(|kind| kind == LaunchKind::VsCode)
+                .unwrap_or(false)
+                && window.title.contains(title_needle)
+        })
+    });
+
+    // The folder the window has open — the non-trivial "VS Code state", read
+    // the same way `capture_launch_spec` does (process command line → folder).
+    let folder = window.and_then(|window| {
+        process_info::read_process_command_line(window.process_id)
+            .and_then(|command_line| launch_service::extract_vscode_folder(&command_line))
+    });
+
+    // Git and agent state use the same production services/stores as RepoDeck.
+    // Falling back to `--folder` is necessary for a secondary VS Code window:
+    // VS Code commonly shares a process whose command line has no folder.
+    let observed_folder = folder.as_deref().or(folder_fallback);
+    let git = observed_folder
+        .map(|path| git_state(Path::new(path)))
+        .unwrap_or_else(|| "git=?".into());
+    let agent = match (observed_folder, data_dir) {
+        (Some(path), Some(data_dir)) => agent_state(data_dir, Path::new(path)),
+        _ => "agent=?".into(),
     };
 
-    // Geometry + show state, straight from RepoDeck's window layer.
-    let hwnd = HWND(w.hwnd as *mut _);
-    let frame = window_rect(hwnd);
-    let show = placement::get_show_state(hwnd)
-        .map(|s| format!("{s:?}"))
-        .unwrap_or_else(|_| "?".into());
-
-    // Which monitor the window sits on (by its centre).
-    let monitor = frame
-        .as_ref()
-        .and_then(|r| {
-            let (cx, cy) = r.center();
-            enumerate_monitors()
-                .ok()?
-                .into_iter()
-                .find(|m| m.bounds_px.contains_point(cx, cy))
-                .map(|m| m.device_name)
-        })
-        .unwrap_or_else(|| "?".into());
-
-    // The folder the window has open — the non-trivial "VS Code state", read the
-    // same way `capture_launch_spec` does (process command line → folder).
-    let folder = process_info::read_process_command_line(w.process_id)
-        .and_then(|cl| launch_service::extract_vscode_folder(&cl));
-
-    let geo = frame
-        .map(|r| format!("frame=({},{} {}x{})", r.x, r.y, r.width, r.height))
-        .unwrap_or_else(|| "frame=?".into());
-
-    // git state of the open folder (branch + dirty count), falling back to the
-    // provided folder when VS Code exposed no path on its command line.
-    let git = folder
-        .as_deref()
-        .or(folder_fallback)
-        .map(git_state)
-        .unwrap_or_else(|| "git=?".into());
-
-    // Claude Code state for this session (running / waiting-for-input).
-    let claude = claude_status();
+    let window_projection = match window {
+        Some(window) => {
+            // Geometry + show state, straight from RepoDeck's window layer.
+            let hwnd = HWND(window.hwnd as *mut _);
+            let frame = window_rect(hwnd);
+            let show = placement::get_show_state(hwnd)
+                .map(|state| format!("{state:?}"))
+                .unwrap_or_else(|_| "?".into());
+            let monitor = frame
+                .as_ref()
+                .and_then(|rect| {
+                    let (cx, cy) = rect.center();
+                    enumerate_monitors()
+                        .ok()?
+                        .into_iter()
+                        .find(|monitor| monitor.bounds_px.contains_point(cx, cy))
+                        .map(|monitor| monitor.device_name)
+                })
+                .unwrap_or_else(|| "?".into());
+            let geometry = frame
+                .map(|rect| {
+                    format!(
+                        "frame=({},{} {}x{})",
+                        rect.x, rect.y, rect.width, rect.height
+                    )
+                })
+                .unwrap_or_else(|| "frame=?".into());
+            format!(
+                "window=[show={show} monitor={monitor} {geometry} pid={} hwnd={}]",
+                window.process_id, window.hwnd
+            )
+        }
+        None => match windows {
+            Ok(_) => format!("window=[not-found title~={title_needle:?}]"),
+            Err(error) => format!("window=[enumerate-error:{error}]"),
+        },
+    };
 
     format!(
-        "{stamp} claude={claude} {git} show={show} monitor={monitor} {geo} folder={:?} pid={} hwnd={}",
-        folder.as_deref().unwrap_or("(none)"),
-        w.process_id,
-        w.hwnd
+        "{stamp} {agent} {git} {window_projection} folder={:?}",
+        observed_folder.unwrap_or("(none)")
     )
 }
 
-/// `branch=<name> dirty=<n>` for the repo at `folder`, via the git CLI (best
-/// effort — the same information RepoDeck shows in the Quick Switcher row).
-fn git_state(folder: &str) -> String {
-    let run = |args: &[&str]| -> Option<String> {
-        let o = std::process::Command::new("git")
-            .args(["-C", folder])
-            .args(args)
-            .output()
-            .ok()?;
-        o.status
-            .success()
-            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "?".into());
-    let dirty = run(&["status", "--porcelain"])
-        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-        .unwrap_or(0);
-    format!("git=[branch={branch} dirty={dirty}]")
+/// One-shot per-repository summary — every field the home-screen dashboard
+/// wants, gathered from the production services (git + gh + agent hooks). Slow
+/// network fields (PRs / CI) are fetched here once, not per tick.
+fn home_dashboard(folder: &Path, data_dir: Option<&Path>) -> Vec<String> {
+    let git = git_status_service::fetch(folder);
+    let branch = git.branch.clone().unwrap_or_else(|| "-".into());
+    let gh = gh_status_service::fetch(folder, git.branch.as_deref());
+    let (ci_sym, ci_label) = gh.ci.symbol_label();
+    let pr = gh
+        .current_branch_pr
+        .as_ref()
+        .map(|p| format!("PR #{} {:?}", p.number, p.title))
+        .unwrap_or_else(|| "-".into());
+    let agent = data_dir
+        .map(|d| agent_state(d, folder))
+        .unwrap_or_else(|| "agent=?".into());
+
+    vec![
+        "===== home dashboard (one-shot) =====".into(),
+        format!("  repo            : {}", folder.display()),
+        format!("  branch          : {branch}"),
+        format!("  uncommitted     : {} 変更", git.changed_count),
+        format!(
+            "  unpushed        : {}",
+            if git.has_upstream {
+                format!("{} commits", git.ahead)
+            } else {
+                "(no upstream)".into()
+            }
+        ),
+        format!(
+            "  last commit     : {}",
+            git.last_commit_at.as_deref().unwrap_or("-")
+        ),
+        format!("  open PRs        : {}", gh.open_pr_count),
+        format!("  this branch PR  : {pr}"),
+        format!("  CI              : {ci_sym} {ci_label}"),
+        format!("  agent (担当)    : {agent}"),
+        format!("  gh available    : {}", gh.gh_available),
+        "=====================================".into(),
+    ]
 }
 
-/// RUNNING vs WAITING-INPUT for the active Claude Code session, inferred from
-/// how recently its transcript JSONL was appended to: while Claude Code works it
-/// streams tool calls / output into the transcript, so a fresh mtime means it is
-/// executing; once it hands the turn back to the user the file goes quiet.
-fn claude_status() -> String {
-    let Some(base) = std::env::var_os("USERPROFILE") else {
-        return "CLAUDE=?".into();
-    };
-    let dir = Path::new(&base)
-        .join(".claude")
-        .join("projects")
-        .join("c--code-portfolio-repodeck");
-    // Newest .jsonl in the project dir is the active session's transcript.
-    let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
-        rd.filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (p, t)))
-            .max_by_key(|(_, t)| *t)
-    });
-    let Some((_, modified)) = newest else {
-        return "CLAUDE=(no session)".into();
-    };
-    let age = modified.elapsed().map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    let state = if age < 3.0 {
-        "RUNNING"
-    } else if age < 90.0 {
-        "WAITING-INPUT"
+/// Git projection produced by the exact service used to fill Quick Switcher.
+fn git_state(folder: &Path) -> String {
+    let git = git_status_service::fetch(folder);
+    if !git.is_git {
+        return "git=[not-repository]".into();
+    }
+    let unpushed = if git.has_upstream {
+        format!("{}", git.ahead)
     } else {
-        "IDLE"
+        "no-upstream".into()
     };
-    format!("{state}(idle={age:.0}s)")
+    format!(
+        "git=[branch={} changed={} unpushed={} behind={} last_commit={}]",
+        git.branch.as_deref().unwrap_or("-"),
+        git.changed_count,
+        unpushed,
+        git.behind,
+        git.last_commit_at.as_deref().unwrap_or("-")
+    )
+}
+
+/// Agent projection produced from the persisted result of RepoDeck's actual
+/// hook path. No transcript/process heuristic is involved.
+fn agent_state(data_dir: &Path, folder: &Path) -> String {
+    let config = match config_store::load(data_dir) {
+        Ok(Some(loaded)) => loaded.config,
+        Ok(None) => return "agent=[no-config]".into(),
+        Err(error) => return format!("agent=[config-error:{error}]"),
+    };
+
+    let Some(workset_id) = agent_status_service::map_event_to_workset(&config.worksets, folder)
+    else {
+        return "agent=[unmatched-workset]".into();
+    };
+
+    let runtime = runtime_store::load(data_dir);
+    let aggregate = agent_status_service::aggregate_all(&config.worksets, &runtime.agent_runs)
+        .get(&workset_id)
+        .copied()
+        .unwrap_or(repodeck::domain::agent::AgentState::Unknown);
+    let workset_name = config
+        .worksets
+        .iter()
+        .find(|workset| workset.id == workset_id)
+        .map(|workset| workset.name.as_str())
+        .unwrap_or("?");
+    let runs = runtime
+        .agent_runs
+        .iter()
+        .filter(|run| run.workset_id == workset_id)
+        .map(|run| {
+            format!(
+                "{}:{}={:?}",
+                run.session_id,
+                if run.turn_id.is_empty() {
+                    "-"
+                } else {
+                    &run.turn_id
+                },
+                run.state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("agent=[workset={workset_name:?} aggregate={aggregate:?} runs={runs:?}]")
 }
 
 fn window_rect(hwnd: HWND) -> Option<PixelRect> {

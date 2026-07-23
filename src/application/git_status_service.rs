@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::domain::git::{GitStatus, clean_branch, parse_changed_count};
+use crate::domain::git::{GitStatus, clean_branch, parse_ahead_behind, parse_changed_count};
 
 /// `CREATE_NO_WINDOW` — keeps `git.exe` from popping a console window each time
 /// it runs (these calls happen silently in the background).
@@ -54,10 +54,27 @@ pub fn fetch(path: &Path) -> GitStatus {
         .map(|out| out.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    // Unpushed / behind counts, only meaningful with an upstream. The symmetric
+    // `--left-right --count @{upstream}...HEAD` fails (→ None) when the branch
+    // has no upstream, which is exactly when there's nothing to report.
+    let (has_upstream, ahead, behind) = match git(
+        path,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    ) {
+        Some(out) => {
+            let (ahead, behind) = parse_ahead_behind(&out);
+            (true, ahead, behind)
+        }
+        None => (false, 0, 0),
+    };
+
     GitStatus {
         is_git: true,
         branch: clean_branch(&branch_raw),
         changed_count,
         last_commit_at,
+        has_upstream,
+        ahead,
+        behind,
     }
 }

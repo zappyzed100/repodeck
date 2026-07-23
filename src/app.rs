@@ -2544,6 +2544,23 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                 agent_row_status(&state.agent_runs, workset.id, agent_state);
             let (agent_symbol, agent_status_label) = agent_symbol_and_label(agent_state);
             let git = cached_git_status(&workset.repository_path);
+            let gh = cached_gh_status(&workset.repository_path);
+            let unpushed_text = if git.has_upstream && git.ahead > 0 {
+                format!("↑{}未push", git.ahead)
+            } else {
+                String::new()
+            };
+            let pr_text = match (&gh.current_branch_pr, gh.open_pr_count) {
+                (Some(pr), _) => format!("PR #{}", pr.number),
+                (None, n) if n > 0 => format!("PR ×{n}"),
+                _ => String::new(),
+            };
+            use crate::application::gh_status_service::CiState;
+            let (ci_symbol, ci_text) = if gh.gh_available && gh.ci != CiState::None {
+                gh.ci.symbol_label()
+            } else {
+                ("", "")
+            };
             QuickSwitcherRow {
                 workset_id: workset.id.to_string().into(),
                 name: workset.name.clone().into(),
@@ -2577,6 +2594,11 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                     .map(format_commit_relative)
                     .unwrap_or_default()
                     .into(),
+                unpushed_text: unpushed_text.into(),
+                pr_text: pr_text.into(),
+                ci_symbol: ci_symbol.into(),
+                ci_text: ci_text.into(),
+                ci_color: hex_to_color(ci_state_color(gh.ci)),
             }
         })
         .collect();
@@ -2603,6 +2625,18 @@ fn agent_symbol_and_label(state: AgentState) -> (&'static str, &'static str) {
         AgentState::Ready => ("✓", "成功"),
         AgentState::Blocked => ("×", "失敗"),
         AgentState::Idle | AgentState::Unknown => ("—", "未実行"),
+    }
+}
+
+/// Hex colour for a CI state's symbol in the Quick Switcher (green pass / red
+/// fail / blue running / grey none), matching the agent-status palette.
+fn ci_state_color(state: crate::application::gh_status_service::CiState) -> &'static str {
+    use crate::application::gh_status_service::CiState;
+    match state {
+        CiState::Success => "#66BB6A",
+        CiState::Failure => "#EF5350",
+        CiState::Running => "#42A5F5",
+        CiState::None | CiState::Unknown => "#9E9E9E",
     }
 }
 
@@ -2719,9 +2753,11 @@ fn select_row_for_workset(switcher: &QuickSwitcher, workset_id: uuid::Uuid) {
 /// reliably grab keyboard focus on `.show()` alone).
 fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
     refresh_quick_switcher_rows(switcher, config, data_dir);
-    // Kick a background git refresh; rows re-render when it completes. The
-    // switcher shows the cached (possibly stale/empty) values immediately.
+    // Kick background git + GitHub refreshes; rows re-render when each
+    // completes. The switcher shows the cached (possibly stale/empty) values
+    // immediately, git fills in fast, and the slower gh (PR/CI) fills in after.
     spawn_git_refresh(workset_repo_paths(config));
+    spawn_gh_refresh(workset_repo_paths(config));
 
     let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
     let cursor = monitor::cursor_position().unwrap_or((0, 0));
@@ -2858,7 +2894,10 @@ fn compute_empty_main_destinations(
                     .iter()
                     .filter(|w| {
                         w.windows.iter().any(|mw| {
-                            matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                            matches!(
+                                decisions.get(&mw.id),
+                                Some(MatchDecision::AutoRebind { .. })
+                            )
                         })
                     })
                     .map(|w| w.id)
@@ -3045,8 +3084,9 @@ fn wire_quick_switcher(
 
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
         // A switch can change branch/uncommitted state (e.g. worktrees) — refresh
-        // git in the background so the next open shows current values.
+        // git + GitHub in the background so the next open shows current values.
         spawn_git_refresh(workset_repo_paths(&c.borrow()));
+        spawn_gh_refresh(workset_repo_paths(&c.borrow()));
         if close_after_switch {
             let _ = switcher.hide();
         }
@@ -4206,6 +4246,42 @@ fn spawn_git_refresh(paths: Vec<PathBuf>) {
             }
         }
         let _ = slint::invoke_from_event_loop(refresh_quick_switcher_from_context);
+    });
+}
+
+/// Per-repository GitHub status (open PRs + CI), refreshed on a background
+/// thread — `gh` talks to the network, so it must never block the switcher.
+/// Read when building rows; the empty default shows until the first refresh.
+static GH_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, crate::application::gh_status_service::GhStatus>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn cached_gh_status(path: &Path) -> crate::application::gh_status_service::GhStatus {
+    GH_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
+        .unwrap_or_default()
+}
+
+/// Fetches each repo's GitHub status (PRs + CI) on a background thread, storing
+/// it in `GH_CACHE` and re-rendering the switcher as each repo resolves (gh is
+/// slow, so rows fill in progressively rather than waiting for the whole set).
+/// Uses each repo's cached git branch to find that branch's PR and scope CI.
+fn spawn_gh_refresh(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for path in paths {
+            let branch = cached_git_status(&path).branch;
+            let status =
+                crate::application::gh_status_service::fetch(&path, branch.as_deref());
+            if let Ok(mut cache) = GH_CACHE.lock() {
+                cache.insert(path, status);
+            }
+            let _ = slint::invoke_from_event_loop(refresh_quick_switcher_from_context);
+        }
     });
 }
 
