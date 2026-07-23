@@ -9,8 +9,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
@@ -114,8 +114,19 @@ fn describe_candidate(hwnd: HWND, exclude_process_id: u32) -> Option<TopLevelWin
         return None;
     }
 
-    let rect_px = get_window_rect(hwnd)?;
-    if rect_px.width < MIN_CANDIDATE_WIDTH || rect_px.height < MIN_CANDIDATE_HEIGHT {
+    // A minimized window has a tiny off-screen frame (≈ -32000). Keep it in the
+    // list anyway — otherwise a window parked-to-minimized by an earlier switch
+    // can never be matched and brought back when its own set is activated
+    // (2026-07-23). Use its restore rect so it isn't dropped as "too small".
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    let rect_px = if minimized {
+        crate::windowing::placement::get_normal_rect(hwnd)
+            .ok()
+            .or_else(|| get_window_rect(hwnd))?
+    } else {
+        get_window_rect(hwnd)?
+    };
+    if !minimized && (rect_px.width < MIN_CANDIDATE_WIDTH || rect_px.height < MIN_CANDIDATE_HEIGHT) {
         return None;
     }
 
