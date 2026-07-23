@@ -1661,6 +1661,246 @@ mod tests {
         assert_eq!(evictees, vec![20, 40]);
     }
 
+    fn mon_wh(device_name: &str, x: i32, y: i32, w: i32, h: i32) -> MonitorInfo {
+        MonitorInfo {
+            handle: 0,
+            device_name: device_name.to_string(),
+            bounds_px: PixelRect::new(x, y, w, h),
+            work_area_px: PixelRect::new(x, y, w, h),
+            dpi_x: 96,
+            dpi_y: 96,
+            is_primary: x == 0 && y == 0,
+        }
+    }
+
+    /// Drives the *real* `switch_to` through thousands of random set switches on
+    /// a fake desktop and asserts, after every switch, that the layout is valid:
+    /// no two visible windows overlap, the set switched to actually has its
+    /// windows on-screen (not stranded/minimized), and nothing lands off every
+    /// monitor. Deterministic PRNG so any failure reproduces from the seed.
+    #[test]
+    fn simulation_thousands_of_random_switches_keep_the_layout_valid() {
+        use crate::domain::config::SubScreen;
+
+        // 2 main + 5 parking (2 HD, 3 QHD) + 1 sub monitor. Enough parking that
+        // the auto windows usually have slack, so the optimality check below is
+        // actually exercised (not just "everything is full").
+        let monitors = vec![
+            mon_wh("MAIN0", 0, 0, 1920, 1080),
+            mon_wh("MAIN1", 1920, 0, 1920, 1080),
+            mon_wh("PARK1", -1920, 0, 1920, 1080),
+            mon_wh("PARK2", -3840, 0, 1920, 1080),
+            mon_wh("PARK3", 3840, 0, 2560, 1440),
+            mon_wh("PARK4", 3840, 1440, 2560, 1440),
+            mon_wh("PARK5", 3840, 2880, 2560, 1440),
+            mon_wh("SUBMON", 6400, 0, 1920, 1080),
+        ];
+        let main_ids = vec!["MAIN0".to_string(), "MAIN1".to_string()];
+        let sub = SubScreen {
+            id: Uuid::new_v4(),
+            name: "S".to_string(),
+            monitor_ids: vec!["SUBMON".to_string()],
+            split: AutoSplit::One,
+            cell_index: 0,
+            fullscreen: false,
+        };
+        let full = NormalizedRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+
+        // 15 sets × 2 windows; sets 0,1 park onto the sub, the rest are Auto.
+        // Each window has a unique exe/title so it matches exactly one entry.
+        let mut worksets: Vec<Workset> = Vec::new();
+        let mut wins: Vec<(isize, String)> = Vec::new();
+        let mut hwnd = 100isize;
+        for s in 0..15 {
+            let policy = if s < 2 {
+                ParkingPolicy::SubScreen { sub_screen_id: sub.id }
+            } else {
+                ParkingPolicy::Auto
+            };
+            let mut mws = Vec::new();
+            for (idx, ab) in ["a", "b"].iter().enumerate() {
+                let exe = format!("s{s:02}{ab}");
+                mws.push(managed_window(&exe, idx, full, SavedShowState::Normal, idx as i32));
+                wins.push((hwnd, exe));
+                hwnd += 1;
+            }
+            worksets.push(workset(s, policy, mws));
+        }
+
+        let fake = FakeWindowOps::new();
+        for (h, _) in &wins {
+            fake.seed_window(*h, PixelRect::new(0, 0, 800, 600), SavedShowState::Normal);
+        }
+        let dir = tempdir().unwrap();
+        let coord = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+        let mon_rects: Vec<PixelRect> = monitors.iter().map(|m| m.bounds_px).collect();
+
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        for iter in 0..3000u32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let target_idx = ((seed >> 33) as usize) % worksets.len();
+
+            let live: Vec<TopLevelWindow> = wins
+                .iter()
+                .map(|(h, exe)| {
+                    let mut lw = live_window(*h, exe);
+                    lw.rect_px = coord.window_ops.rect_of(*h).unwrap();
+                    lw
+                })
+                .collect();
+
+            coord
+                .switch_to(SwitchRequest {
+                    worksets: &worksets,
+                    fixed_slots: &[],
+                    sub_screens: std::slice::from_ref(&sub),
+                    saved_monitors: &[],
+                    main_monitor_ids: &main_ids,
+                    live_monitors: &monitors,
+                    live_windows: &live,
+                    target_workset_id: worksets[target_idx].id,
+                })
+                .unwrap_or_else(|e| panic!("switch #{iter} to set {target_idx} failed: {e:?}"));
+
+            // The set switched to must have both its windows visible (on main).
+            for k in 0..2 {
+                let h = wins[target_idx * 2 + k].0;
+                assert_ne!(
+                    coord.window_ops.show_state_of(h),
+                    Some(SavedShowState::Minimized),
+                    "switch #{iter} to set {target_idx}: its window {h} was left minimized"
+                );
+            }
+
+            // Collect every non-minimized window's rect.
+            let placed: Vec<(isize, PixelRect)> = wins
+                .iter()
+                .filter(|(h, _)| {
+                    coord.window_ops.show_state_of(*h) != Some(SavedShowState::Minimized)
+                })
+                .map(|(h, _)| (*h, coord.window_ops.rect_of(*h).unwrap()))
+                .collect();
+
+            // No two visible windows overlap.
+            for i in 0..placed.len() {
+                for j in (i + 1)..placed.len() {
+                    let (ha, a) = placed[i];
+                    let (hb, b) = placed[j];
+                    let overlap =
+                        a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                    assert!(
+                        !overlap,
+                        "switch #{iter} to set {target_idx}: {ha} {a:?} overlaps {hb} {b:?}"
+                    );
+                }
+            }
+            // Every visible window is fully on some monitor.
+            for (h, r) in &placed {
+                assert!(
+                    on_some_monitor(*r, &mon_rects),
+                    "switch #{iter} to set {target_idx}: window {h} {r:?} is off every monitor"
+                );
+            }
+
+            // The active set's windows are on a MAIN monitor.
+            let main_rects = [mon_rects[0], mon_rects[1]];
+            for k in 0..2 {
+                let h = wins[target_idx * 2 + k].0;
+                let r = coord.window_ops.rect_of(h).unwrap();
+                assert!(
+                    on_some_monitor(r, &main_rects),
+                    "switch #{iter}: active set {target_idx} window {h} {r:?} is not on a main monitor"
+                );
+            }
+            // No non-active visible window sits on a main monitor.
+            for si in 0..worksets.len() {
+                if si == target_idx {
+                    continue;
+                }
+                for k in 0..2 {
+                    let h = wins[si * 2 + k].0;
+                    if coord.window_ops.show_state_of(h) == Some(SavedShowState::Minimized) {
+                        continue;
+                    }
+                    let r = coord.window_ops.rect_of(h).unwrap();
+                    assert!(
+                        !on_some_monitor(r, &main_rects),
+                        "switch #{iter}: non-active set {si} window {h} {r:?} is on a main monitor"
+                    );
+                }
+            }
+
+            // OPTIMALITY: the parked auto windows are at a local maximin optimum —
+            // no single window can move to another parking monitor and make the
+            // smallest parked cell larger (spec §2.5: each window as large as the
+            // layout allows). This is what catches a *suboptimal* (not merely
+            // invalid) placement.
+            let park = [
+                mon_rects[2], mon_rects[3], mon_rects[4], mon_rects[5], mon_rects[6],
+            ];
+            let caps: Vec<usize> = park.iter().map(|m| screen_capacity(*m)).collect();
+            let mut occ = [0usize; 5];
+            for si in 2..worksets.len() {
+                if si == target_idx {
+                    continue;
+                }
+                for k in 0..2 {
+                    let h = wins[si * 2 + k].0;
+                    if coord.window_ops.show_state_of(h) == Some(SavedShowState::Minimized) {
+                        continue;
+                    }
+                    let r = coord.window_ops.rect_of(h).unwrap();
+                    for (mi, pm) in park.iter().enumerate() {
+                        if r.x >= pm.x
+                            && r.right() <= pm.right()
+                            && r.y >= pm.y
+                            && r.bottom() <= pm.bottom()
+                        {
+                            occ[mi] += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            let cell = |mi: usize, count: usize| -> i64 {
+                if count == 0 {
+                    i64::MAX
+                } else {
+                    smallest_cell_area(park[mi], count)
+                }
+            };
+            let cur_min = (0..5)
+                .filter(|&mi| occ[mi] > 0)
+                .map(|mi| cell(mi, occ[mi]))
+                .min()
+                .unwrap_or(i64::MAX);
+            for a in 0..5 {
+                if occ[a] == 0 {
+                    continue;
+                }
+                for b in 0..5 {
+                    if a == b || occ[b] >= caps[b] {
+                        continue;
+                    }
+                    let mut n = occ;
+                    n[a] -= 1;
+                    n[b] += 1;
+                    let new_min = (0..5)
+                        .filter(|&mi| n[mi] > 0)
+                        .map(|mi| cell(mi, n[mi]))
+                        .min()
+                        .unwrap_or(i64::MAX);
+                    assert!(
+                        new_min <= cur_min,
+                        "switch #{iter} to set {target_idx}: SUBOPTIMAL parking — moving a window {a}->{b} raises smallest cell {cur_min}->{new_min} (occ {occ:?} caps {caps:?})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn simulation_sub_screen_sharers_tile_the_region_without_gaps() {
         use crate::domain::config::SubScreen;

@@ -138,12 +138,32 @@ pub fn set_placement(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) {
     apply_placement(hwnd, rect, maximized, fill);
 
     let raw = hwnd.0 as isize;
+    // Each placement of a window gets a fresh generation number. The re-assert
+    // loop below stops the instant a newer `set_placement` for the same window
+    // supersedes it — otherwise a previous switch's ~6.5s re-assert thread keeps
+    // re-applying its (now stale) rect and fights the new switch's placement,
+    // leaving windows at the wrong size / overlapping and making the parking
+    // monitors flicker (2026-07-23).
+    let my_generation = {
+        let mut map = PLACEMENT_GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let g = map.entry(raw).or_insert(0);
+        *g = g.wrapping_add(1);
+        *g
+    };
     std::thread::spawn(move || {
         // Long tail (≈6.5s cumulative): a browser leaving F11 full-screen
         // restores its own remembered bounds noticeably after our first apply,
         // so keep winning the race until it stops re-asserting.
         for delay_ms in [300u64, 500, 700, 1000, 1500, 2500] {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            // Superseded by a newer placement of this window? Stop.
+            let current = PLACEMENT_GENERATIONS
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&raw).copied());
+            if current != Some(my_generation) {
+                break;
+            }
             let hwnd = HWND(raw as *mut _);
             match placement_settled(hwnd, rect, maximized, fill) {
                 None => break, // window is gone; nothing left to do
@@ -157,6 +177,12 @@ pub fn set_placement(hwnd: HWND, rect: PixelRect, maximized: bool, fill: bool) {
         }
     });
 }
+
+/// Per-window placement generation. Bumped on every `set_placement`; a re-assert
+/// loop aborts once its generation is no longer the latest for that window.
+static PLACEMENT_GENERATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<isize, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// One pass of the working sequence: leave maximized/minimized state without
 /// stealing focus, apply the rectangle (expanded to fill if `fill`), then
