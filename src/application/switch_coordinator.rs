@@ -178,6 +178,21 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .unwrap_or_default();
         let target_resolved = resolved_windows(target, &decisions, request.live_windows);
 
+        // Every non-target workset that has live windows. ALL of them are parked
+        // (re-placed) on each switch — not just the outgoing one — so the parking
+        // layout always matches the current balanced allocation. Otherwise a set
+        // parked by an earlier switch keeps a stale cell and overlaps the freshly
+        // parked ones at the wrong size (2026-07-23).
+        let parking: Vec<(&Workset, Vec<ResolvedWindow>)> = request
+            .worksets
+            .iter()
+            .filter(|w| w.id != target.id)
+            .filter_map(|w| {
+                let resolved = resolved_windows(w, &decisions, request.live_windows);
+                (!resolved.is_empty()).then_some((w, resolved))
+            })
+            .collect();
+
         tracing::info!(
             target: "switch",
             from = current.map(|w| w.name.as_str()).unwrap_or("(none)"),
@@ -225,8 +240,9 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // Step 4: journal every affected window's pre-switch placement.
         let transaction_id = Uuid::new_v4();
         let mut journal_windows = Vec::new();
-        for resolved in current_resolved
+        for resolved in parking
             .iter()
+            .flat_map(|(_, r)| r.iter())
             .chain(target_resolved.iter())
             .chain(sub_evictees.iter())
         {
@@ -248,37 +264,27 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // very end (after the target is focused), so the keys land on the parked
         // video and the foreground still ends up on the new workset.
         let mut fullscreen_hwnds: Vec<isize> = Vec::new();
-        if let Some(current) = current {
+        // The sets that reserve a parking cell are exactly the non-target live
+        // sets (a set whose apps are all closed reserves nothing, so it can't
+        // shrink the others — 2026-07-23).
+        let worksets_with_windows: std::collections::HashSet<Uuid> =
+            parking.iter().map(|(w, _)| w.id).collect();
+        // Clear any stale foreign window out of the outgoing set's sub cell first.
+        self.park_evictees(&sub_evictees, &request);
+        // Re-place every non-target live set into its current allocated cell.
+        for (w, resolved) in &parking {
             tracing::info!(
-                target: "switch", workset = %current.name,
-                windows = current_resolved.len(), evictees = sub_evictees.len(),
-                policy = ?current.parking_policy, "switch: parking outgoing workset"
+                target: "switch", workset = %w.name, windows = resolved.len(),
+                policy = ?w.parking_policy, "switch: parking set"
             );
-            // Only sets that actually have live windows on screen should reserve
-            // a parking cell — otherwise a set whose apps are closed still eats
-            // space and crams the live windows into needlessly small cells
-            // (2026-07-23 bug: 「空きがあるのに1/4で退避」).
-            let worksets_with_windows: std::collections::HashSet<Uuid> = request
-                .worksets
-                .iter()
-                .filter(|w| {
-                    w.windows.iter().any(|mw| {
-                        matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
-                    })
-                })
-                .map(|w| w.id)
-                .collect();
-            // Clear any stale occupant out of the sub-screen cell first, so the
-            // outgoing window is not stacked on top of it.
-            self.park_evictees(&sub_evictees, &request);
             match self.park_workset(
-                current,
-                &current_resolved,
+                w,
+                resolved,
                 &request,
                 &mut runtime.auto_slot_assignments,
                 &worksets_with_windows,
             ) {
-                Ok(hwnds) => fullscreen_hwnds = hwnds,
+                Ok(hwnds) => fullscreen_hwnds.extend(hwnds),
                 Err(reason) => return Err(self.rollback(journal, reason)),
             }
         }
