@@ -183,7 +183,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // layout always matches the current balanced allocation. Otherwise a set
         // parked by an earlier switch keeps a stale cell and overlaps the freshly
         // parked ones at the wrong size (2026-07-23).
-        let parking: Vec<(&Workset, Vec<ResolvedWindow>)> = request
+        let mut parking: Vec<(&Workset, Vec<ResolvedWindow>)> = request
             .worksets
             .iter()
             .filter(|w| w.id != target.id)
@@ -192,6 +192,27 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 (!resolved.is_empty()).then_some((w, resolved))
             })
             .collect();
+
+        // ウィンドウ単位の「退避せず最小化」（ManagedWindow::minimize_when_parked）。
+        // 退避（別画面のセルへ移動）する代わりに最小化したいウィンドウを、退避対象
+        // から外してここで直接最小化する。セル数の割り当てより前に外すので、残りの
+        // ウィンドウだけで退避レイアウトが計算される。全ウィンドウが最小化指定の
+        // セットは退避対象から消える。
+        for (_w, resolved) in &mut parking {
+            resolved.retain(|r| {
+                if r.managed.minimize_when_parked {
+                    tracing::info!(
+                        target: "switch", hwnd = r.hwnd,
+                        "switch: minimizing window instead of parking (退避せず最小化)"
+                    );
+                    self.window_ops.minimize(r.hwnd);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        parking.retain(|(_, resolved)| !resolved.is_empty());
 
         tracing::info!(
             target: "switch",
@@ -1210,6 +1231,7 @@ mod tests {
             },
             z_order,
             launch_spec: None,
+            minimize_when_parked: false,
         }
     }
 
@@ -1274,6 +1296,98 @@ mod tests {
         assert!(
             on_some_monitor(rect, monitors),
             "hwnd {hwnd} rect {rect:?} is not fully within any monitor"
+        );
+    }
+
+    #[test]
+    fn a_minimize_when_parked_window_is_minimized_not_relocated() {
+        let dir = tempdir().unwrap();
+        let main_rect = NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.3,
+            height: 0.3,
+        };
+        // セットAは2窓：a1は通常退避、a2は「退避せず最小化」指定。
+        let mut a2 = managed_window("app-a2", 0, main_rect, SavedShowState::Normal, 1);
+        a2.minimize_when_parked = true;
+        let a = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![
+                managed_window("app-a1", 0, main_rect, SavedShowState::Normal, 0),
+                a2,
+            ],
+        );
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window(
+                "app-b",
+                0,
+                main_rect,
+                SavedShowState::Normal,
+                0,
+            )],
+        );
+        let worksets = vec![a.clone(), b.clone()];
+
+        let live_windows = vec![
+            live_window(1, "app-a1"),
+            live_window(2, "app-a2"),
+            live_window(3, "app-b"),
+        ];
+        let main = monitor("MAIN", 0);
+        let side = monitor("SIDE", 1920);
+        let live_monitors = vec![main.clone(), side.clone()];
+        let saved_monitors = vec![crate::domain::monitor::SavedMonitor {
+            stable_id: "SIDE".to_string(),
+            device_name: "SIDE".to_string(),
+            device_path: None,
+            friendly_name: None,
+            bounds_px: side.bounds_px,
+            work_area_px: side.work_area_px,
+            dpi_x: 96,
+            dpi_y: 96,
+            auto_split: Some(AutoSplit::One),
+            excluded: false,
+        }];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+
+        let fake = FakeWindowOps::new();
+        for hwnd in [1isize, 2, 3] {
+            fake.seed_window(
+                hwnd,
+                PixelRect::new(100, 100, 400, 300),
+                SavedShowState::Normal,
+            );
+        }
+        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+
+        // Bへ切り替える＝Aは退避される。
+        coordinator
+            .switch_to(SwitchRequest {
+                worksets: &worksets,
+                fixed_slots: &[],
+                sub_screens: &[],
+                saved_monitors: &saved_monitors,
+                main_monitor_ids: &main_monitor_ids,
+                live_monitors: &live_monitors,
+                live_windows: &live_windows,
+                target_workset_id: b.id,
+            })
+            .expect("switch to B");
+
+        // a2（最小化指定）は最小化。a1は退避＝最小化されていない。
+        assert_eq!(
+            coordinator.window_ops.show_state_of(2),
+            Some(SavedShowState::Minimized),
+            "flagged window must be minimized, not relocated"
+        );
+        assert_ne!(
+            coordinator.window_ops.show_state_of(1),
+            Some(SavedShowState::Minimized),
+            "unflagged window must be parked normally"
         );
     }
 

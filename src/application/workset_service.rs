@@ -192,6 +192,7 @@ pub fn build_managed_window(
         // Filled in by the caller (registration), which knows the workset's
         // repository path and can read a browser's URL from its live HWND.
         launch_spec: None,
+        minimize_when_parked: false,
     })
 }
 
@@ -670,6 +671,7 @@ mod tests {
             },
             z_order: 0,
             launch_spec: None,
+            minimize_when_parked: false,
         };
         let mut managed_b = managed_a.clone();
         managed_b.id = Uuid::new_v4();
@@ -740,6 +742,7 @@ mod tests {
             },
             z_order: 0,
             launch_spec: None,
+            minimize_when_parked: false,
         };
         let mut managed_b = managed_a.clone();
         managed_b.id = Uuid::new_v4();
@@ -812,6 +815,7 @@ mod tests {
             },
             z_order: 0,
             launch_spec: None,
+            minimize_when_parked: false,
         }
     }
 

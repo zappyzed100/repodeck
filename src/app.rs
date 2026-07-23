@@ -1132,6 +1132,8 @@ struct PendingApp {
     /// How that monitor is divided, and which cell (reading order) this app takes.
     split: AutoSplit,
     cell_index: usize,
+    /// 退避時に移動せず最小化するか（`ManagedWindow::minimize_when_parked`）。
+    minimize_when_parked: bool,
 }
 
 /// UI-only Workset Manager state: the last enumerated monitor list (needed to
@@ -1470,6 +1472,8 @@ fn build_launch_app_window(
         },
         z_order: i32::try_from(z_order).unwrap_or(0),
         launch_spec: Some(spec),
+        // 編集時も、詳細で切り替えた「退避せず最小化」の設定を引き継ぐ。
+        minimize_when_parked: pending.minimize_when_parked,
     }
 }
 
@@ -1528,6 +1532,7 @@ fn pending_from_managed_window(
         monitor_index: window.main_placement.main_monitor_index,
         split,
         cell_index,
+        minimize_when_parked: window.minimize_when_parked,
     }
 }
 
@@ -1772,6 +1777,7 @@ fn refresh_selected_workset_detail(
                 title: window.matcher.registered_title.clone().into(),
                 status_label: label.into(),
                 status_is_warning: warn,
+                minimize_when_parked: window.minimize_when_parked,
             }
         })
         .collect();
@@ -2574,6 +2580,8 @@ fn wire_workset_manager(
             monitor_index,
             split,
             cell_index,
+            // 既定は退避。登録後に詳細のチェックボックスで最小化へ切り替える。
+            minimize_when_parked: false,
         });
         refresh_pending_apps(&manager, &state);
         drop(state);
@@ -2695,6 +2703,35 @@ fn wire_workset_manager(
         let mut state = s.borrow_mut();
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
         refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
+    });
+
+    // 退避せず最小化: 選択セットの index 番目のウィンドウの
+    // `minimize_when_parked` を反転して保存する。次の切り替えから有効。
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_toggle_window_minimize_when_parked(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        {
+            let mut config = c.borrow_mut();
+            let state = s.borrow();
+            let Some(window) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get_mut(i))
+                .and_then(|w| w.windows.get_mut(index))
+            else {
+                return;
+            };
+            window.minimize_when_parked = !window.minimize_when_parked;
+        }
+        if let Err(err) = config_store::save(&d, &c.borrow()) {
+            tracing::warn!(error = %err, "failed to save minimize-when-parked toggle");
+        }
+        refresh_selected_workset_detail(&manager, &c.borrow(), &s.borrow(), &d);
     });
 
     // 編集: load the selected set back into the registration view. Everything

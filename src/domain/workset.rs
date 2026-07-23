@@ -55,6 +55,12 @@ pub struct ManagedWindow {
     /// this field existed, or apps whose launch couldn't be determined.
     #[serde(default)]
     pub launch_spec: Option<LaunchSpec>,
+    /// 別のセットへ切り替えたとき、このウィンドウを退避（別画面のセルへ移動）
+    /// せず**最小化**する。ブラウザなど、動かすより最小化したほうが都合のよい
+    /// ウィンドウ向け。既定は `false`（従来どおり退避）。セット管理の詳細で
+    /// ウィンドウ単位に切り替える。
+    #[serde(default)]
+    pub minimize_when_parked: bool,
 }
 
 /// An app the user has registered as a launch candidate (the "起動候補" list).

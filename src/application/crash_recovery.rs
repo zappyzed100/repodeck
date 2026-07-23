@@ -176,6 +176,7 @@ mod tests {
             },
             z_order: 0,
             launch_spec: None,
+            minimize_when_parked: false,
         }
     }
 

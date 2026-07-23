@@ -14,6 +14,8 @@ export struct ManagedWindowSummary {
     title: string,
     status_label: string,
     status_is_warning: bool,
+    // 退避時に移動せず最小化する（ManagedWindow::minimize_when_parked）。
+    minimize_when_parked: bool,
 }
 
 export struct RegistrationCandidate {
@@ -96,6 +98,8 @@ export component WorksetManager inherits Window {
     callback close-workset-windows-requested();
     /// Load the selected set back into the registration view to change it.
     callback edit-workset-requested();
+    /// 選択セットのウィンドウ（index番目）の「退避せず最小化」を切り替える。
+    callback toggle-window-minimize-when-parked(index: int);
 
     callback start-registration();
     callback cancel-registration();
@@ -308,6 +312,23 @@ export component WorksetManager inherits Window {
                                             text: w.status_label;
                                             font-size: 10px;
                                             color: w.status_is_warning ? Theme.danger : Theme.success;
+                                        }
+                                    }
+
+                                    // 退避せず最小化するか。オフ=退避（別画面へ移動）、
+                                    // オン=最小化。ブラウザなど移動より最小化が好ましい窓向け。
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        spacing: Theme.space-xs;
+                                        Text {
+                                            text: "退避せず最小化";
+                                            font-size: 11px;
+                                            color: Theme.text-secondary;
+                                            vertical-alignment: center;
+                                        }
+                                        GlassCheckbox {
+                                            checked: w.minimize_when_parked;
+                                            toggled => { root.toggle-window-minimize-when-parked(i); }
                                         }
                                     }
                                 }
