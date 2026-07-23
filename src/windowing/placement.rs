@@ -1,13 +1,15 @@
 //! Reading and changing a single window's placement, plus batched moves
 //! (PLAN.md §4.5 `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`).
 
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, GetWindowRect,
-    HDWP, HWND_TOP, PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED,
-    SW_SHOWMINIMIZED, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLOSE,
+    GetWindowThreadProcessId, HDWP, HWND_TOP, PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WINDOWPLACEMENT, WM_CLOSE,
 };
 
 use crate::domain::placement::{PixelRect, SavedShowState};
@@ -288,6 +290,32 @@ pub fn minimize(hwnd: HWND) {
 pub fn close_window(hwnd: HWND) -> bool {
     // SAFETY: `hwnd` is a live handle; `WM_CLOSE` carries no pointer payload.
     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
+/// `hwnd` を持つプロセスを終了させる。
+///
+/// リモートデスクトップ（mstsc.exe）のように `WM_CLOSE` では畳めないアプリ専用の
+/// 逃げ道。mstsc はセッションを保持したまま居座り、次にセットを開き直しても新しい
+/// 接続が張れない。編集中の文書を持つ種類のアプリではないので、終了させて問題ない。
+/// 対象の判定は [`crate::application::launch_service::closes_only_by_kill`]。
+pub fn kill_window_process(hwnd: HWND) -> bool {
+    let mut process_id = 0u32;
+    // SAFETY: `hwnd` is a live handle; `process_id` is a valid out-pointer.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if process_id == 0 {
+        return false;
+    }
+    // SAFETY: `process_id` came from `GetWindowThreadProcessId`.
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_TERMINATE, false, process_id) }) else {
+        return false;
+    };
+    // SAFETY: `handle` is a valid, owned process handle opened for termination.
+    let terminated = unsafe { TerminateProcess(handle, 0) }.is_ok();
+    // SAFETY: `handle` is a valid, owned handle we are done with.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    terminated
 }
 
 /// Moves `hwnd` directly above `insert_after` in Z order without moving or

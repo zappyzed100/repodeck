@@ -15,6 +15,9 @@ export struct QuickSwitcherRow {
     agent-symbol: string,
     agent-status-label: string,
     agent-elapsed-text: string,
+    // 実行中・入力待ちなど「今まさに動いている」状態か。真のとき状態表示を
+    // 目立つピル（色付き背景＋大きめ太字）で描く。未実行/成功/失敗は控えめのまま。
+    agent-is-active: bool,
     // Git working-tree status (empty for non-git repos, filled by a background
     // refresh): current branch, "変更N" change count, "↑N未push" unpushed
     // commits, and "最終commit" age.
@@ -291,17 +294,37 @@ export component QuickSwitcher inherits Window {
 
                                     Rectangle { horizontal-stretch: 1; }
 
-                                    Text {
-                                        text: row.agent-symbol;
-                                        font-size: 12px;
-                                        color: row.agent-status-color;
-                                        vertical-alignment: center;
-                                    }
-                                    Text {
-                                        text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
-                                        font-size: 11px;
-                                        color: Theme.text-secondary;
-                                        vertical-alignment: center;
+                                    // 状態ピル。実行中・入力待ちのときは色付き背景で
+                                    // 大きく目立たせ、それ以外（未実行/成功/失敗）は
+                                    // 従来どおり控えめのテキストに留める。
+                                    Rectangle {
+                                        border-radius: 7px;
+                                        background: row.agent-is-active ? row.agent-status-color.with-alpha(0.22) : transparent;
+                                        border-width: row.agent-is-active ? 1px : 0px;
+                                        border-color: row.agent-status-color.with-alpha(0.55);
+                                        horizontal-stretch: 0;
+
+                                        HorizontalLayout {
+                                            padding-left: row.agent-is-active ? 9px : 0px;
+                                            padding-right: row.agent-is-active ? 9px : 0px;
+                                            padding-top: row.agent-is-active ? 3px : 0px;
+                                            padding-bottom: row.agent-is-active ? 3px : 0px;
+                                            spacing: 5px;
+
+                                            Text {
+                                                text: row.agent-symbol;
+                                                font-size: row.agent-is-active ? 15px : 12px;
+                                                color: row.agent-status-color;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
+                                                font-size: row.agent-is-active ? 14px : 11px;
+                                                font-weight: row.agent-is-active ? 700 : 400;
+                                                color: row.agent-is-active ? row.agent-status-color : Theme.text-secondary;
+                                                vertical-alignment: center;
+                                            }
+                                        }
                                     }
                                 }
 

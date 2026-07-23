@@ -43,7 +43,7 @@ use crate::hotkey::mouse_wheel_hook::MouseWheelHook;
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
 use crate::ipc::named_pipe::{self, NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
-use crate::persistence::{config_store, journal_store, runtime_store};
+use crate::persistence::{clock, config_store, journal_store, runtime_store};
 use crate::windowing::autostart;
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
@@ -260,7 +260,21 @@ fn load_or_default_config(data_dir: &Path) -> AppConfig {
                     "config.json was unreadable; recovered settings from config.backup.json"
                 );
             }
-            result.config
+            let mut config = result.config;
+            // 宣言時にアプリ名を針にしていた古い VS Code エントリを、開いている
+            // フォルダ名の針へ移行する。保存に失敗しても今回の起動には効いている
+            // ので、次回また移行するだけ。
+            let retitled = launch_service::retitle_declared_vscode_windows(&mut config.worksets);
+            if retitled > 0 {
+                tracing::info!(
+                    retitled,
+                    "migrated declared VS Code windows to a folder title needle"
+                );
+                if let Err(err) = config_store::save(data_dir, &config) {
+                    tracing::warn!(error = %err, "failed to save the migrated config");
+                }
+            }
+            config
         }
         Ok(None) => {
             tracing::info!("no config.json found; starting from defaults (first run)");
@@ -1138,6 +1152,10 @@ struct WorksetManagerState {
     parking_selected_sub: i32,
     /// The apps making up the set being registered, in the order they were added.
     pending_apps: Vec<PendingApp>,
+    /// When set, the registration view is changing this existing set rather
+    /// than creating a new one, and 更新 replaces it in place (keeping its id,
+    /// created_at, sort_order and hotkey).
+    editing_workset_id: Option<uuid::Uuid>,
 }
 
 impl WorksetManagerState {
@@ -1152,6 +1170,7 @@ impl WorksetManagerState {
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
             pending_apps: Vec::new(),
+            editing_workset_id: None,
         }
     }
 }
@@ -1421,10 +1440,16 @@ fn build_launch_app_window(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            // Unknown until the window exists; the name carries the match.
+            // ウィンドウが存在するまで不明。最初にバインドしたウィンドウから
+            // 学習する（`remember_learned_classes`）。
             window_class: String::new(),
             registered_title: app.name.clone(),
-            title_contains: Some(app.name.clone()),
+            // 保存する価値があるのは、そのアプリの *他の* ウィンドウと区別できる
+            // 針だけ。VS Code はタイトルに開いたフォルダ名を出すので、1 セットに
+            // VS Code が 2 つあっても見分けがつく。アプリ名そのものだと開くすべて
+            // のウィンドウに一致してしまい、閉じたブラウザのエントリが無関係な同じ
+            // ブラウザの窓を取り込む原因になっていた。
+            title_contains: launch_service::declared_title_needle(kind, input),
             title_regex: None,
         },
         main_placement: SavedPlacement {
@@ -1445,6 +1470,64 @@ fn build_launch_app_window(
         },
         z_order: i32::try_from(z_order).unwrap_or(0),
         launch_spec: Some(spec),
+    }
+}
+
+/// Turns a saved `ManagedWindow` back into the form row it was declared from,
+/// so an existing set can be edited.
+///
+/// The launch app is looked up in the registry by executable; a window whose
+/// app is no longer registered (or that predates the registry, having been
+/// captured from a live window) gets a stand-in built from its own matcher, so
+/// editing a set never silently drops one of its entries.
+fn pending_from_managed_window(
+    window: &crate::domain::workset::ManagedWindow,
+    config: &AppConfig,
+) -> PendingApp {
+    use crate::domain::workset::{LaunchApp, LaunchKind};
+
+    let app = config
+        .launch_apps
+        .iter()
+        .find(|a| {
+            crate::windowing::matcher::same_executable(&a.program, &window.matcher.executable_path)
+        })
+        .cloned()
+        .unwrap_or_else(|| LaunchApp {
+            id: uuid::Uuid::new_v4(),
+            name: if window.matcher.registered_title.is_empty() {
+                window.matcher.process_name.clone()
+            } else {
+                window.matcher.registered_title.clone()
+            },
+            program: window.matcher.executable_path.clone(),
+            args: String::new(),
+            aumid: window.launch_spec.as_ref().and_then(|s| s.aumid.clone()),
+        });
+
+    // Recover the declared input from the launch spec's arguments, dropping the
+    // flags `build_launch_spec` adds (`-n`, `--new-window`).
+    let input = window
+        .launch_spec
+        .as_ref()
+        .map_or_else(String::new, |spec| match spec.kind {
+            LaunchKind::VsCode | LaunchKind::Browser => spec
+                .args
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .cloned()
+                .unwrap_or_default(),
+            LaunchKind::Generic => spec.args.join(" "),
+        });
+
+    let (split, cell_index) =
+        layout_service::split_cell_from_normalized(window.main_placement.normalized_rect);
+    PendingApp {
+        app,
+        input,
+        monitor_index: window.main_placement.main_monitor_index,
+        split,
+        cell_index,
     }
 }
 
@@ -1752,17 +1835,105 @@ fn reopen_place_workset(
     }
 }
 
+/// Asks every live window of `workset_id` to close, returning the set's name
+/// and how many windows were asked.
+///
+/// 既定では `WM_CLOSE` を投げるだけなので、アプリは拒否も保存確認もできる——
+/// ユーザーの同意なしに失われるものはない。例外は
+/// [`launch_service::closes_only_by_kill`] に挙げたアプリ（リモートデスクトップ）
+/// だけで、これは `WM_CLOSE` では閉じないためプロセスを終了させる。セット自体は
+/// 登録されたままなので、あとで切り替えれば全部起動し直される。
+///
+/// 閉じたウィンドウの HWND はバインドとして *記録* する（消さない）。HWND が
+/// 消えたバインドこそが「このウィンドウは閉じられた」と解決側が気づく手がかり
+/// だから。消してしまうと内容マッチに戻り、同じアプリの別ウィンドウへ結び直され
+/// て、セットは開いたままに見え、開き直すの対象がなくなる。閉じるのを拒んだ
+/// アプリは HWND が生きたままなので、バインドも保たれる——これも正しい。
+fn close_workset_windows(
+    config: &AppConfig,
+    data_dir: &Path,
+    workset_id: uuid::Uuid,
+) -> Option<(String, usize)> {
+    let workset = config.worksets.iter().find(|w| w.id == workset_id)?;
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut runtime = runtime_store::load(data_dir);
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &runtime.window_bindings,
+        Some(workset_id),
+    );
+
+    let targets: Vec<(uuid::Uuid, isize, bool)> = workset
+        .windows
+        .iter()
+        .filter_map(|w| match decisions.get(&w.id) {
+            Some(MatchDecision::AutoRebind { hwnd }) => Some((
+                w.id,
+                *hwnd,
+                launch_service::closes_only_by_kill(&w.matcher.executable_path),
+            )),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return Some((workset.name.clone(), 0));
+    }
+
+    let closed = targets
+        .iter()
+        .filter(|(_, hwnd, by_kill)| {
+            let hwnd = HWND(*hwnd as *mut _);
+            if *by_kill {
+                tracing::info!(target: "switch", "close-workset: terminating a process that ignores WM_CLOSE");
+                win_placement::kill_window_process(hwnd)
+            } else {
+                win_placement::close_window(hwnd)
+            }
+        })
+        .count();
+    tracing::info!(target: "switch", %workset_id, closed, "close-workset: posted WM_CLOSE");
+
+    for (id, hwnd, _) in targets {
+        runtime.window_bindings.insert(id, hwnd);
+    }
+    let _ = runtime_store::save(data_dir, &runtime);
+
+    Some((workset.name.clone(), closed))
+}
+
 /// What to acquire after launching a switch target's closed windows: the
 /// pre-launch HWND set and, per launched window, its managed id + expected
 /// executable/class so the newly-appeared window can be bound to it.
 struct PendingAcquire {
     workset_id: uuid::Uuid,
     before: std::collections::HashSet<isize>,
-    dead: Vec<(uuid::Uuid, PathBuf, String)>,
+    /// まだバインドできていない起動済みエントリ。現れた順に減っていく。
+    dead: Vec<Launched>,
+    /// バインド済みのエントリ。窓が消えたら `dead` へ戻る。
+    bound: Vec<BoundWindow>,
+    /// これまでに確保した HWND。別のエントリが同じ窓を二重に取らないようにする。
+    claimed: std::collections::HashSet<isize>,
     /// Relaunched browsers whose launch spec carried no URL — they open a blank
     /// window with the address bar focused, so they are minimized once bound so
     /// stray keystrokes during the switch can't land in the omnibox (2026-07-23).
     blank_browsers: std::collections::HashSet<uuid::Uuid>,
+}
+
+/// 起動したが、まだどのウィンドウとも結びついていない管理ウィンドウ。
+/// `class` は登録済みのウィンドウクラス（宣言由来なら空）。
+struct Launched {
+    id: uuid::Uuid,
+    exe: PathBuf,
+    class: String,
+}
+
+/// 結びついた管理ウィンドウと、その相手の HWND・実際に観測したクラス。
+struct BoundWindow {
+    launched: Launched,
+    hwnd: isize,
+    observed_class: String,
 }
 
 /// Launches the target workset's closed (unresolved) windows that carry a
@@ -1801,7 +1972,11 @@ fn launch_missing_for_switch(
                     if no_url {
                         blank_browsers.insert(w.id);
                     }
-                    dead.push((w.id, spec.program.clone(), w.matcher.window_class.clone()));
+                    dead.push(Launched {
+                        id: w.id,
+                        exe: spec.program.clone(),
+                        class: w.matcher.window_class.clone(),
+                    });
                 }
                 Err(err) => {
                     tracing::warn!(target: "launch", error = %err, program = %spec.program.display(), "switch: relaunch failed");
@@ -1818,50 +1993,249 @@ fn launch_missing_for_switch(
         workset_id: target_id,
         before: live_windows.iter().map(|w| w.hwnd).collect(),
         dead,
+        bound: Vec::new(),
+        claimed: std::collections::HashSet::new(),
         blank_browsers,
     })
 }
 
-/// After launched windows have had time to appear, binds each newly-appeared
-/// window (matched by executable + class, in launch order) to the managed
-/// window it was launched for, then places the workset so they move to main.
-fn acquire_launched_and_place(
-    pending: PendingAcquire,
+/// 再起動したウィンドウから今学習したウィンドウクラスを、保存済みのセットへ
+/// 書き戻す。以後その宣言ウィンドウは、キャプチャ由来のものと同じようにマッチし、
+/// バインドを保持できる。
+fn remember_learned_classes(
+    learned: &[(uuid::Uuid, String)],
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+) {
+    if learned.is_empty() {
+        return;
+    }
+    {
+        let mut config = config.borrow_mut();
+        for workset in &mut config.worksets {
+            for window in &mut workset.windows {
+                if let Some((_, class)) = learned.iter().find(|(id, _)| *id == window.id) {
+                    tracing::info!(target: "launch", managed = %window.id, class = %class, "learned window class from the relaunched window");
+                    window.matcher.window_class.clone_from(class);
+                }
+            }
+        }
+    }
+    if let Err(err) = config_store::save(data_dir, &config.borrow()) {
+        tracing::warn!(error = %err, "failed to save learned window classes");
+    }
+}
+
+/// 起動したウィンドウが現れるのを待つ間隔と、諦めるまでの回数（約 15 秒）。
+///
+/// 以前は 2.5 秒の一発勝負だった。WinForms や Tauri のコールドスタートはそれを
+/// 平気で超えるので、LibreHardwareMonitor HUD は毎回「現れなかった」扱いになり、
+/// 起動はしたのに未バインドのまま残っていた。現れ次第バインドし、全部揃うか
+/// 期限切れで打ち切る。
+const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_millis(600);
+const ACQUIRE_MAX_POLLS: u32 = 25;
+
+// 監視は期限まで続けるが、揃った時点でいったん配置する。リモートデスクトップは
+// 本体（`TscShellContainerClass`）の前に接続中ダイアログ（`#32770`）を数秒出す。
+// 最初に見えた窓で確定してしまうと、消えるダイアログに紐づいたまま終わる。
+// かといって全員を期限いっぱい待たせると、普通のアプリの配置まで遅くなる。
+// そこで「早く配置し、差し替わったら配置し直す」。
+
+/// いま現れているウィンドウのうち、まだバインドできていないエントリに割り当て
+/// られるものを結びつける。結びついたものは `dead` から `bound` へ移る。
+/// 新たに結びついたものがあれば `true`。
+fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
+    let after = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut newly_bound: Vec<BoundWindow> = Vec::new();
+
+    pending.dead.retain(|launched| {
+        let Some(w) = launch_service::find_launched_window(
+            &after,
+            &pending.before,
+            &pending.claimed,
+            &launched.exe,
+            &launched.class,
+        ) else {
+            return true; // まだ現れていない。次のポーリングで見る。
+        };
+        tracing::info!(target: "launch", managed = %launched.id, hwnd = w.hwnd, class = %w.window_class, "switch: bound relaunched window to its set");
+        pending.claimed.insert(w.hwnd);
+        newly_bound.push(BoundWindow {
+            launched: Launched {
+                id: launched.id,
+                exe: launched.exe.clone(),
+                class: launched.class.clone(),
+            },
+            hwnd: w.hwnd,
+            observed_class: w.window_class.clone(),
+        });
+        false
+    });
+
+    let bound_any = !newly_bound.is_empty();
+    pending.bound.append(&mut newly_bound);
+    bound_any
+}
+
+/// バインド済みのうち、その後ウィンドウが消えたものを `dead` へ戻す。戻したもの
+/// があれば `true`。起動直後のスプラッシュや接続中ダイアログに飛びついたまま
+/// 終わらないための番人。
+fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
+    let live: std::collections::HashSet<isize> =
+        enumerate::enumerate_top_level_windows(std::process::id())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.hwnd)
+            .collect();
+    let mut vanished = false;
+    pending.bound.retain(|b| {
+        if live.contains(&b.hwnd) {
+            return true;
+        }
+        tracing::info!(target: "launch", managed = %b.launched.id, hwnd = b.hwnd, class = %b.observed_class, "switch: the window we bound vanished; waiting for the real one");
+        pending.claimed.remove(&b.hwnd);
+        pending.dead.push(Launched {
+            id: b.launched.id,
+            exe: b.launched.exe.clone(),
+            class: b.launched.class.clone(),
+        });
+        vanished = true;
+        false
+    });
+    vanished
+}
+
+/// バインドの受付を終えて、結果を保存し、セットを配置してメイン画面へ移す。
+///
+/// 起動待ちの間にユーザーが別のセットへ切り替えていたら、バインドの保存だけ行い
+/// 配置はしない。ここで配置すると、いま見ているセットを押しのけて数秒前のセットが
+/// 戻ってくる——「いきなり配置が変わる」の正体だった。`force` は「開き直す」を
+/// 押された初回だけ真で、そのときはまだ現在セットでなくても配置してよい（それが
+/// 押した人の意図なので）。
+fn finish_acquire(
+    pending: &PendingAcquire,
     config: &Rc<RefCell<AppConfig>>,
     data_dir: &Path,
     coordinator: &SwitchCoordinator<Win32WindowOps>,
+    force: bool,
 ) {
-    let after = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-    let mut claimed: std::collections::HashSet<isize> = std::collections::HashSet::new();
-    let mut blank_browser_hwnds: Vec<isize> = Vec::new();
-    let mut runtime = runtime_store::load(data_dir);
-    for (id, exe, class) in &pending.dead {
-        if let Some(w) = after.iter().find(|w| {
-            !pending.before.contains(&w.hwnd)
-                && !claimed.contains(&w.hwnd)
-                && w.window_class == *class
-                && w.executable_path.as_ref() == Some(exe)
-        }) {
-            tracing::info!(target: "launch", managed = %id, hwnd = w.hwnd, class = %class, "switch: bound relaunched window to its set");
-            runtime.window_bindings.insert(*id, w.hwnd);
-            claimed.insert(w.hwnd);
-            if pending.blank_browsers.contains(id) {
-                blank_browser_hwnds.push(w.hwnd);
-            }
-        } else {
-            tracing::warn!(target: "launch", managed = %id, program = %exe.display(), class = %class, "switch: relaunched app did not appear in time to bind");
-        }
+    for launched in &pending.dead {
+        tracing::warn!(target: "launch", managed = %launched.id, program = %launched.exe.display(), class = %launched.class, "switch: relaunched app did not appear in time to bind");
     }
+
+    let mut runtime = runtime_store::load(data_dir);
+    for b in &pending.bound {
+        runtime.window_bindings.insert(b.launched.id, b.hwnd);
+    }
+    let still_current = runtime.current_workset_id == Some(pending.workset_id);
     let _ = runtime_store::save(data_dir, &runtime);
+
+    // 観測したクラスが登録値と違えば書き戻す。消えなかった窓のクラスだけを覚える
+    // ので、接続中ダイアログの `#32770` を掴まされることはない。
+    let learned: Vec<(uuid::Uuid, String)> = pending
+        .bound
+        .iter()
+        .filter(|b| !b.observed_class.is_empty() && b.observed_class != b.launched.class)
+        .map(|b| (b.launched.id, b.observed_class.clone()))
+        .collect();
+    remember_learned_classes(&learned, config, data_dir);
+
+    if !force && !still_current {
+        tracing::info!(target: "launch", workset = %pending.workset_id, "switch: the user moved on; bindings saved, placement skipped");
+        return;
+    }
     reopen_place_workset(pending.workset_id, config, data_dir, coordinator);
 
-    // A blank browser (relaunched with no captured URL) opens with its address
-    // bar focused; minimize it after placement so stray keystrokes during the
-    // switch can't be typed into the omnibox.
-    for hwnd in blank_browser_hwnds {
-        tracing::info!(target: "launch", hwnd, "minimizing relaunched blank browser (no captured URL)");
-        Win32WindowOps.minimize(hwnd);
+    // URL を持たずに起動したブラウザはアドレスバーにフォーカスが当たった状態で
+    // 開く。切替中の打鍵がオムニボックスへ流れ込まないよう、配置後に最小化する。
+    for b in &pending.bound {
+        if pending.blank_browsers.contains(&b.launched.id) {
+            tracing::info!(target: "launch", hwnd = b.hwnd, "minimizing relaunched blank browser (no captured URL)");
+            Win32WindowOps.minimize(b.hwnd);
+        }
     }
+}
+
+/// 監視の途中経過。
+struct AcquireWatch {
+    pending: PendingAcquire,
+    polls: u32,
+    /// 一度でも配置したか。以後は差し替わりが起きたときだけ配置し直す。
+    placed: bool,
+}
+
+/// 起動したウィンドウが現れるのを繰り返し確認し、現れ次第それを起動した管理
+/// ウィンドウへ結びつける。全部揃った時点で配置して `on_done` を呼び、そのあとも
+/// 期限まで見張って、掴んだ窓が消えたら本物へ結び直して配置し直す。
+///
+/// `force_first_placement` は「開き直す」ボタンから呼ぶときだけ真。あのボタンは
+/// 現在セットでないものを開き直すことがあり、そのときも配置してよい。切替経由の
+/// 呼び出しでは偽——切替はもう終わっているので、ここでの配置はやり直しであって、
+/// ユーザーが別のセットへ移っていたら黙って見送るべきものになる。
+fn start_acquire_watch(
+    pending: PendingAcquire,
+    config: Rc<RefCell<AppConfig>>,
+    data_dir: PathBuf,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
+    force_first_placement: bool,
+    on_done: impl Fn() + 'static,
+) {
+    let watch = RefCell::new(AcquireWatch {
+        pending,
+        polls: 0,
+        placed: false,
+    });
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        ACQUIRE_POLL_INTERVAL,
+        move || {
+            enum Step {
+                Wait,
+                Place { first: bool },
+            }
+            let (step, expired) = {
+                let mut watch = watch.borrow_mut();
+                let watch = &mut *watch;
+                watch.polls += 1;
+                let vanished = drop_vanished_bindings(&mut watch.pending);
+                let newly_bound = bind_appeared_windows(&mut watch.pending);
+                let expired = watch.polls >= ACQUIRE_MAX_POLLS;
+                let all_bound = watch.pending.dead.is_empty();
+                let step = match (watch.placed, all_bound) {
+                    // 初回：全部揃ったら（または期限切れなら）配置する。
+                    (false, _) if all_bound || expired => Step::Place { first: true },
+                    // 二度目以降：掴んだ窓が本物へ差し替わったときだけ配置し直す。
+                    (true, true) if vanished || newly_bound => Step::Place { first: false },
+                    _ => Step::Wait,
+                };
+                (step, expired)
+            };
+            if let Step::Place { first } = step {
+                let mut watch = watch.borrow_mut();
+                watch.placed = true;
+                finish_acquire(
+                    &watch.pending,
+                    &config,
+                    &data_dir,
+                    &coordinator,
+                    first && force_first_placement,
+                );
+                drop(watch);
+                // 紐づけ結果が変わったので、開いている管理画面にも反映させる。
+                on_done();
+            }
+            if expired {
+                REOPEN_TIMER.with(|t| {
+                    if let Some(timer) = t.borrow().as_ref() {
+                        timer.stop();
+                    }
+                });
+                on_done();
+            }
+        },
+    );
+    REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
 }
 
 fn wire_workset_manager(
@@ -2146,15 +2520,20 @@ fn wire_workset_manager(
     });
 
     let m = manager.as_weak();
-    manager.on_app_pick_path_requested(move || {
+    manager.on_app_pick_folder_requested(move || {
         let Some(manager) = m.upgrade() else { return };
-        // VS Code takes either a folder or a `.code-workspace` file, so offer
-        // the file picker first and fall back to a folder pick when cancelled.
-        let picked = rfd::FileDialog::new()
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            manager.set_app_input_text(path.display().to_string().into());
+        }
+    });
+
+    let m = manager.as_weak();
+    manager.on_app_pick_workspace_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        if let Some(path) = rfd::FileDialog::new()
             .add_filter("VS Code ワークスペース", &["code-workspace"])
             .pick_file()
-            .or_else(|| rfd::FileDialog::new().pick_folder());
-        if let Some(path) = picked {
+        {
             manager.set_app_input_text(path.display().to_string().into());
         }
     });
@@ -2229,7 +2608,14 @@ fn wire_workset_manager(
     let coord = coordinator.clone();
     manager.on_reopen_closed_requested(move || {
         let Some(manager) = m.upgrade() else { return };
-        let (workset_id, specs) = {
+        // Reuse the switch path's launch-and-acquire flow rather than launching
+        // by hand. Launching alone left the reopened windows unbound: nothing
+        // told RepoDeck *which* managed window each new window belonged to, so
+        // they only bound if the matcher happened to score them past the
+        // auto-rebind threshold — which a fresh window (different title, no
+        // recorded class) usually doesn't. `acquire_launched_and_place` pairs
+        // each newly-appeared window with the entry it was launched for.
+        let pending = {
             let state = s.borrow();
             let config = c.borrow();
             let Some(workset) = state
@@ -2238,35 +2624,20 @@ fn wire_workset_manager(
             else {
                 return;
             };
+            let workset_id = workset.id;
             let live_windows =
                 enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
-            let specs: Vec<crate::domain::workset::LaunchSpec> = workset
-                .windows
-                .iter()
-                .filter(|w| {
-                    !matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
-                })
-                .filter_map(|w| w.launch_spec.clone())
-                .collect();
-            (workset.id, specs)
+            let runtime = runtime_store::load(&dir);
+            launch_missing_for_switch(&config, &runtime.window_bindings, &live_windows, workset_id)
         };
 
-        if specs.is_empty() {
+        let Some(pending) = pending else {
             manager.set_status_text("開き直せる閉じたアプリはありませんでした。".into());
             manager.set_status_is_warning(false);
             return;
-        }
+        };
 
-        let mut launched = 0;
-        for spec in &specs {
-            match crate::windowing::app_launch::launch(spec) {
-                Ok(()) => launched += 1,
-                Err(err) => {
-                    tracing::warn!(error = %err, program = %spec.program.display(), "reopen: launch failed");
-                }
-            }
-        }
+        let launched = pending.dead.len();
         manager.set_status_text(
             format!(
                 "{launched}個のアプリを起動しました。配置を復元しています… （復元完了まで、同じアプリを手動で起動しないでください）"
@@ -2275,27 +2646,119 @@ fn wire_workset_manager(
         );
         manager.set_status_is_warning(false);
 
-        // Give the apps time to create their windows, then switch to the workset
-        // so the reopened windows get matched and placed.
+        // ウィンドウが現れるのを待ちながら、現れた順に結びつけて配置する。
         let c2 = c.clone();
         let dir2 = dir.clone();
-        let coord2 = coord.clone();
         let m2 = m.clone();
         let s2 = s.clone();
-        let timer = slint::Timer::default();
-        timer.start(
-            slint::TimerMode::SingleShot,
-            Duration::from_millis(2500),
-            move || {
-                reopen_place_workset(workset_id, &c2, &dir2, &coord2);
-                if let Some(manager) = m2.upgrade() {
-                    refresh_selected_workset_detail(&manager, &c2.borrow(), &s2.borrow(), &dir2);
-                    manager.set_status_text("配置を復元しました。".into());
-                    manager.set_status_is_warning(false);
-                }
-            },
+        start_acquire_watch(pending, c.clone(), dir.clone(), coord.clone(), true, move || {
+            if let Some(manager) = m2.upgrade() {
+                let mut state = s2.borrow_mut();
+                refresh_workset_summaries(&manager, &c2.borrow(), &mut state);
+                refresh_selected_workset_detail(&manager, &c2.borrow(), &state, &dir2);
+                manager.set_status_text("配置を復元しました。".into());
+                manager.set_status_is_warning(false);
+            }
+        });
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_close_workset_windows_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let workset_id = {
+            let state = s.borrow();
+            let config = c.borrow();
+            let Some(workset) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get(i))
+            else {
+                return;
+            };
+            workset.id
+        };
+        let Some((name, closed)) = close_workset_windows(&c.borrow(), &d, workset_id) else {
+            return;
+        };
+
+        manager.set_status_text(
+            if closed == 0 {
+                format!("「{name}」は開いていません。")
+            } else {
+                format!("「{name}」のウィンドウ{closed}個に終了を要求しました。")
+            }
+            .into(),
         );
-        REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
+        manager.set_status_is_warning(false);
+        let mut state = s.borrow_mut();
+        refresh_workset_summaries(&manager, &c.borrow(), &mut state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
+    });
+
+    // 編集: load the selected set back into the registration view. Everything
+    // about it is recoverable from what was saved, so the same form serves both
+    // creating and changing — only the target of 登録/更新 differs.
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_edit_workset_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        let config = c.borrow();
+        let Some(workset) = state
+            .selected_workset_index
+            .and_then(|i| config.worksets.get(i))
+        else {
+            return;
+        };
+
+        state.editing_workset_id = Some(workset.id);
+        state.pending_apps = workset
+            .windows
+            .iter()
+            .map(|w| pending_from_managed_window(w, &config))
+            .collect();
+        state.selected_color = hex_to_color(&workset.color);
+        state.fullscreen_when_parked = workset.fullscreen_when_parked;
+        state.parking_selected_sub = match &workset.parking_policy {
+            crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } => config
+                .sub_screens
+                .iter()
+                .position(|sub| sub.id == *sub_screen_id)
+                .and_then(|i| i32::try_from(i).ok())
+                .unwrap_or(-1),
+            _ => -1,
+        };
+        let name = workset.name.clone();
+
+        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
+        refresh_pending_apps(&manager, &state);
+        refresh_launch_apps(&manager, &config);
+        refresh_placement_monitors(&manager, &config, &state);
+        manager.set_placement_split_index(0);
+        refresh_placement_cells(&manager);
+        refresh_parking_subs(&manager, &config, &mut state);
+
+        // The full palette, not just unused colors — this set's own color has to
+        // stay selectable.
+        manager.set_color_choices(
+            std::rc::Rc::new(slint::VecModel::from(
+                WORKSET_PALETTE
+                    .iter()
+                    .map(|c| hex_to_color(c))
+                    .collect::<Vec<_>>(),
+            ))
+            .into(),
+        );
+        manager.set_selected_color(state.selected_color);
+        manager.set_registration_name(name.into());
+        manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
+        manager.set_registration_editing(true);
+        manager.set_registering(true);
+        manager.set_status_text("アプリ・画面・名前を変更して「更新」を押してください。".into());
+        manager.set_status_is_warning(false);
     });
 
     let m = manager.as_weak();
@@ -2307,6 +2770,8 @@ fn wire_workset_manager(
         let config = c.borrow();
 
         state.pending_apps.clear();
+        state.editing_workset_id = None;
+        manager.set_registration_editing(false);
         // Monitors are re-enumerated here so the 画面 picker labels the screens
         // as they are *now*, not as they were when the manager opened.
         state.monitors = monitor::enumerate_monitors().unwrap_or_default();
@@ -2693,8 +3158,10 @@ fn wire_workset_manager(
         {
             let mut state = s.borrow_mut();
             state.pending_apps.clear();
+            state.editing_workset_id = None;
             refresh_pending_apps(&manager, &state);
         }
+        manager.set_registration_editing(false);
         manager.set_registering(false);
     });
 
@@ -2748,6 +3215,7 @@ fn wire_workset_manager(
         };
 
         let color_hex = color_to_hex(state.selected_color);
+        let editing_id = state.editing_workset_id;
         let save_result = {
             let mut config = c.borrow_mut();
             let sort_order = i32::try_from(config.worksets.len()).unwrap_or(i32::MAX);
@@ -2772,7 +3240,34 @@ fn wire_workset_manager(
                 };
             }
 
-            config.worksets.push(workset);
+            // 更新 replaces the existing set's contents in place, keeping its
+            // identity — its id, created_at, sort_order and any hotkey bound to
+            // it. Snapshot the original so a validation or save failure can put
+            // it back untouched.
+            let backup = editing_id.and_then(|id| {
+                config
+                    .worksets
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| (w.id, w.clone()))
+            });
+            match &backup {
+                Some((existing_id, _)) => {
+                    if let Some(existing) =
+                        config.worksets.iter_mut().find(|w| &w.id == existing_id)
+                    {
+                        existing.name = workset.name.clone();
+                        existing.repository_path = workset.repository_path.clone();
+                        existing.repository_kind = workset.repository_kind;
+                        existing.color = workset.color.clone();
+                        existing.parking_policy = workset.parking_policy.clone();
+                        existing.fullscreen_when_parked = workset.fullscreen_when_parked;
+                        existing.windows = workset.windows.clone();
+                        existing.updated_at = clock::now_rfc3339();
+                    }
+                }
+                None => config.worksets.push(workset),
+            }
 
             let errors = config.validate();
             // Registering the same window in more than one workset is allowed —
@@ -2788,8 +3283,15 @@ fn wire_workset_manager(
                 })
                 .map(config_validation_message)
                 .collect();
-            let restore = |config: &mut AppConfig| {
-                config.worksets.pop();
+            let restore = |config: &mut AppConfig| match &backup {
+                Some((id, original)) => {
+                    if let Some(w) = config.worksets.iter_mut().find(|w| &w.id == id) {
+                        *w = original.clone();
+                    }
+                }
+                None => {
+                    config.worksets.pop();
+                }
             };
             if !fatal.is_empty() {
                 restore(&mut config);
@@ -2809,15 +3311,24 @@ fn wire_workset_manager(
             Ok(()) => {
                 state.registering = false;
                 state.pending_apps.clear();
+                let was_editing = state.editing_workset_id.take().is_some();
                 refresh_pending_apps(&manager, &state);
                 manager.set_registering(false);
-                manager.set_status_text("ワークセットを登録しました。".into());
+                manager.set_registration_editing(false);
+                manager.set_status_text(
+                    if was_editing {
+                        "セットを更新しました。"
+                    } else {
+                        "ワークセットを登録しました。"
+                    }
+                    .into(),
+                );
                 manager.set_status_is_warning(false);
                 refresh_workset_summaries(&manager, &c.borrow(), &mut state);
                 refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
             }
             Err(message) => {
-                manager.set_status_text(format!("登録できません: {message}").into());
+                manager.set_status_text(format!("保存できません: {message}").into());
                 manager.set_status_is_warning(true);
             }
         }
@@ -2903,6 +3414,11 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                 agent_symbol: agent_symbol.into(),
                 agent_status_label: agent_status_label.into(),
                 agent_elapsed_text: agent_elapsed_text.into(),
+                // 実行中・入力待ちだけを「動作中」として目立たせる。
+                agent_is_active: matches!(
+                    agent_state,
+                    AgentState::Running | AgentState::NeedsInput
+                ),
                 branch_text: git.branch.clone().unwrap_or_default().into(),
                 changed_text: if git.is_git {
                     format!("変更{}", git.changed_count).into()
@@ -3073,6 +3589,10 @@ fn select_row_for_workset(switcher: &QuickSwitcher, workset_id: uuid::Uuid) {
 /// focus onto it (needed for a `WS_EX_TOOLWINDOW` popup, which doesn't
 /// reliably grab keyboard focus on `.show()` alone).
 fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    // 絞り込みは毎回まっさらにする。閉じても残っていたため、一度何か打って閉じる
+    // と、次に開いたときも同じ絞り込みが効いたままで、一致しないセットは行ごと
+    // 消えていた（動いているセットが一覧に居ない、という形で見える）。
+    switcher.set_filter_text(slint::SharedString::new());
     refresh_quick_switcher_rows(switcher, config, data_dir);
     // Kick background git + GitHub refreshes; rows re-render when each
     // completes. The switcher shows the cached (possibly stale/empty) values
@@ -3345,52 +3865,17 @@ fn wire_quick_switcher(
         let Ok(workset_id) = uuid::Uuid::parse_str(&workset_id) else {
             return;
         };
-
-        let (name, hwnds) = {
-            let config = c.borrow();
-            let Some(workset) = config.worksets.iter().find(|w| w.id == workset_id) else {
-                return;
-            };
-            let live_windows =
-                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
-            let hwnds: Vec<isize> = workset
-                .windows
-                .iter()
-                .filter_map(|w| match decisions.get(&w.id) {
-                    Some(MatchDecision::AutoRebind { hwnd }) => Some(*hwnd),
-                    _ => None,
-                })
-                .collect();
-            (workset.name.clone(), hwnds)
+        let Some((name, closed)) = close_workset_windows(&c.borrow(), &d, workset_id) else {
+            return;
         };
 
-        if hwnds.is_empty() {
-            switcher.set_status_text(format!("「{name}」は開いていません。").into());
-            switcher.set_status_is_warning(false);
-            return;
-        }
-
-        let closed = hwnds
-            .iter()
-            .filter(|hwnd| win_placement::close_window(HWND(**hwnd as *mut _)))
-            .count();
-        tracing::info!(target: "switch", %workset_id, closed, "close-workset: posted WM_CLOSE");
-
-        // Drop the session bindings for the windows we asked to close, so a
-        // window that does close isn't chased by a stale HWND next switch.
-        let mut runtime = runtime_store::load(&d);
-        let config = c.borrow();
-        if let Some(workset) = config.worksets.iter().find(|w| w.id == workset_id) {
-            for window in &workset.windows {
-                runtime.window_bindings.remove(&window.id);
-            }
-        }
-        drop(config);
-        let _ = runtime_store::save(&d, &runtime);
-
         switcher.set_status_text(
-            format!("「{name}」のウィンドウ{closed}個に終了を要求しました。").into(),
+            if closed == 0 {
+                format!("「{name}」は開いていません。")
+            } else {
+                format!("「{name}」のウィンドウ{closed}個に終了を要求しました。")
+            }
+            .into(),
         );
         switcher.set_status_is_warning(false);
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
@@ -3473,24 +3958,9 @@ fn wire_quick_switcher(
             let _ = switcher.hide();
         }
 
-        // If we relaunched closed windows, acquire and place them once they've
-        // had time to appear.
+        // 閉じていたウィンドウを起動したなら、現れ次第結びつけて配置する。
         if let Some(pending) = pending_acquire {
-            let c2 = c.clone();
-            let d2 = d.clone();
-            let coord2 = coord.clone();
-            let pending = RefCell::new(Some(pending));
-            let timer = slint::Timer::default();
-            timer.start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(2500),
-                move || {
-                    if let Some(p) = pending.borrow_mut().take() {
-                        acquire_launched_and_place(p, &c2, &d2, &coord2);
-                    }
-                },
-            );
-            REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
+            start_acquire_watch(pending, c.clone(), d.clone(), coord.clone(), false, || {});
         }
     });
 
@@ -3794,26 +4264,15 @@ fn wire_codex_settings(window: &AppWindow, config: Rc<RefCell<AppConfig>>) {
 
     let w = window.as_weak();
     window.on_codex_copy_snippet_requested(move || {
-        let Some(window) = w.upgrade() else { return };
-        let Some(hook_path) = hook_exe_path() else {
-            window.set_codex_status_text(
-                "repodeck-hook.exeが見つかりません。インストール先を確認してください。".into(),
-            );
-            window.set_codex_status_is_warning(true);
-            return;
-        };
+        if let Some(window) = w.upgrade() {
+            copy_hook_snippet(&window, HookFlavor::Codex);
+        }
+    });
 
-        let snippet = build_hooks_json_snippet(&hook_path);
-        window.set_codex_hook_snippet(snippet.clone().into());
-        match copy_text_to_clipboard(&snippet) {
-            Ok(()) => {
-                window.set_codex_status_text("クリップボードへコピーしました。".into());
-                window.set_codex_status_is_warning(false);
-            }
-            Err(err) => {
-                window.set_codex_status_text(format!("コピーに失敗しました: {err}").into());
-                window.set_codex_status_is_warning(true);
-            }
+    let w = window.as_weak();
+    window.on_claude_copy_snippet_requested(move || {
+        if let Some(window) = w.upgrade() {
+            copy_hook_snippet(&window, HookFlavor::ClaudeCode);
         }
     });
 
@@ -3863,6 +4322,36 @@ fn wire_codex_settings(window: &AppWindow, config: Rc<RefCell<AppConfig>>) {
     });
 }
 
+/// 選んだエージェント向けのフックスニペットを組み立て、プレビュー欄へ表示し、
+/// クリップボードへコピーする。両ボタンで共通。
+fn copy_hook_snippet(window: &AppWindow, flavor: HookFlavor) {
+    let Some(hook_path) = hook_exe_path() else {
+        window.set_codex_status_text(
+            "repodeck-hook.exeが見つかりません。インストール先を確認してください。".into(),
+        );
+        window.set_codex_status_is_warning(true);
+        return;
+    };
+    let label = match flavor {
+        HookFlavor::Codex => "Codex",
+        HookFlavor::ClaudeCode => "Claude Code",
+    };
+    let snippet = build_hooks_json_snippet(&hook_path, flavor);
+    window.set_codex_hook_snippet(snippet.clone().into());
+    match copy_text_to_clipboard(&snippet) {
+        Ok(()) => {
+            window.set_codex_status_text(
+                format!("{label}用スニペットをクリップボードへコピーしました。").into(),
+            );
+            window.set_codex_status_is_warning(false);
+        }
+        Err(err) => {
+            window.set_codex_status_text(format!("コピーに失敗しました: {err}").into());
+            window.set_codex_status_is_warning(true);
+        }
+    }
+}
+
 fn refresh_codex_settings_state(window: &AppWindow, config: &AppConfig) {
     check_hook_exe(window);
     window.set_codex_send_test_event_enabled(!config.worksets.is_empty());
@@ -3882,29 +4371,49 @@ fn hook_exe_path() -> Option<PathBuf> {
     hook_path.exists().then_some(hook_path)
 }
 
-/// Builds the `hooks.json` fragment for all 4 Codex hooks (PLAN.md §6.5),
-/// via `serde_json::json!`/`to_string_pretty` rather than string templating
-/// so every one of §6.5's validation conditions holds by construction: one
-/// group per hook, one `command`-type entry per group, a 2-second timeout,
-/// and `commandWindows` wrapping the absolute path in literal quotes (the
-/// shell-level quoting a path containing spaces needs, distinct from the
-/// JSON string's own quoting).
-fn build_hooks_json_snippet(hook_path: &Path) -> String {
+/// どちらのエージェント向けのフックスニペットか。同じ `repodeck-hook.exe` を
+/// 呼ぶが、設定キーもイベント名も異なる（[`crate::ipc::protocol`] 参照）。
+///
+/// - **Codex**: `commandWindows` キー。入力待ちは `PermissionRequest`。
+/// - **Claude Code**: `command` キー。入力待ちは `Notification`。
+///
+/// 以前は Codex 形式だけを生成しており、そのまま Claude の `settings.json` に
+/// 貼っても——キーもイベント名も違うため——一切動かなかった。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookFlavor {
+    Codex,
+    ClaudeCode,
+}
+
+/// フックの `hooks.json`（Codex）/ `settings.json`（Claude Code）断片を組み立てる。
+/// 文字列テンプレートではなく `serde_json` で作るので、括弧やエスケープの崩れが
+/// 構造的に起きない。1 イベント 1 グループ、1 グループ 1 コマンド、2 秒タイムアウト、
+/// 空白入りパスに耐えるようコマンド文字列は絶対パスをリテラルの引用符で包む。
+fn build_hooks_json_snippet(hook_path: &Path, flavor: HookFlavor) -> String {
     let command = format!("\"{}\"", hook_path.display());
+    let command_key = match flavor {
+        HookFlavor::Codex => "commandWindows",
+        HookFlavor::ClaudeCode => "command",
+    };
     let hook_group = || {
         serde_json::json!({
             "hooks": [{
                 "type": "command",
-                "commandWindows": command,
+                command_key: command,
                 "timeout": 2,
             }]
         })
     };
 
+    // 「入力待ち」を表すイベント名だけがエージェント間で異なる。
+    let needs_input_event = match flavor {
+        HookFlavor::Codex => "PermissionRequest",
+        HookFlavor::ClaudeCode => "Notification",
+    };
     let value = serde_json::json!({
         "hooks": {
             "UserPromptSubmit": [hook_group()],
-            "PermissionRequest": [hook_group()],
+            needs_input_event: [hook_group()],
             "PostToolUse": [hook_group()],
             "Stop": [hook_group()],
         }
@@ -4389,27 +4898,42 @@ fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
 }
 
 /// Handles one command from the env-gated test-control pipe, on the UI thread.
-/// Only `switch <workset-uuid>` is understood today: it re-enters the fully-wired
-/// Quick-Switcher switch path (relaunch, journal, rollback, tray refresh) exactly
-/// as a user selection would, so a soak-test driver exercises the real code path.
+///
+/// `switch <workset-uuid>` re-enters the fully-wired Quick-Switcher switch path
+/// (relaunch, journal, rollback, tray refresh) exactly as a user selection
+/// would, and `close <workset-uuid>` runs the same 「アプリを閉じる」 the manager's
+/// button does — so a soak-test driver exercises the real code paths.
 fn handle_test_control(bytes: &[u8]) {
     let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
         return;
     };
     let text = String::from_utf8_lossy(bytes);
     let command = text.trim();
-    let Some(rest) = command.strip_prefix("switch ") else {
-        tracing::warn!(target: "switch", command = %command, "test-control: unknown command");
-        return;
+    let (verb, rest) = match command.split_once(' ') {
+        Some(parts) => parts,
+        None => {
+            tracing::warn!(target: "switch", command = %command, "test-control: unknown command");
+            return;
+        }
     };
     let id = rest.trim();
-    if uuid::Uuid::parse_str(id).is_err() {
-        tracing::warn!(target: "switch", arg = %id, "test-control: switch arg is not a uuid");
+    let Ok(workset_id) = uuid::Uuid::parse_str(id) else {
+        tracing::warn!(target: "switch", arg = %id, "test-control: arg is not a uuid");
         return;
-    }
-    if let Some(switcher) = ctx.quick_switcher.upgrade() {
-        tracing::info!(target: "switch", workset = %id, "test-control: switch requested");
-        switcher.invoke_switch_requested(id.into());
+    };
+
+    match verb {
+        "switch" => {
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                tracing::info!(target: "switch", workset = %id, "test-control: switch requested");
+                switcher.invoke_switch_requested(id.into());
+            }
+        }
+        "close" => {
+            tracing::info!(target: "switch", workset = %id, "test-control: close requested");
+            close_workset_windows(&ctx.config.borrow(), &ctx.data_dir, workset_id);
+        }
+        _ => tracing::warn!(target: "switch", command = %command, "test-control: unknown command"),
     }
 }
 
@@ -5410,4 +5934,53 @@ pub fn run() -> Result<()> {
 
     tracing::info!("RepoDeck exiting");
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_snippet_tests {
+    use std::path::Path;
+
+    use super::{HookFlavor, build_hooks_json_snippet};
+
+    /// Codexスニペットは `commandWindows` キーと `PermissionRequest` を使う。
+    #[test]
+    fn codex_snippet_uses_command_windows_and_permission_request() {
+        let s = build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::Codex);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let hooks = &v["hooks"];
+        assert!(hooks.get("PermissionRequest").is_some());
+        assert!(hooks.get("Notification").is_none());
+        let cmd = &hooks["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(cmd["commandWindows"], r#""C:\x\repodeck-hook.exe""#);
+        assert!(cmd.get("command").is_none());
+        assert_eq!(cmd["timeout"], 2);
+    }
+
+    /// Claude Codeスニペットは `command` キーと `Notification` を使う。
+    #[test]
+    fn claude_snippet_uses_command_and_notification() {
+        let s =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::ClaudeCode);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let hooks = &v["hooks"];
+        assert!(hooks.get("Notification").is_some());
+        assert!(hooks.get("PermissionRequest").is_none());
+        let cmd = &hooks["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(cmd["command"], r#""C:\x\repodeck-hook.exe""#);
+        assert!(cmd.get("commandWindows").is_none());
+    }
+
+    /// どちらも4イベントを持ち、有効なJSONである。
+    #[test]
+    fn both_flavors_cover_all_four_lifecycle_events() {
+        for flavor in [HookFlavor::Codex, HookFlavor::ClaudeCode] {
+            let s = build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), flavor);
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            let hooks = v["hooks"].as_object().unwrap();
+            assert_eq!(hooks.len(), 4, "expected exactly 4 hook events");
+            assert!(hooks.contains_key("UserPromptSubmit"));
+            assert!(hooks.contains_key("PostToolUse"));
+            assert!(hooks.contains_key("Stop"));
+        }
+    }
 }

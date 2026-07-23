@@ -164,6 +164,32 @@ pub fn normalized_split_cell(split: AutoSplit, cell_index: usize) -> NormalizedR
     }
 }
 
+/// The inverse of [`normalized_split_cell`]: which split and cell a saved
+/// normalized rectangle describes.
+///
+/// Editing a set has to show the 分割 / 位置 the set was registered with, and
+/// all that is persisted is the rectangle. Anything that isn't recognisably one
+/// of the grid cells (a rectangle captured from a hand-dragged window, from
+/// before sets were declared) reads as whole-monitor, which is the least
+/// surprising thing to re-save. The tolerance absorbs the rounding in
+/// `auto_split_cells`' integer pixel division.
+pub fn split_cell_from_normalized(rect: NormalizedRect) -> (AutoSplit, usize) {
+    const TOLERANCE: f64 = 0.02;
+    for split in [AutoSplit::FourGrid, AutoSplit::TwoColumns, AutoSplit::One] {
+        for cell_index in 0..split.cell_count() {
+            let candidate = normalized_split_cell(split, cell_index);
+            if (candidate.x - rect.x).abs() < TOLERANCE
+                && (candidate.y - rect.y).abs() < TOLERANCE
+                && (candidate.width - rect.width).abs() < TOLERANCE
+                && (candidate.height - rect.height).abs() < TOLERANCE
+            {
+                return (split, cell_index);
+            }
+        }
+    }
+    (AutoSplit::One, 0)
+}
+
 /// Selects the windows from `windows` whose center point falls on one of
 /// `main_monitor_bounds` (PLAN.md §3.6's candidate rule, reused here for
 /// "メインを空にする"'s "メイン画面と交差するトップレベルウィンドウを列挙").
@@ -235,6 +261,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Registering a placement and then editing the set must show back the same
+    /// 分割 / 位置 the user picked.
+    #[test]
+    fn split_and_cell_round_trip_through_a_normalized_rect() {
+        for split in [AutoSplit::One, AutoSplit::TwoColumns, AutoSplit::FourGrid] {
+            for cell_index in 0..split.cell_count() {
+                let rect = normalized_split_cell(split, cell_index);
+                assert_eq!(split_cell_from_normalized(rect), (split, cell_index));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_rect_reads_as_the_whole_monitor() {
+        let odd = NormalizedRect {
+            x: 0.13,
+            y: 0.27,
+            width: 0.41,
+            height: 0.62,
+        };
+        assert_eq!(split_cell_from_normalized(odd), (AutoSplit::One, 0));
     }
 
     #[test]

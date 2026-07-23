@@ -111,12 +111,10 @@ pub fn fetch(dir: &Path, branch: Option<&str>) -> GhStatus {
 
     let prs: Vec<GhPr> = serde_json::from_str(pr_json.trim()).unwrap_or_default();
     let current_branch_pr = branch.and_then(|b| {
-        prs.iter()
-            .find(|p| p.head_ref_name == b)
-            .map(|p| PrRef {
-                number: p.number,
-                title: p.title.clone(),
-            })
+        prs.iter().find(|p| p.head_ref_name == b).map(|p| PrRef {
+            number: p.number,
+            title: p.title.clone(),
+        })
     });
 
     GhStatus {
@@ -208,8 +206,14 @@ mod tests {
         assert_eq!(classify_ci("queued", None), CiState::Running);
         assert_eq!(classify_ci("completed", Some("success")), CiState::Success);
         assert_eq!(classify_ci("completed", Some("failure")), CiState::Failure);
-        assert_eq!(classify_ci("completed", Some("timed_out")), CiState::Failure);
-        assert_eq!(classify_ci("completed", Some("cancelled")), CiState::Failure);
+        assert_eq!(
+            classify_ci("completed", Some("timed_out")),
+            CiState::Failure
+        );
+        assert_eq!(
+            classify_ci("completed", Some("cancelled")),
+            CiState::Failure
+        );
         assert_eq!(classify_ci("completed", Some("skipped")), CiState::Unknown);
         assert_eq!(classify_ci("completed", None), CiState::Unknown);
     }

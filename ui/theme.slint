@@ -34,7 +34,10 @@ export global Theme {
     // the window, so alpha < 1.0 reads as frosted glass rather than the
     // ghosted, overlapping text documented above. With the setting off the
     // window falls back to the opaque glass-base.
-    out property <color> glass-base-translucent: rgba(13, 13, 16, 0.60);
+    // 0.60では背後の映像やテキストが透けて読めてしまう（ユーザー報告 2026-07-24）。
+    // この環境はDWMのぼかしが効かず透過分がそのまま滲むため、ほぼ不透明まで上げて
+    // 背後の内容を読めなくする。ごくわずかなガラス感だけ残す。
+    out property <color> glass-base-translucent: rgba(13, 13, 16, 0.96);
     out property <color> glass-panel: rgba(22, 22, 27, 1.0);
     out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
     out property <color> glass-panel-strong: rgba(0, 0, 0, 0.90);

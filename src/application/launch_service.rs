@@ -6,9 +6,11 @@
 //! [`crate::windowing::app_launch`], and the browser-URL capture (which does
 //! need UI Automation) in [`crate::windowing::browser_url`].
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::domain::workset::{LaunchKind, LaunchSpec};
+use crate::windowing::enumerate::TopLevelWindow;
 
 /// Classifies an executable by file name into the app family we build launch
 /// args for. Case-insensitive; unknown apps are [`LaunchKind::Generic`].
@@ -95,6 +97,20 @@ pub fn vscode_folder_matches_title(folder: &str, window_title: &str) -> bool {
         return false;
     };
     window_title.contains(&stem)
+}
+
+/// 「アプリを閉じる」で `WM_CLOSE` ではなくプロセス終了を使うアプリか。
+///
+/// リモートデスクトップ（mstsc.exe）は `WM_CLOSE` で切断確認を出して居座り、
+/// セッションを掴んだままなので開き直しても新しい接続を張れない。編集中の文書を
+/// 抱える種類のアプリではないため、終了させて失われるものはない。既定は
+/// `WM_CLOSE`——プロセスを殺すのは、ユーザーの確認なしに何かを失いうる操作なので、
+/// ここに挙げたものだけの例外に留める。
+pub fn closes_only_by_kill(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|n| n == "mstsc.exe")
 }
 
 /// Whether `executable` is Firefox (which uses `-new-window` rather than the
@@ -204,11 +220,127 @@ pub fn build_launch_spec(
     }
 }
 
+/// 登録アプリから宣言したウィンドウの `title_contains`：起動入力のうち、実際に
+/// ウィンドウタイトルへ現れ、かつそのアプリの他のウィンドウと区別できる部分。
+///
+/// VS Code のタイトルは開いているフォルダ（またはワークスペース）名を含むので
+/// その stem が使える。ブラウザのタイトルは *ページ* のもので起動 URL とは無関係、
+/// 汎用アプリの引数もタイトルではない。どちらも `None` にする——アプリのどの
+/// ウィンドウにも一致してしまう針を入れるくらいなら、針なしのほうがよい。
+pub fn declared_title_needle(kind: LaunchKind, input: &str) -> Option<String> {
+    if kind != LaunchKind::VsCode {
+        return None;
+    }
+    Path::new(input.trim())
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// 既存セットの VS Code エントリの `title_contains` を、アプリ名から開いている
+/// フォルダ名へ入れ替える。入れ替えた数を返す。
+///
+/// 登録アプリからの宣言は当初アプリ名をそのまま針にしていた。これだと 1 セットに
+/// VS Code が 2 つあっても——別セットの VS Code とすら——見分けがつかない。起動
+/// 引数には開くフォルダが入っているので、そこから本来の針を復元できる。
+///
+/// ブラウザや汎用アプリの針は触らない。タイトルから復元できる識別子が無く、
+/// 針を外すと点数が閾値に届かず「起動中の窓を取り込む」動作まで失われるため。
+/// そちらの取り違えは、バインドが切れたときに
+/// [`crate::windowing::matcher::has_title_evidence`] が弾く。
+pub fn retitle_declared_vscode_windows(worksets: &mut [crate::domain::workset::Workset]) -> usize {
+    let mut changed = 0;
+    for workset in worksets.iter_mut() {
+        for window in &mut workset.windows {
+            let matcher = &window.matcher;
+            // アプリ名がそのまま針になっているもの＝宣言時の既定値のままのもの。
+            if matcher.title_contains.as_deref() != Some(matcher.registered_title.as_str()) {
+                continue;
+            }
+            let Some(spec) = &window.launch_spec else {
+                continue;
+            };
+            if spec.kind != LaunchKind::VsCode {
+                continue;
+            }
+            let Some(folder) = spec.args.iter().find(|a| !a.starts_with('-')) else {
+                continue;
+            };
+            let Some(needle) = declared_title_needle(LaunchKind::VsCode, folder) else {
+                continue;
+            };
+            window.matcher.title_contains = Some(needle);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 再起動したエントリが結びつくべき、新しく現れたウィンドウを選ぶ。
+///
+/// 登録アプリから宣言したセットはウィンドウクラスを持たない（宣言時点でアプリが
+/// 起動している——どころかインストールされている——とは限らない）。よって空の
+/// `class` は「未知」とし、実行ファイルだけで決める。クラス一致を要求していた
+/// ため、宣言アプリは *一つも* 紐づかなかった：VS Code、LibreHardwareMonitor、
+/// リモートデスクトップはいずれも起動だけして未バインドのまま残っていた。
+///
+/// 実行ファイルはまずフルパス、次にファイル名で比較する。ストアアプリは AUMID
+/// 経由で起動され、そのウィンドウのプロセスは *バージョン付き* の `WindowsApps`
+/// ディレクトリに居るので、アプリが更新された途端フルパスは登録値と一致しなくなる。
+///
+/// クラスは絞り込みの *ヒント* であって条件ではない。WinForms のクラス名は
+/// `WindowsForms10.Window.8.app.0.21b46d2_r3_ad1` のように実行ごとに変わりうる
+/// 部分を含むため、前回学習したクラスに固執すると次回また紐づかなくなる。
+pub fn find_launched_window<'a>(
+    after: &'a [TopLevelWindow],
+    before: &HashSet<isize>,
+    claimed: &HashSet<isize>,
+    exe: &Path,
+    class: &str,
+) -> Option<&'a TopLevelWindow> {
+    let fresh = |w: &&TopLevelWindow| !before.contains(&w.hwnd) && !claimed.contains(&w.hwnd);
+    let same_exe = |w: &&TopLevelWindow| {
+        w.executable_path
+            .as_deref()
+            .is_some_and(|p| crate::windowing::matcher::same_executable(p, exe))
+    };
+    let file_name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    };
+    let same_name = |w: &&TopLevelWindow| {
+        file_name(exe).is_some_and(|wanted| {
+            w.executable_path
+                .as_deref()
+                .and_then(file_name)
+                .is_some_and(|got| got == wanted)
+        })
+    };
+
+    after
+        .iter()
+        .find(|w| fresh(w) && same_exe(w) && !class.is_empty() && w.window_class == class)
+        .or_else(|| after.iter().find(|w| fresh(w) && same_exe(w)))
+        .or_else(|| after.iter().find(|w| fresh(w) && same_name(w)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::domain::placement::PixelRect;
+
+    fn window(hwnd: isize, exe: &str, class: &str) -> TopLevelWindow {
+        TopLevelWindow {
+            hwnd,
+            process_id: 100,
+            executable_path: Some(PathBuf::from(exe)),
+            window_class: class.to_string(),
+            title: "t".to_string(),
+            rect_px: PixelRect::new(0, 0, 800, 600),
+        }
+    }
 
     #[test]
     fn classify_detects_vscode_and_browsers_case_insensitively() {
@@ -284,7 +416,10 @@ mod tests {
             r"C:\code\test\repo01",
             "repo07 - Visual Studio Code"
         ));
-        assert!(!vscode_folder_matches_title("", "repo01 - Visual Studio Code"));
+        assert!(!vscode_folder_matches_title(
+            "",
+            "repo01 - Visual Studio Code"
+        ));
     }
 
     #[test]
@@ -326,7 +461,10 @@ mod tests {
             None,
         );
         assert_eq!(spec.kind, LaunchKind::Generic);
-        assert_eq!(spec.aumid.as_deref(), Some("OpenAI.Codex_2p2nqsd0c76g0!App"));
+        assert_eq!(
+            spec.aumid.as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0!App")
+        );
     }
 
     #[test]
@@ -381,6 +519,198 @@ mod tests {
     #[test]
     fn extract_vscode_folder_none_for_a_bare_window() {
         assert_eq!(extract_vscode_folder(r#""C:\x\Code.exe""#), None);
+    }
+
+    #[test]
+    fn declared_window_with_no_class_binds_on_the_executable_alone() {
+        // 登録アプリ由来のエントリはクラスが空。クラス一致を要求していたため
+        // LibreHardwareMonitor もリモートデスクトップも起動後に紐づかなかった。
+        let exe = r"C:\tool\LibreHardwareMonitor.Windows.Forms.exe";
+        let after = vec![window(11, exe, "WindowsForms10.Window.8.app.0.1")];
+        let found =
+            find_launched_window(&after, &HashSet::new(), &HashSet::new(), Path::new(exe), "");
+        assert_eq!(found.map(|w| w.hwnd), Some(11));
+    }
+
+    #[test]
+    fn only_a_newly_appeared_unclaimed_window_is_taken() {
+        let exe = r"C:\x\mstsc.exe";
+        let after = vec![
+            window(1, exe, "TscShellContainerClass"),
+            window(2, exe, "TscShellContainerClass"),
+        ];
+        let before: HashSet<isize> = [1].into_iter().collect();
+        // 1 は起動前から居たので対象外、2 が選ばれる。
+        let first = find_launched_window(&after, &before, &HashSet::new(), Path::new(exe), "");
+        assert_eq!(first.map(|w| w.hwnd), Some(2));
+        // 2 を別のエントリが確保済みなら、もう渡せる窓はない。
+        let claimed: HashSet<isize> = [2].into_iter().collect();
+        assert!(find_launched_window(&after, &before, &claimed, Path::new(exe), "").is_none());
+    }
+
+    #[test]
+    fn a_known_class_narrows_the_choice_but_does_not_gate_it() {
+        let exe = r"C:\VS\Code.exe";
+        let after = vec![
+            window(1, exe, "OtherClass"),
+            window(2, exe, "Chrome_WidgetWin_1"),
+        ];
+        let found = find_launched_window(
+            &after,
+            &HashSet::new(),
+            &HashSet::new(),
+            Path::new(exe),
+            "Chrome_WidgetWin_1",
+        );
+        assert_eq!(found.map(|w| w.hwnd), Some(2));
+
+        // WinForms のクラス名は実行ごとに変わりうる。学習済みのクラスと一致する
+        // 窓が無くても、実行ファイルが合っていれば結びつける。
+        let stale = vec![window(
+            3,
+            r"C:\tool\LHM.exe",
+            "WindowsForms10.Window.8.app.0.21b46d2_r3_ad1",
+        )];
+        let found = find_launched_window(
+            &stale,
+            &HashSet::new(),
+            &HashSet::new(),
+            Path::new(r"C:\tool\LHM.exe"),
+            "WindowsForms10.Window.8.app.0.aabbcc_r6_ad1",
+        );
+        assert_eq!(found.map(|w| w.hwnd), Some(3));
+    }
+
+    #[test]
+    fn store_app_falls_back_to_the_file_name_when_the_version_directory_moved() {
+        // AUMID 起動なので、窓のプロセスは更新後の versioned な WindowsApps に居る。
+        let registered = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.4045.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let running = r"C:\Program Files\WindowsApps\OpenAI.Codex_99.0.0.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let after = vec![window(7, running, "WinUIDesktopWin32WindowClass")];
+        let found = find_launched_window(
+            &after,
+            &HashSet::new(),
+            &HashSet::new(),
+            Path::new(registered),
+            "",
+        );
+        assert_eq!(found.map(|w| w.hwnd), Some(7));
+    }
+
+    #[test]
+    fn migration_swaps_the_app_name_needle_for_the_open_folder() {
+        use crate::domain::workset::{ManagedWindow, RepositoryKind, WindowMatcher};
+
+        fn declared(app_name: &str, spec: Option<LaunchSpec>) -> ManagedWindow {
+            ManagedWindow {
+                id: uuid::Uuid::new_v4(),
+                matcher: WindowMatcher {
+                    executable_path: PathBuf::from(r"C:\x\app.exe"),
+                    process_name: "app.exe".to_string(),
+                    window_class: String::new(),
+                    registered_title: app_name.to_string(),
+                    title_contains: Some(app_name.to_string()),
+                    title_regex: None,
+                },
+                main_placement: crate::domain::placement::SavedPlacement {
+                    monitor_id: "A".to_string(),
+                    main_monitor_index: 0,
+                    normalized_rect: crate::domain::placement::NormalizedRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    physical_rect_at_capture: crate::domain::placement::PixelRect::new(0, 0, 0, 0),
+                    show_state: crate::domain::placement::SavedShowState::Normal,
+                },
+                z_order: 0,
+                launch_spec: spec,
+            }
+        }
+
+        let code = declared(
+            "Visual Studio Code",
+            Some(build_launch_spec(
+                Path::new(r"C:\VS\Code.exe"),
+                Some(Path::new(r"C:\code\portfolio\repodeck")),
+                None,
+            )),
+        );
+        let workspace = declared(
+            "Visual Studio Code",
+            Some(build_launch_spec(
+                Path::new(r"C:\VS\Code.exe"),
+                Some(Path::new(r"C:\ws\02_資料.code-workspace")),
+                None,
+            )),
+        );
+        let brave = declared(
+            "Brave",
+            Some(build_launch_spec(
+                Path::new(r"C:\brave\brave.exe"),
+                None,
+                Some("https://www.youtube.com/"),
+            )),
+        );
+        let mut worksets = vec![crate::application::workset_service::build_workset(
+            "S".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\s"),
+            RepositoryKind::Git,
+            0,
+            vec![code.clone(), workspace.clone(), brave.clone()],
+        )];
+
+        assert_eq!(retitle_declared_vscode_windows(&mut worksets), 2);
+        let windows = &worksets[0].windows;
+        assert_eq!(
+            windows[0].matcher.title_contains.as_deref(),
+            Some("repodeck")
+        );
+        assert_eq!(
+            windows[1].matcher.title_contains.as_deref(),
+            Some("02_資料")
+        );
+        // ブラウザの針は据え置き（外すと起動中の窓を取り込めなくなる）。
+        assert_eq!(windows[2].matcher.title_contains.as_deref(), Some("Brave"));
+
+        // 二度目は何も変えない（移行済みの針を上書きしない）。
+        assert_eq!(retitle_declared_vscode_windows(&mut worksets), 0);
+    }
+
+    #[test]
+    fn only_remote_desktop_is_closed_by_killing_its_process() {
+        assert!(closes_only_by_kill(Path::new(
+            r"C:\Windows\System32\mstsc.exe"
+        )));
+        assert!(closes_only_by_kill(Path::new(
+            r"C:\Windows\System32\MSTSC.EXE"
+        )));
+        // 既定は WM_CLOSE。編集中の内容を持ちうるアプリを勝手に殺さない。
+        assert!(!closes_only_by_kill(Path::new(r"C:\VS\Code.exe")));
+        assert!(!closes_only_by_kill(Path::new(r"C:\brave\brave.exe")));
+        assert!(!closes_only_by_kill(Path::new("")));
+    }
+
+    #[test]
+    fn declared_title_needle_is_the_vscode_folder_and_nothing_else() {
+        assert_eq!(
+            declared_title_needle(LaunchKind::VsCode, r"C:\code\test\repo01"),
+            Some("repo01".to_string())
+        );
+        // ワークスペースはタイトルに拡張子なしで出る。
+        assert_eq!(
+            declared_title_needle(LaunchKind::VsCode, r"C:\code\repo08\repo08.code-workspace"),
+            Some("repo08".to_string())
+        );
+        assert_eq!(declared_title_needle(LaunchKind::VsCode, ""), None);
+        // ブラウザのタイトルはページのもので URL とは無関係。汎用アプリの引数も同様。
+        assert_eq!(
+            declared_title_needle(LaunchKind::Browser, "https://example.com"),
+            None
+        );
+        assert_eq!(declared_title_needle(LaunchKind::Generic, "--hud"), None);
     }
 
     #[test]

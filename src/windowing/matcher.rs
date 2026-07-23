@@ -3,9 +3,22 @@
 //! only reads [`TopLevelWindow`] values that `enumerate` already collected.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use crate::domain::workset::WindowMatcher;
 use crate::windowing::enumerate::TopLevelWindow;
+
+/// 2 つの実行ファイルパスが同じものを指すか。
+///
+/// Windows のパスは大文字小文字を区別しない。登録値はスタートメニューの
+/// ショートカットから来ることが多く `C:\WINDOWS\system32\mstsc.exe`、実行中の
+/// ウィンドウから読める値は OS 正規の `C:\Windows\System32\mstsc.exe` になる。
+/// 素の `PathBuf` 比較はこれを別物と見なすので、リモートデスクトップのバインドが
+/// 検証で落ち、「閉じる」の対象からも外れていた。
+pub fn same_executable(a: &Path, b: &Path) -> bool {
+    let key = |p: &Path| p.as_os_str().to_string_lossy().to_ascii_lowercase();
+    key(a) == key(b)
+}
 
 const AUTO_REBIND_THRESHOLD: i32 = 75;
 const AUTO_REBIND_MARGIN: i32 = 20;
@@ -66,12 +79,25 @@ pub fn title_similarity(a: &str, b: &str) -> f64 {
 pub fn score_candidate(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> i32 {
     let mut score = 0;
 
-    if candidate.executable_path.as_ref() == Some(&matcher.executable_path) {
+    if candidate
+        .executable_path
+        .as_deref()
+        .is_some_and(|p| same_executable(p, &matcher.executable_path))
+    {
         score += 50;
     }
     if candidate.window_class == matcher.window_class {
         score += 25;
     }
+
+    score + title_score(matcher, candidate)
+}
+
+/// [`score_candidate`] のうちタイトル由来の分。アプリ同一性（実行ファイル＋
+/// ウィンドウクラス）以外のすべて。
+fn title_score(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> i32 {
+    let mut score = 0;
+
     if matcher
         .title_contains
         .as_deref()
@@ -97,6 +123,25 @@ pub fn score_candidate(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> i
     }
 
     score
+}
+
+/// `candidate` が「そのアプリの他のウィンドウ」ではなく *この* ウィンドウだと
+/// 言える根拠を持つか。
+///
+/// 実行ファイル＋クラスは「そのアプリの窓」としか言っていない（Brave のどの
+/// ウィンドウもどの Brave 登録にも一致する）。アプリ名そのものの
+/// `title_contains` も同様で、登録アプリから宣言したセットは当初これを保存して
+/// いた。移行はせず、ここで無視する。同一アプリの二窓を取り違えられない呼び出し
+/// 側が、本物の再発見とそっくりさんを見分けるために使う。
+pub fn has_title_evidence(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> bool {
+    let discriminating = WindowMatcher {
+        title_contains: matcher
+            .title_contains
+            .clone()
+            .filter(|needle| *needle != matcher.registered_title),
+        ..matcher.clone()
+    };
+    title_score(&discriminating, candidate) > 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +301,33 @@ mod tests {
     }
 
     #[test]
+    fn executable_paths_are_compared_case_insensitively() {
+        // 登録値はショートカット由来（C:\WINDOWS\system32\…）、実行中の窓から
+        // 読める値は OS 正規（C:\Windows\System32\…）。同じ実行ファイルである。
+        assert!(same_executable(
+            Path::new(r"C:\WINDOWS\system32\mstsc.exe"),
+            Path::new(r"C:\Windows\System32\mstsc.exe")
+        ));
+        assert!(!same_executable(
+            Path::new(r"C:\Windows\System32\mstsc.exe"),
+            Path::new(r"C:\Windows\System32\notepad.exe")
+        ));
+
+        let mut m = matcher();
+        m.executable_path = PathBuf::from(r"C:\WINDOWS\system32\mstsc.exe");
+        m.window_class = "TscShellContainerClass".to_string();
+        m.registered_title = "Remote Desktop Connection".to_string();
+        let c = candidate(
+            1,
+            Some(r"C:\Windows\System32\mstsc.exe"),
+            "TscShellContainerClass",
+            "perkypat100 - リモート デスクトップ接続",
+        );
+        // 実行ファイル 50 + クラス 25 で自動再バインドの閾値に届く。
+        assert_eq!(score_candidate(&m, &c), 75);
+    }
+
+    #[test]
     fn low_score_candidate_is_unresolved() {
         let m = matcher();
         let c = candidate(
@@ -321,6 +393,60 @@ mod tests {
         // contains(30) + regex(30) + similarity(10, since normalized titles differ by the VS Code suffix only, still >=0.8) = 70 -> unresolved.
         let score = score_candidate(&m, &c);
         assert_eq!(score, 70);
+    }
+
+    #[test]
+    fn the_apps_own_name_is_not_evidence_that_this_is_the_right_window() {
+        // 登録アプリから宣言したエントリ：登録タイトルも針もアプリ名そのもの。
+        let m = WindowMatcher {
+            executable_path: PathBuf::from(r"C:\brave\brave.exe"),
+            process_name: "brave.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "Brave".to_string(),
+            title_contains: Some("Brave".to_string()),
+            title_regex: None,
+        };
+        let other_window = candidate(
+            1,
+            Some(r"C:\brave\brave.exe"),
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        );
+        assert!(!has_title_evidence(&m, &other_window));
+    }
+
+    #[test]
+    fn a_discriminating_needle_is_evidence() {
+        let mut m = matcher();
+        m.title_contains = Some("repo01".to_string());
+        let mine = candidate(
+            1,
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "repo01 - Visual Studio Code",
+        );
+        let theirs = candidate(
+            2,
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "repo07 - Visual Studio Code",
+        );
+        assert!(has_title_evidence(&m, &mine));
+        assert!(!has_title_evidence(&m, &theirs));
+    }
+
+    #[test]
+    fn a_captured_windows_own_title_is_evidence() {
+        // キャプチャ由来の登録は本物のウィンドウタイトルを持つので、
+        // タイトルが多少変わっても類似度で自分だと分かる。
+        let m = matcher();
+        let same = candidate(
+            1,
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "lib.rs - repodeck - Visual Studio Code",
+        );
+        assert!(has_title_evidence(&m, &same));
     }
 
     #[test]

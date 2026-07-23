@@ -28,10 +28,35 @@ pub fn launch(spec: &LaunchSpec) -> std::io::Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    for name in INHERITED_VARS_TO_DROP {
+        command.env_remove(name);
+    }
     // Spawn and immediately drop the handle; the child keeps running.
     let _child = command.spawn()?;
     Ok(())
 }
+
+/// 子プロセスへ引き継いではいけない環境変数。
+///
+/// RepoDeck を VS Code のターミナルから起動すると、拡張ホストの環境が丸ごと
+/// 引き継がれる。その中の `ELECTRON_RUN_AS_NODE=1` は Electron アプリを素の
+/// Node として起動させるので、`Code.exe --new-window <folder>` が
+/// `bad option: --new-window` で即死し、開き直しても VS Code が永久に現れない。
+/// `VSCODE_*` の受け渡し変数も同様に、別インスタンスの IPC や NLS 設定を
+/// 押し付けてしまう。起動するのは独立したデスクトップアプリなので、これらは
+/// 落としてから渡す。
+const INHERITED_VARS_TO_DROP: &[&str] = &[
+    "ELECTRON_RUN_AS_NODE",
+    "VSCODE_CODE_CACHE_PATH",
+    "VSCODE_CRASH_REPORTER_PROCESS_TYPE",
+    "VSCODE_CWD",
+    "VSCODE_ESM_ENTRYPOINT",
+    "VSCODE_HANDLES_UNCAUGHT_ERRORS",
+    "VSCODE_IPC_HOOK",
+    "VSCODE_L10N_BUNDLE_LOCATION",
+    "VSCODE_NLS_CONFIG",
+    "VSCODE_PID",
+];
 
 /// Activates a packaged app by AUMID through `explorer.exe shell:AppsFolder\…`,
 /// the documented shell entry point for launching a Store app without knowing

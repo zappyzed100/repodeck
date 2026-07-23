@@ -102,16 +102,21 @@ pub fn apply_event(
             );
         }
         NormalizedEventKind::ToolUseObserved => {
-            // Only a resume from a pending-input state counts as a real
-            // transition (PLAN.md §6.3); a stray `PostToolUse` with no
-            // matching run, or one that isn't currently `NeedsInput`,
-            // silently no-ops.
+            // ツール使用は「また動いている」の合図。`NeedsInput`（入力待ちから
+            // 再開）に加えて `Ready` からも `Running` へ戻す。Claude Code は
+            // ターン終了ごとに `Stop` を撃つため、一度 `Ready`（成功）になった後も
+            // サブエージェント待ちや自律的な複数ターン作業で活動が続く。ここで
+            // `Ready` から戻さないと、実際は動いているのに「成功」のまま張り付き、
+            // 次のユーザープロンプトまで直らない（ユーザー報告 2026-07-24）。
+            // 対応する run が無い野良 `PostToolUse` や、既に `Running` のものは
+            // 従来どおり何もしない。
             if let Some(run) =
                 find_run_mut(&mut state.agent_runs, &event.session_id, &event.turn_id)
-                && run.state == AgentState::NeedsInput
+                && matches!(run.state, AgentState::NeedsInput | AgentState::Ready)
             {
                 run.state = AgentState::Running;
                 run.last_transition_at = event.occurred_at.clone();
+                run.confirmed = false;
             }
         }
         NormalizedEventKind::RunCompleted => {
@@ -436,6 +441,47 @@ mod tests {
             aggregate_all(&worksets, &state.agent_runs)[&workset_id],
             AgentState::Idle
         );
+    }
+
+    #[test]
+    fn tool_use_after_ready_resumes_running() {
+        // Claude Codeはターン終了ごとにStopを撃つ。一度Ready（成功）になった後、
+        // サブエージェント処理やツール実行で活動が続くなら、PostToolUseで
+        // Runningへ戻り「成功のまま張り付く」ことがないようにする。
+        let dir = tempdir().unwrap();
+        let repo = PathBuf::from(r"D:\repos\a");
+        let worksets = [workset_at(&repo)];
+        let mut unmatched = Vec::new();
+
+        apply_event(
+            dir.path(),
+            &worksets,
+            &mut unmatched,
+            event(NormalizedEventKind::RunStarted, &repo, "s1", "t1"),
+        )
+        .unwrap();
+        apply_event(
+            dir.path(),
+            &worksets,
+            &mut unmatched,
+            event(NormalizedEventKind::RunCompleted, &repo, "s1", "t1"),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_store::load(dir.path()).agent_runs[0].state,
+            AgentState::Ready
+        );
+
+        apply_event(
+            dir.path(),
+            &worksets,
+            &mut unmatched,
+            event(NormalizedEventKind::ToolUseObserved, &repo, "s1", "t1"),
+        )
+        .unwrap();
+        let state = runtime_store::load(dir.path());
+        assert_eq!(state.agent_runs[0].state, AgentState::Running);
+        assert!(!state.agent_runs[0].confirmed);
     }
 
     #[test]

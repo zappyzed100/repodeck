@@ -240,9 +240,16 @@ pub fn resolve_all_matches(
 /// was registered with (guards against Windows recycling the HWND for an
 /// unrelated window). Title/URL are deliberately NOT checked — that volatility
 /// is the whole reason bindings exist.
+///
+/// クラスは照合しない。登録アプリから宣言したウィンドウはそもそもクラスを持たず
+/// （宣言時点でアプリが起動しているとは限らない）、学習したクラスも WinForms の
+/// `WindowsForms10.Window.8.app.0.21b46d2_r3_ad1` のように実行ごとに変わりうる。
+/// 一致を要求すると、そうしたウィンドウは永久にバインドを保持できない。HWND の
+/// 使い回しに対しては実行ファイルの一致で十分に守れている。
 fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
-    live.executable_path.as_ref() == Some(&matcher.executable_path)
-        && live.window_class == matcher.window_class
+    live.executable_path
+        .as_deref()
+        .is_some_and(|p| matcher::same_executable(p, &matcher.executable_path))
 }
 
 /// Like [`resolve_all_matches`], but first tries each managed window's tracked
@@ -278,14 +285,45 @@ pub fn resolve_all_matches_with_bindings(
         );
     for workset in ordered {
         for window in &workset.windows {
-            if let Some(&hwnd) = bindings.get(&window.id)
-                && !bound.contains(&hwnd)
-                && let Some(live) = live_windows.iter().find(|w| w.hwnd == hwnd)
-                && binding_still_valid(&window.matcher, live)
-            {
-                bound.insert(hwnd);
-                results.insert(window.id, MatchDecision::AutoRebind { hwnd });
-                continue;
+            if let Some(&hwnd) = bindings.get(&window.id) {
+                match live_windows.iter().find(|w| w.hwnd == hwnd) {
+                    Some(live)
+                        if !bound.contains(&hwnd) && binding_still_valid(&window.matcher, live) =>
+                    {
+                        bound.insert(hwnd);
+                        results.insert(window.id, MatchDecision::AutoRebind { hwnd });
+                        continue;
+                    }
+                    // バインド先のウィンドウがもう存在しない＝このエントリは閉じ
+                    // られた。内容マッチでの再発見はまだ許す（開き直した VS Code
+                    // はタイトルに同じフォルダ名を持つ）が、「同じアプリの別窓」
+                    // で妥協させてはいけない。妥協すると、閉じた Brave が別の
+                    // Brave ウィンドウを勝手に取り込み、セットは開いているように
+                    // 見え、開き直すが「対象なし」と言う。
+                    None => {
+                        let decision =
+                            matcher::resolve_best_match(&window.matcher, live_windows, &bound);
+                        let decision = match &decision {
+                            MatchDecision::AutoRebind { hwnd }
+                                if !live_windows.iter().any(|w| {
+                                    w.hwnd == *hwnd
+                                        && matcher::has_title_evidence(&window.matcher, w)
+                                }) =>
+                            {
+                                MatchDecision::Unresolved
+                            }
+                            _ => decision,
+                        };
+                        if let MatchDecision::AutoRebind { hwnd } = &decision {
+                            bound.insert(*hwnd);
+                        }
+                        results.insert(window.id, decision);
+                        continue;
+                    }
+                    // 生きてはいるが先のセットが確保済み、または HWND が無関係な
+                    // ウィンドウに再利用された場合は内容マッチへ委ねる。
+                    _ => {}
+                }
             }
 
             let decision = matcher::resolve_best_match(&window.matcher, live_windows, &bound);
@@ -745,6 +783,136 @@ mod tests {
         assert_ne!(
             decisions[&managed_a.id],
             MatchDecision::AutoRebind { hwnd: 1 }
+        );
+    }
+
+    /// 登録アプリから宣言したエントリ（クラス未学習、タイトルはアプリ名だけ）。
+    fn declared_window(exe: &str, app_name: &str) -> ManagedWindow {
+        ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: WindowMatcher {
+                executable_path: PathBuf::from(exe),
+                process_name: "app.exe".to_string(),
+                window_class: String::new(),
+                registered_title: app_name.to_string(),
+                title_contains: Some(app_name.to_string()),
+                title_regex: None,
+            },
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: crate::domain::placement::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 0, 0),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+        }
+    }
+
+    fn single_set(windows: Vec<ManagedWindow>) -> Workset {
+        build_workset(
+            "S".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\s"),
+            RepositoryKind::Git,
+            0,
+            windows,
+        )
+    }
+
+    #[test]
+    fn a_declared_window_holds_its_binding_even_though_no_class_was_registered() {
+        // クラス一致を要求していたため、宣言アプリはバインドを一切保持できず、
+        // 開き直しても紐づかなかった（VS Code / LibreHardwareMonitor / RDP）。
+        let managed = declared_window(r"C:\tool\LHM.exe", "Libre Hardware Monitor");
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            42,
+            r"C:\tool\LHM.exe",
+            "WindowsForms10.Window.8.app.0.1",
+            "Libre Hardware Monitor",
+        )];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 42)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 42 }
+        );
+    }
+
+    #[test]
+    fn a_closed_browser_does_not_adopt_another_window_of_the_same_browser() {
+        // Brave を閉じたのに、別の Brave ウィンドウへ紐づき直してしまい
+        // 「開き直せる閉じたアプリはありませんでした」になっていた。
+        let managed = declared_window(r"C:\brave\brave.exe", "Brave");
+        let set = single_set(vec![managed.clone()]);
+        // このエントリが結びついていた 10 は消え、無関係な Brave の窓 11 だけが残る。
+        let live = [window_with(
+            11,
+            r"C:\brave\brave.exe",
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        )];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 10)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(decisions[&managed.id], MatchDecision::Unresolved);
+    }
+
+    #[test]
+    fn a_closed_vscode_window_is_still_re_found_by_its_folder_in_the_title() {
+        // 一方、タイトルで自分だと分かるものは内容マッチでの再発見を許す：
+        // ユーザーが同じフォルダを開き直した VS Code は取り込んでよい。
+        let mut managed = declared_window(r"C:\VS\Code.exe", "Visual Studio Code");
+        managed.matcher.title_contains = Some("repo01".to_string());
+        let set = single_set(vec![managed.clone()]);
+        let live = [
+            window_with(
+                11,
+                r"C:\VS\Code.exe",
+                "Chrome_WidgetWin_1",
+                "repo01 - Visual Studio Code",
+            ),
+            window_with(
+                12,
+                r"C:\VS\Code.exe",
+                "Chrome_WidgetWin_1",
+                "repo07 - Visual Studio Code",
+            ),
+        ];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 10)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 11 }
+        );
+    }
+
+    #[test]
+    fn without_any_binding_a_declared_entry_still_adopts_a_running_window() {
+        // バインドが無い＝まだ一度も結びついていない（再起動後など）。この段階では
+        // 既に起動している窓を取り込めたほうが便利なので、従来どおり内容マッチ。
+        let managed = declared_window(r"C:\brave\brave.exe", "Brave");
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            11,
+            r"C:\brave\brave.exe",
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        )];
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &HashMap::new(), None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 11 }
         );
     }
 }

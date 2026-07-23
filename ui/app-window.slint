@@ -73,6 +73,7 @@ export component AppWindow inherits Window {
     callback open-workset-manager-requested();
     callback codex-check-hook-exe-requested();
     callback codex-copy-snippet-requested();
+    callback claude-copy-snippet-requested();
     callback codex-open-config-folder-requested();
     callback codex-send-test-event-requested();
     callback open-third-party-notices-requested();
@@ -296,8 +297,13 @@ export component AppWindow inherits Window {
             }
 
             GlassButton {
-                text: "hooks.json断片をコピー";
+                text: "Codex用hooks.json断片をコピー";
                 clicked => { root.codex-copy-snippet-requested(); }
+            }
+
+            GlassButton {
+                text: "Claude Code用settings.json断片をコピー";
+                clicked => { root.claude-copy-snippet-requested(); }
             }
 
             if root.codex-hook-snippet != "": Rectangle {
@@ -337,7 +343,7 @@ export component AppWindow inherits Window {
             }
 
             Text {
-                text: "Codex CLIの /hooks で4つのフックを信頼するまで、イベントは届きません。";
+                text: "Codex: hooks.jsonへ貼り、CLIの /hooks で4つのフックを信頼するまでイベントは届きません。Claude Code: ~/.claude/settings.json のhooksへ貼り、新しいセッションから有効になります。";
                 font-size: 11px;
                 color: Theme.text-tertiary;
                 wrap: word-wrap;
