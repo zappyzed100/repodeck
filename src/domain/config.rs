@@ -95,7 +95,6 @@ impl AppConfig {
 
         let mut seen_workset_ids: HashSet<Uuid> = HashSet::new();
         let mut seen_window_ids: HashSet<Uuid> = HashSet::new();
-        let mut seen_matchers: HashSet<(PathBuf, String, String)> = HashSet::new();
 
         for workset in &self.worksets {
             if !seen_workset_ids.insert(workset.id) {
@@ -159,18 +158,10 @@ impl AppConfig {
                     errors.push(ConfigValidationError::DuplicateManagedWindowId { id: window.id });
                 }
 
-                let matcher_key = (
-                    window.matcher.executable_path.clone(),
-                    window.matcher.window_class.clone(),
-                    window.matcher.registered_title.clone(),
-                );
-                if !seen_matchers.insert(matcher_key) {
-                    errors.push(ConfigValidationError::DuplicateWindowMatcher {
-                        executable_path: window.matcher.executable_path.display().to_string(),
-                        window_class: window.matcher.window_class.clone(),
-                        registered_title: window.matcher.registered_title.clone(),
-                    });
-                }
+                // 同じウィンドウ（同一 matcher）が複数のセットに登録されるのは
+                // 設計上許容。切り替え時に、そのウィンドウは最初に要求したセットへ
+                // 解決され、アクティブなセットに追従する。ブラウザや VS Code を
+                // 複数セットで共有する通常の使い方なので、重複は検証しない。
 
                 if let Some(pattern) = &window.matcher.title_regex
                     && let Err(source) = regex::Regex::new(pattern)
@@ -339,14 +330,6 @@ pub enum ConfigValidationError {
     DuplicateWorksetId { id: Uuid },
     #[error("duplicate managed window id: {id}")]
     DuplicateManagedWindowId { id: Uuid },
-    #[error(
-        "window matcher registered to more than one workset: {executable_path} / {window_class} / {registered_title}"
-    )]
-    DuplicateWindowMatcher {
-        executable_path: String,
-        window_class: String,
-        registered_title: String,
-    },
     #[error("duplicate fixed parking slot: monitor {monitor_id} grid {grid:?} cell {cell_index}")]
     DuplicateFixedSlot {
         monitor_id: String,

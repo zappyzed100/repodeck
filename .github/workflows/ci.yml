@@ -13,6 +13,20 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# CI 全体で共通の Cargo 設定。
+# - CARGO_INCREMENTAL=0: CI は毎回クリーンに近いので増分は無駄。キャッシュも肥大
+#   させない（Swatinem/rust-cache 推奨）。
+# - リリースの LTO / codegen-units を上書きし、ビルドを大幅短縮する。配布用の
+#   本物のプロファイル（Cargo.toml: lto=true, codegen-units=1）は build.ps1 が
+#   使うのでそのまま。CI が確認したいのは「リリースでも通る」ことなので、CI では
+#   LTO を切り、codegen を分割して速く回す。
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+
 jobs:
   docs-only-check:
     runs-on: windows-latest
@@ -50,6 +64,7 @@ jobs:
     needs: docs-only-check
     if: needs.docs-only-check.outputs.docs_only != 'true'
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +74,11 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # 依存ツリー（slint / windows-rs）が巨大なので、release 成果物まで含めて
+          # キャッシュを効かせる。ワークフロー変更でもキャッシュを共有し続けたい
+          # ので、キーには含めない。
+          cache-all-crates: true
 
       - name: cargo fmt --check
         run: cargo fmt --check

@@ -3306,18 +3306,11 @@ fn wire_workset_manager(
                 None => config.worksets.push(workset),
             }
 
-            let errors = config.validate();
-            // Registering the same window in more than one workset is allowed —
-            // at switch time a window simply resolves to whichever workset claims
-            // it first — so it is not a fatal error, only the rest are.
-            let fatal: Vec<String> = errors
+            // 同じウィンドウを複数セットに登録するのは許容なので、検証はもう
+            // それを報告しない（`validate` から撤去済み）。残る検証はすべて致命。
+            let fatal: Vec<String> = config
+                .validate()
                 .iter()
-                .filter(|e| {
-                    !matches!(
-                        e,
-                        crate::domain::config::ConfigValidationError::DuplicateWindowMatcher { .. }
-                    )
-                })
                 .map(config_validation_message)
                 .collect();
             let restore = |config: &mut AppConfig| match &backup {
@@ -3682,9 +3675,6 @@ fn config_validation_message(error: &crate::domain::config::ConfigValidationErro
     use crate::domain::config::ConfigValidationError as E;
     match error {
         E::WorksetNameLength { .. } => "セット名は1〜80文字にしてください。".to_string(),
-        E::DuplicateWindowMatcher {
-            registered_title, ..
-        } => format!("「{registered_title}」は既に別のセットに登録されています。"),
         other => other.to_string(),
     }
 }
