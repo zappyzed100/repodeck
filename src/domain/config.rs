@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::monitor::SavedMonitor;
-use crate::domain::workset::{FixedParkingSlot, ParkingPolicy, Workset};
+use crate::domain::workset::{FixedParkingSlot, LaunchApp, ParkingPolicy, Workset};
 
 /// `config.json`'s current schema version (PLAN.md §7.6). Bump this, and add a
 /// migration in `persistence::migrations`, whenever a field is added or changed.
@@ -28,6 +28,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub sub_screens: Vec<SubScreen>,
     pub worksets: Vec<Workset>,
+    /// Apps the user has registered as launch candidates. Worksets attach one of
+    /// these rather than naming an executable directly, so the same app can be
+    /// reused across sets and re-pointed in one place if it moves.
+    #[serde(default)]
+    pub launch_apps: Vec<LaunchApp>,
     pub fixed_slots: Vec<FixedParkingSlot>,
 }
 
@@ -66,6 +71,7 @@ impl AppConfig {
             main_monitor_ids: Vec::new(),
             sub_screens: Vec::new(),
             worksets: Vec::new(),
+            launch_apps: Vec::new(),
             fixed_slots: Vec::new(),
         }
     }

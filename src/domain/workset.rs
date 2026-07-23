@@ -57,6 +57,25 @@ pub struct ManagedWindow {
     pub launch_spec: Option<LaunchSpec>,
 }
 
+/// An app the user has registered as a launch candidate (the "起動候補" list).
+///
+/// Registration has three routes, all of which end here: type a name and a path,
+/// browse for the executable, or pick a Start Menu entry (which fills both from
+/// the shortcut — see `windowing::start_menu`). A workset then *references* one
+/// of these instead of naming an executable itself, so the same app can be
+/// attached to several sets and re-pointed in one place when it moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchApp {
+    pub id: Uuid,
+    /// Display name, and the title hint used to match the app's window.
+    pub name: String,
+    /// The executable to run.
+    pub program: PathBuf,
+    /// Default arguments (e.g. those carried by a Start Menu shortcut).
+    #[serde(default)]
+    pub args: String,
+}
+
 /// How to relaunch a managed window's application after it was closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchSpec {
