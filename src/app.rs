@@ -3403,8 +3403,7 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
 
     let rows: Vec<QuickSwitcherRow> = ordered
         .iter()
-        .enumerate()
-        .map(|(i, workset)| {
+        .map(|workset| {
             let agent_state = aggregates
                 .get(&workset.id)
                 .copied()
@@ -3442,11 +3441,6 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                 color: hex_to_color(&workset.color),
                 is_current: Some(workset.id) == current_workset_id,
                 is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
-                number_hint: if i < 9 {
-                    i32::try_from(i + 1).unwrap_or(0)
-                } else {
-                    0
-                },
                 agent_status_color: hex_to_color(state_color(agent_state)),
                 agent_symbol: agent_symbol.into(),
                 agent_status_label: agent_status_label.into(),
@@ -3917,6 +3911,42 @@ fn wire_quick_switcher(
         switcher.set_status_is_warning(false);
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
     });
+
+    // 並び替え ▲▼: 手動順を書き換えて保存し、行を再描画する。
+    for direction in [
+        quick_switcher_service::MoveDirection::Up,
+        quick_switcher_service::MoveDirection::Down,
+    ] {
+        let s = switcher.as_weak();
+        let c = config.clone();
+        let d = data_dir.clone();
+        let handler = move |workset_id: slint::SharedString| {
+            let Some(switcher) = s.upgrade() else { return };
+            let Ok(workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+                return;
+            };
+            {
+                let mut config = c.borrow_mut();
+                if !quick_switcher_service::move_workset(
+                    &mut config.worksets,
+                    workset_id,
+                    direction,
+                ) {
+                    return;
+                }
+                // 並び替えは手動順でのみ意味を持つので、確実に反映させる。
+                config.settings.sort_mode = crate::domain::config::SortMode::Manual;
+            }
+            if let Err(err) = config_store::save(&d, &c.borrow()) {
+                tracing::warn!(error = %err, "failed to save workset reorder");
+            }
+            refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+        };
+        match direction {
+            quick_switcher_service::MoveDirection::Up => switcher.on_move_workset_up(handler),
+            quick_switcher_service::MoveDirection::Down => switcher.on_move_workset_down(handler),
+        }
+    }
 
     let s = switcher.as_weak();
     let c = config.clone();

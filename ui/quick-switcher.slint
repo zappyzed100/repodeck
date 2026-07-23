@@ -7,7 +7,6 @@ export struct QuickSwitcherRow {
     color: color,
     is-current: bool,
     is-parking-target: bool,
-    number-hint: int,
     // Codex agent status (PLAN.md §6, Phase 8). Always shown now: `agent-symbol`
     // + `agent-status-label` (✓成功 / ×失敗 / ●実行中・入力待ち / —未実行),
     // coloured by `agent-status-color`.
@@ -66,6 +65,9 @@ export component QuickSwitcher inherits Window {
     callback manager-requested();
     callback empty-main-requested();
     callback close-requested();
+    /// セットの並び順を1つ上/下へ動かす（手動順を書き換える）。
+    callback move-workset-up(workset-id: string);
+    callback move-workset-down(workset-id: string);
 
     backdrop := Rectangle {
         x: 0;
@@ -403,30 +405,20 @@ export component QuickSwitcher inherits Window {
                                 }
                             }
 
-                            if row.number-hint > 0: Rectangle {
-                                width: 26px;
-                                height: 26px;
-                                border-radius: 13px;
-                                background: Theme.glass-panel-strong;
-                                Text {
-                                    text: row.number-hint;
-                                    font-size: 14px;
-                                    color: Theme.text-secondary;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            // Quit this set's apps without switching to it.
+                            // 右端の操作を1列に：×（上）／▲／▼。並び替えは手動順を
+                            // 書き換えるので、絞り込み中（画面順＝全体順でない）は
+                            // ▲▼を隠す。端の行は片方を無効化。
                             VerticalLayout {
                                 alignment: center;
+                                spacing: 3px;
+
+                                // ×（最上段）: このセットのアプリを閉じる（切替はしない）。
                                 Rectangle {
                                     width: 30px;
-                                    height: 30px;
-                                    border-radius: 15px;
+                                    height: 28px;
+                                    border-radius: Theme.radius-sm;
                                     background: quit-touch.pressed || quit-touch.has-hover ? Theme.danger : Theme.glass-panel-strong;
                                     animate background { duration: Theme.duration-fast; easing: ease-out; }
-
                                     // "×" (U+00D7): the font lacks U+2715.
                                     Text {
                                         text: "×";
@@ -435,9 +427,47 @@ export component QuickSwitcher inherits Window {
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
-
                                     quit-touch := TouchArea {
                                         clicked => { root.close-workset-requested(row.workset-id); }
+                                    }
+                                }
+
+                                if root.filter-text == "": Rectangle {
+                                    width: 30px;
+                                    height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: up-touch.has-hover && i > 0 ? Theme.glass-hover : Theme.glass-panel-strong;
+                                    opacity: i > 0 ? 1.0 : 0.3;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+                                    Text {
+                                        text: "▲";
+                                        font-size: 12px;
+                                        color: Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    up-touch := TouchArea {
+                                        enabled: i > 0;
+                                        clicked => { root.move-workset-up(row.workset-id); }
+                                    }
+                                }
+                                if root.filter-text == "": Rectangle {
+                                    width: 30px;
+                                    height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: down-touch.has-hover && i < root.rows.length - 1 ? Theme.glass-hover : Theme.glass-panel-strong;
+                                    opacity: i < root.rows.length - 1 ? 1.0 : 0.3;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+                                    Text {
+                                        text: "▼";
+                                        font-size: 12px;
+                                        color: Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    down-touch := TouchArea {
+                                        enabled: i < root.rows.length - 1;
+                                        clicked => { root.move-workset-down(row.workset-id); }
                                     }
                                 }
                             }
