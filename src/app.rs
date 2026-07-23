@@ -1325,6 +1325,63 @@ fn refresh_placement_monitors(
     let has_monitors = !names.is_empty();
     manager.set_placement_monitors(std::rc::Rc::new(slint::VecModel::from(names)).into());
     manager.set_placement_monitor_index(if has_monitors { 0 } else { -1 });
+    refresh_placement_monitor_tiles(manager, config, state);
+}
+
+/// 配置プレビュー用のタイルを作る。全メイン画面を囲む矩形で正規化するので、
+/// 実際の左右・上下関係と解像度差がそのまま縮小されて描かれる。未接続の画面は
+/// 位置が分からないので、既知の画面の右隣に等幅で並べる。
+fn refresh_placement_monitor_tiles(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &WorksetManagerState,
+) {
+    let live: Vec<(usize, &MonitorInfo)> = config
+        .main_monitor_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            state
+                .monitors
+                .iter()
+                .find(|m| &m.device_name == id)
+                .map(|m| (index, m))
+        })
+        .collect();
+    if live.is_empty() {
+        manager.set_placement_monitor_tiles(
+            std::rc::Rc::new(slint::VecModel::from(Vec::<PlacementMonitorTile>::new())).into(),
+        );
+        return;
+    }
+
+    // 全メイン画面を囲む矩形。
+    let min_x = live.iter().map(|(_, m)| m.bounds_px.x).min().unwrap_or(0);
+    let min_y = live.iter().map(|(_, m)| m.bounds_px.y).min().unwrap_or(0);
+    let max_x = live
+        .iter()
+        .map(|(_, m)| m.bounds_px.right())
+        .max()
+        .unwrap_or(1);
+    let max_y = live
+        .iter()
+        .map(|(_, m)| m.bounds_px.bottom())
+        .max()
+        .unwrap_or(1);
+    let span_x = ((max_x - min_x) as f32).max(1.0);
+    let span_y = ((max_y - min_y) as f32).max(1.0);
+
+    let tiles: Vec<PlacementMonitorTile> = live
+        .iter()
+        .map(|(index, m)| PlacementMonitorTile {
+            label: format!("画面{}", index + 1).into(),
+            nx: (m.bounds_px.x - min_x) as f32 / span_x,
+            ny: (m.bounds_px.y - min_y) as f32 / span_y,
+            nw: m.bounds_px.width as f32 / span_x,
+            nh: m.bounds_px.height as f32 / span_y,
+        })
+        .collect();
+    manager.set_placement_monitor_tiles(std::rc::Rc::new(slint::VecModel::from(tiles)).into());
 }
 
 /// Fills the 位置 picker with the cells of the currently selected 分割.

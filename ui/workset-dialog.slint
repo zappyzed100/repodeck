@@ -18,6 +18,16 @@ export struct ManagedWindowSummary {
     minimize_when_parked: bool,
 }
 
+/// 配置プレビュー用の1枚のメイン画面。位置とサイズは、全メイン画面を囲む矩形を
+/// 1×1 に正規化した値。実際の並び（左右・上下・解像度差）をそのまま縮小して描く。
+export struct PlacementMonitorTile {
+    label: string,
+    nx: float,
+    ny: float,
+    nw: float,
+    nh: float,
+}
+
 export struct RegistrationCandidate {
     title: string,
     process_name: string,
@@ -143,6 +153,13 @@ export component WorksetManager inherits Window {
     in property <[string]> placement-cells: ["全画面"];
     in-out property <int> placement-cell-index: 0;
     callback placement-split-selected(index: int);
+
+    // 配置プレビュー：メイン画面を実際の並びどおりに描き、分割セルを選ばせる。
+    in property <[PlacementMonitorTile]> placement-monitor-tiles: [];
+    // 分割（0=1分割 / 1=2分割（左右） / 2=4分割）に対応する列数・行数。
+    // セル番号は読み順なので、列 = mod(i, cols)、行 = floor(i / cols)。
+    property <int> cell-cols: root.placement-split-index == 0 ? 1 : 2;
+    property <int> cell-rows: root.placement-split-index == 2 ? 2 : 1;
 
     // --- UI 1: 起動候補を登録 ---
     // A standalone panel (over both the list and the registration view) where
@@ -442,6 +459,89 @@ export component WorksetManager inherits Window {
                         clicked => { root.app-pick-workspace-requested(); }
                     }
                 }
+                // 配置プレビュー：画面名だけでは配置が分からないので、メイン画面を
+                // 実際の並び・比率のまま全部描き、分割セルを直接クリックで選べる。
+                if root.app-catalog.length > 0 && root.placement-monitor-tiles.length > 0: Rectangle {
+                    height: 150px;
+                    background: Theme.glass-panel-soft;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+
+                    preview := Rectangle {
+                        x: Theme.space-sm;
+                        y: Theme.space-sm;
+                        width: parent.width - 2 * Theme.space-sm;
+                        height: parent.height - 2 * Theme.space-sm;
+
+                        for tile[ti] in root.placement-monitor-tiles: Rectangle {
+                            x: preview.width * tile.nx;
+                            y: preview.height * tile.ny;
+                            width: preview.width * tile.nw;
+                            height: preview.height * tile.nh;
+
+                            monitor-box := Rectangle {
+                                width: parent.width - 4px;
+                                height: parent.height - 4px;
+                                border-radius: Theme.radius-sm;
+                                background: Theme.glass-panel;
+                                border-width: 1px;
+                                border-color: Theme.hairline-bright;
+
+                                // 分割セル。読み順で番号が振られる。
+                                for cell[ci] in root.placement-cells: Rectangle {
+                                    x: monitor-box.width * Math.mod(ci, root.cell-cols) / root.cell-cols;
+                                    y: monitor-box.height * Math.floor(ci / root.cell-cols) / root.cell-rows;
+                                    width: monitor-box.width / root.cell-cols;
+                                    height: monitor-box.height / root.cell-rows;
+
+                                    cell-box := Rectangle {
+                                        width: parent.width - 3px;
+                                        height: parent.height - 3px;
+                                        border-radius: 4px;
+                                        background: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                            ? Theme.accent
+                                            : (cell-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft);
+                                        border-width: 1px;
+                                        border-color: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                            ? Theme.accent
+                                            : Theme.hairline;
+                                        animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                                        Text {
+                                            text: cell;
+                                            font-size: 10px;
+                                            color: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                                ? Theme.text-primary
+                                                : Theme.text-tertiary;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+
+                                        cell-touch := TouchArea {
+                                            clicked => {
+                                                root.placement-monitor-index = ti;
+                                                root.placement-cell-index = ci;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 画面名は左上に小さく重ねる（セルの邪魔をしない）。
+                                Text {
+                                    x: 4px;
+                                    y: 2px;
+                                    text: tile.label;
+                                    font-size: 10px;
+                                    font-weight: 600;
+                                    color: ti == root.placement-monitor-index ? Theme.accent : Theme.text-secondary;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if root.app-catalog.length > 0: HorizontalLayout {
                     spacing: Theme.space-xs;
                     height: 36px;
