@@ -1335,8 +1335,24 @@ fn capture_launch_spec(
     // with no folder (2026-07-23). Fall back to repository_path if the capture
     // fails (protected process, or a bare window with no path argument).
     let captured_vscode_folder = if kind == LaunchKind::VsCode {
+        // VS Code shares one process across its windows, so the command line may
+        // describe a *different* window. Keep the folder only when this window's
+        // title names it; otherwise fall back to `repository_path`.
         let folder = crate::windowing::process_info::read_process_command_line(window.process_id)
-            .and_then(|cl| launch_service::extract_vscode_folder(&cl));
+            .and_then(|cl| launch_service::extract_vscode_folder(&cl))
+            .filter(|folder| {
+                let matches = launch_service::vscode_folder_matches_title(folder, &window.title);
+                if !matches {
+                    tracing::info!(
+                        target: "launch",
+                        pid = window.process_id,
+                        %folder,
+                        title = %window.title,
+                        "capture: ignoring VS Code folder — it belongs to another window of the shared process"
+                    );
+                }
+                matches
+            });
         tracing::info!(target: "launch", pid = window.process_id, folder = ?folder, "capture: VS Code open folder from command line");
         folder
     } else {
@@ -3892,6 +3908,19 @@ fn copy_text_to_clipboard(text: &str) -> windows::core::Result<()> {
 fn wire_about_and_autostart(window: &AppWindow, config: Rc<RefCell<AppConfig>>, data_dir: PathBuf) {
     window.set_app_version(env!("CARGO_PKG_VERSION").into());
     window.set_start_with_windows(autostart::is_enabled().unwrap_or(false));
+    window.set_restore_workset_on_start(config.borrow().settings.restore_workset_on_start);
+
+    // Unlike autostart (whose truth lives in the registry) this is purely a
+    // config flag, so the toggle just persists it.
+    let c = config.clone();
+    let dir = data_dir.clone();
+    window.on_restore_workset_on_start_toggled(move |enabled| {
+        let mut cfg = c.borrow_mut();
+        cfg.settings.restore_workset_on_start = enabled;
+        if let Err(err) = config_store::save(&dir, &cfg) {
+            tracing::warn!(error = %err, "failed to save restore-workset-on-start setting");
+        }
+    });
 
     window.on_open_third_party_notices_requested(|| {
         let Ok(exe) = std::env::current_exe() else {
@@ -4917,6 +4946,24 @@ pub fn run() -> Result<()> {
             unmatched_agent_events: RefCell::new(Vec::new()),
         }));
     });
+
+    // Restore the last workset, if asked to. Deferred onto the event loop so it
+    // runs once the UI is up: after a reboot this relaunches that set's apps and
+    // places them, which is the whole point — one step back to where you were.
+    if config.borrow().settings.restore_workset_on_start
+        && let Some(workset_id) = runtime_store::load(&data_dir).current_workset_id
+    {
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+                return;
+            };
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                tracing::info!(target: "switch", workset = %workset_id, "startup: restoring last workset");
+                // Reuses the fully-wired switch path (relaunch, journal, rollback).
+                switcher.invoke_switch_requested(workset_id.to_string().into());
+            }
+        });
+    }
 
     // Codex agent-event named pipe server (PLAN.md §6.4, §9.1). A failure to
     // bind (e.g. another process already squatting the pipe name) disables

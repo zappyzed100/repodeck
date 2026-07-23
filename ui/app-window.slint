@@ -59,6 +59,7 @@ export component AppWindow inherits Window {
 
     // 起動設定 (Phase 9).
     in-out property <bool> start-with-windows: false;
+    in-out property <bool> restore-workset-on-start: false;
     in property <string> autostart-status-text: "";
     in property <bool> autostart-status-is-warning: false;
 
@@ -76,6 +77,7 @@ export component AppWindow inherits Window {
     callback codex-send-test-event-requested();
     callback open-third-party-notices-requested();
     callback start-with-windows-toggled(bool);
+    callback restore-workset-on-start-toggled(bool);
 
     // 修飾キー単独の押下 (Ctrl/Alt/Shift/Win いずれかのキー自体) か。
     // キャプチャ中はこれらを無視して「修飾キー以外のキー」を待つ。
@@ -356,6 +358,23 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     text: "Windows起動時にRepoDeckを自動起動する";
+                    vertical-alignment: center;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                GlassCheckbox {
+                    checked: root.restore-workset-on-start;
+                    toggled => {
+                        root.restore-workset-on-start = !root.restore-workset-on-start;
+                        root.restore-workset-on-start-toggled(root.restore-workset-on-start);
+                    }
+                }
+                Text {
+                    text: "起動時に前回のセットを復元する（アプリを起動して配置）";
                     vertical-alignment: center;
                     color: Theme.text-secondary;
                     wrap: word-wrap;

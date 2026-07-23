@@ -76,6 +76,27 @@ fn package_family_name(package_dir: &str) -> Option<String> {
     Some(format!("{name}_{publisher_id}"))
 }
 
+/// Whether a folder read from a VS Code process's command line plausibly belongs
+/// to the window being registered.
+///
+/// VS Code runs every window in one process, so `read_process_command_line`
+/// returns the command line of whichever window started it — register a *second*
+/// window and you silently capture the *first* window's folder. The window title
+/// always contains the open folder's (or workspace's) name, so requiring that
+/// name to appear in the title rejects exactly that mismatch. A `.code-workspace`
+/// is compared by its stem, since the title shows the workspace name without the
+/// extension ("repo08 (ワークスペース)").
+pub fn vscode_folder_matches_title(folder: &str, window_title: &str) -> bool {
+    let Some(stem) = Path::new(folder)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    window_title.contains(&stem)
+}
+
 /// Whether `executable` is Firefox (which uses `-new-window` rather than the
 /// Chromium `--new-window`).
 fn is_firefox(executable: &Path) -> bool {
@@ -243,6 +264,27 @@ mod tests {
     fn vscode_spec_without_repo_has_no_args() {
         let spec = build_launch_spec(Path::new(r"C:\VS\Code.exe"), None, None);
         assert!(spec.args.is_empty());
+    }
+
+    #[test]
+    fn vscode_folder_is_accepted_only_when_the_title_names_it() {
+        // Folder window: title carries the folder name.
+        assert!(vscode_folder_matches_title(
+            r"C:\code\test\repo01",
+            "repo01 - Visual Studio Code"
+        ));
+        // Workspace window: title shows the workspace stem, not the file name.
+        assert!(vscode_folder_matches_title(
+            r"C:\code\test\repo08\repo08.code-workspace",
+            "repo08 (ワークスペース) [WS repo08]"
+        ));
+        // The shared-process trap: a second window whose command line reports
+        // the *first* window's folder must be rejected.
+        assert!(!vscode_folder_matches_title(
+            r"C:\code\test\repo01",
+            "repo07 - Visual Studio Code"
+        ));
+        assert!(!vscode_folder_matches_title("", "repo01 - Visual Studio Code"));
     }
 
     #[test]

@@ -211,6 +211,12 @@ pub struct UserSettings {
     pub notify_needs_input: bool,
     pub notify_ready: bool,
     pub start_with_windows: bool,
+    /// When `true`, RepoDeck switches to the workset that was current when it
+    /// last ran as soon as it starts — which, after a reboot, relaunches that
+    /// set's apps and restores their placement in one step. Off by default:
+    /// moving windows unprompted at login is surprising unless asked for.
+    #[serde(default)]
+    pub restore_workset_on_start: bool,
     /// When `true` (default), RepoDeck automatically attempts a software display
     /// re-detect after a resume-from-sleep if saved monitors are missing from the
     /// live topology (PLAN.md §4.6, Phase 9 resilience). The manual tray trigger
@@ -261,6 +267,7 @@ impl Default for UserSettings {
             notify_needs_input: true,
             notify_ready: true,
             start_with_windows: false,
+            restore_workset_on_start: false,
             auto_display_recovery: default_auto_display_recovery(),
             cycle_next_key: default_cycle_next_key(),
             cycle_prev_key: default_cycle_prev_key(),
