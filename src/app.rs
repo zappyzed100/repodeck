@@ -3727,6 +3727,12 @@ fn compute_empty_main_destinations(
         // Resolve this workset's live on-main windows once.
         let mut resolved: Vec<(isize, PixelRect)> = Vec::new();
         for w in &workset.windows {
+            // 「退避せず最小化」指定のウィンドウは行き先を算出しない。行き先の
+            // 無いウィンドウは呼び出し側が最小化するので、それだけで退避OFFが
+            // メイン画面を空にする経路にも効く。
+            if w.minimize_when_parked {
+                continue;
+            }
             if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id)
                 && let Some(outcome) =
                     resolve_main_restore(&w.main_placement, live_monitors, &config.main_monitor_ids)
