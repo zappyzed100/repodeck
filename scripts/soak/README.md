@@ -29,3 +29,28 @@ overlap. A first-pass mismatch is re-measured after ~1.8s and only counted if it
 pwsh -NoProfile -File scripts/soak/run-soak.ps1 -Iters 300 -SettleMs 1200
 ```
 Results land in `scripts/soak/soak-results/result_<N>.json`.
+
+## Real-app variant (VS Code + browser + Codex/ChatGPT)
+
+`run-soak-real.ps1` drives real applications instead of synthetic label windows:
+- 14 VS Code windows (repo01-07 as folders, repo08-14 as `.code-workspace`),
+- 15 Brave windows (each a `pages/BSET-NN.html` with a unique title),
+- 1 Codex set bound to the ChatGPT desktop app (`OpenAI.Codex`), always kept as
+  worksets[0] so it is in every soak size,
+- SET-02 → 動画 sub-screen, SET-03 → モニター sub-screen (subs exercised at every size).
+
+Helpers: `gen-real-config.py` (build the 15-set config from `_master_config.json`),
+`launch-real.ps1` (pre-launch all app windows once), `close-real.ps1` (WM_CLOSE
+only the test windows, never ChatGPT), `measure.ps1`/`wininfo.ps1` (diagnostics).
+
+The validator adds, for real apps: `--warmup N` (place every window once before
+measuring, since a Chromium window re-asserts its own bounds for ~6.5s on first
+placement), a poll-until-clean confirm (`--confirm-ms`, re-measure until settled
+or budget — real drift persists, settling clears), and an eroded overlap test (a
+maximized window's frame spills ~8px onto the neighbour monitor; that is not a
+real overlap).
+
+```powershell
+pwsh -NoProfile -File scripts/soak/run-soak-real.ps1 -Iters 150 -Warmup 12
+```
+Result after this run: 750 real switches across sizes 3/6/9/12/15 → 0 failures.

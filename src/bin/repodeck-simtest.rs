@@ -57,14 +57,18 @@ fn main() {
 
 struct Options {
     iters: usize,
+    warmup: usize,
     settle_ms: u64,
+    confirm_budget_ms: u64,
     out: Option<PathBuf>,
 }
 
 impl Options {
     fn parse() -> Self {
         let mut iters = 300usize;
+        let mut warmup = 30usize;
         let mut settle_ms = 1200u64;
+        let mut confirm_budget_ms = 8000u64;
         let mut out = None;
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -74,11 +78,22 @@ impl Options {
                     iters = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(iters);
                     i += 1;
                 }
+                "--warmup" => {
+                    warmup = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(warmup);
+                    i += 1;
+                }
                 "--settle-ms" => {
                     settle_ms = args
                         .get(i + 1)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(settle_ms);
+                    i += 1;
+                }
+                "--confirm-ms" => {
+                    confirm_budget_ms = args
+                        .get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(confirm_budget_ms);
                     i += 1;
                 }
                 "--out" => {
@@ -91,7 +106,9 @@ impl Options {
         }
         Self {
             iters,
+            warmup,
             settle_ms,
+            confirm_budget_ms,
             out,
         }
     }
@@ -108,10 +125,11 @@ struct TestWorkset {
     name: String,
 }
 
-/// True if `title` contains one of the configured `SET-*` matcher substrings —
-/// so stray SET windows beyond the current config's worksets are ignored.
+/// True if `title` contains one of the configured matcher substrings — so only
+/// windows the current config actually manages are checked (stray windows and
+/// worksets sliced out for a smaller size are ignored).
 fn is_configured(title: &str, valid: &[String]) -> bool {
-    valid.iter().any(|t| title.contains(t.as_str()))
+    valid.iter().any(|t| !t.is_empty() && title.contains(t.as_str()))
 }
 
 fn run(opts: &Options) -> Result<Report, String> {
@@ -124,14 +142,6 @@ fn run(opts: &Options) -> Result<Report, String> {
     let worksets: Vec<TestWorkset> = cfg
         .worksets
         .iter()
-        .filter(|w| {
-            w.windows.iter().any(|m| {
-                m.matcher
-                    .title_contains
-                    .as_deref()
-                    .is_some_and(|t| t.contains("SET-"))
-            })
-        })
         .map(|w| TestWorkset {
             id: w.id.to_string(),
             name: w.name.clone(),
@@ -146,12 +156,14 @@ fn run(opts: &Options) -> Result<Report, String> {
     }
 
     let main_ids: Vec<String> = cfg.main_monitor_ids.clone();
+    // Every configured matcher's title substring identifies a managed test
+    // window. (For real apps these are "repo07", "WS repo08", "BSET-03",
+    // "ChatGPT" — no shared "SET-" prefix to rely on.)
     let valid_titles: Vec<String> = cfg
         .worksets
         .iter()
         .flat_map(|w| w.windows.iter())
         .filter_map(|m| m.matcher.title_contains.clone())
-        .filter(|t| t.contains("SET-"))
         .collect();
 
     eprintln!(
@@ -162,7 +174,23 @@ fn run(opts: &Options) -> Result<Report, String> {
     );
 
     let mut log = LogTail::open_newest(&dir.join("logs"))?;
-    log.seek_to_end(); // skip pre-test history
+
+    // Warm-up: switch through every workset a few times so each real app
+    // (ChatGPT/VS Code/Brave) gets placed at least once and RepoDeck wins the
+    // initial re-assert battle. First-time placement of a Chromium window that
+    // re-asserts its own bounds can take >8s to settle; measuring across that
+    // would be a false "drift". Results here are discarded.
+    if opts.warmup > 0 {
+        eprintln!("[simtest] warm-up: {} switches (no measurement)", opts.warmup);
+        for i in 0..opts.warmup {
+            let target = i % worksets.len();
+            send_switch(&worksets[target].id)?;
+            std::thread::sleep(Duration::from_millis(opts.settle_ms + 1500));
+        }
+        // Let the last warm-up switch's re-assert fully finish before measuring.
+        std::thread::sleep(Duration::from_millis(4000));
+    }
+    log.seek_to_end(); // skip warm-up + pre-test history
 
     let mut rng = Rng::seeded();
     let mut report = Report::new(worksets.len());
@@ -219,39 +247,42 @@ fn run(opts: &Options) -> Result<Report, String> {
             continue;
         }
 
-        // Confirm pass: a real drift (the SET-10-A class of bug) persists, while
-        // a window still settling into its cell resolves within a second. Wait,
-        // re-measure, and keep only failures present in BOTH passes.
-        std::thread::sleep(Duration::from_millis(1800));
-        let monitors2 = enumerate_monitors().map_err(|e| format!("enumerate monitors: {e}"))?;
-        let windows2 = enumerate_top_level_windows(std::process::id())
-            .map_err(|e| format!("enumerate windows: {e}"))?;
-        let test_windows2: Vec<&TopLevelWindow> = windows2
-            .iter()
-            .filter(|w| is_configured(&w.title, &valid_titles))
-            .collect();
-        let ctx2 = CheckCtx {
-            iter,
-            target_name: &tw.name,
-            main_ids: &main_ids,
-            monitors: &monitors2,
-        };
-        let second = check(&ctx2, &intents, &test_windows2);
-        let persisted: std::collections::HashSet<(String, String)> = second
-            .iter()
-            .map(|f| (f.window.clone(), f.problem.clone()))
-            .collect();
-        let mut confirmed = 0;
-        for f in first {
-            if persisted.contains(&(f.window.clone(), f.problem.clone())) {
-                report.failures.push(f);
-                confirmed += 1;
-            } else {
-                report.transient += 1;
-            }
+        // Confirm pass, poll-until-clean: real Chromium apps (VS Code, Brave)
+        // re-assert their own bounds for up to ~6.5s after a switch, so a
+        // first-pass mismatch is usually a window still settling, not drift.
+        // Re-measure every second up to `confirm_budget_ms`; a mismatch that
+        // clears is transient, one that persists past the whole re-assert window
+        // is a real placement failure (the SET-10-A class).
+        let first_count = first.len();
+        let mut fails = first;
+        let mut waited = 0u64;
+        while !fails.is_empty() && waited < opts.confirm_budget_ms {
+            std::thread::sleep(Duration::from_millis(1000));
+            waited += 1000;
+            let mons = enumerate_monitors().map_err(|e| format!("enumerate monitors: {e}"))?;
+            let wins = enumerate_top_level_windows(std::process::id())
+                .map_err(|e| format!("enumerate windows: {e}"))?;
+            let tws: Vec<&TopLevelWindow> = wins
+                .iter()
+                .filter(|w| is_configured(&w.title, &valid_titles))
+                .collect();
+            let c = CheckCtx {
+                iter,
+                target_name: &tw.name,
+                main_ids: &main_ids,
+                monitors: &mons,
+            };
+            fails = check(&c, &intents, &tws);
         }
-        if confirmed > 0 {
-            eprintln!("[simtest] iter {iter} target={}: {confirmed} CONFIRMED failures", tw.name);
+        report.transient += first_count - fails.len();
+        if !fails.is_empty() {
+            eprintln!(
+                "[simtest] iter {iter} target={}: {} CONFIRMED failures (after {}ms)",
+                tw.name,
+                fails.len(),
+                waited
+            );
+            report.failures.extend(fails);
         }
 
         report.switches += 1;
@@ -360,11 +391,17 @@ fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelW
         }
     }
 
-    // 3. No two currently-visible SET windows overlap.
+    // 3. No two currently-visible SET windows overlap. Each rect is eroded by a
+    //    margin first: a maximized Chromium window's visible frame spills ~8px
+    //    past its monitor onto the neighbour, and flush-tiled cells share an
+    //    edge — neither is a real overlap. Eroding both sides absorbs those
+    //    boundary slivers while any genuine overlap (a window covering another)
+    //    still survives.
+    const ERODE: i32 = 20;
     let visible: Vec<(&str, PixelRect)> = test_windows
         .iter()
         .filter(|w| !is_minimized(w.hwnd))
-        .filter_map(|w| visible_bounds(w.hwnd).map(|r| (w.title.as_str(), r)))
+        .filter_map(|w| visible_bounds(w.hwnd).map(|r| (w.title.as_str(), erode(r, ERODE))))
         .collect();
     for i in 0..visible.len() {
         for j in (i + 1)..visible.len() {
@@ -379,6 +416,11 @@ fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelW
     }
 
     out
+}
+
+/// Shrinks a rect by `m` on every side (used to drop boundary-sliver overlaps).
+fn erode(r: PixelRect, m: i32) -> PixelRect {
+    PixelRect::new(r.x + m, r.y + m, (r.width - 2 * m).max(0), (r.height - 2 * m).max(0))
 }
 
 fn rect_matches(a: &PixelRect, b: &PixelRect, pos_tol: i32, size_tol: i32) -> bool {
