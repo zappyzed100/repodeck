@@ -1124,9 +1124,6 @@ struct WorksetManagerState {
     /// When set, the registration view is editing (re-registering) this
     /// existing workset rather than creating a new one.
     editing_workset_id: Option<uuid::Uuid>,
-    /// Start Menu apps offered by the "起動アプリを追加" picker, in the same
-    /// order as the UI's `app-catalog` names.
-    app_catalog: Vec<crate::windowing::start_menu::StartMenuApp>,
 }
 
 impl WorksetManagerState {
@@ -1143,31 +1140,50 @@ impl WorksetManagerState {
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
             editing_workset_id: None,
-            app_catalog: Vec::new(),
         }
     }
 }
 
-/// Pushes the Start Menu catalogue into the manager UI, (re)reading it from disk
-/// when it hasn't been loaded yet. Resolving a few hundred `.lnk` shortcuts is
-/// fast enough to do inline, and only happens when the manager is opened or the
-/// user asks for a refresh.
-fn refresh_app_catalog(
-    manager: &WorksetManager,
-    state: &mut WorksetManagerState,
-    force: bool,
-) {
-    if force || state.app_catalog.is_empty() {
-        state.app_catalog = crate::windowing::start_menu::enumerate();
-    }
-    let names: Vec<slint::SharedString> = state
-        .app_catalog
-        .iter()
-        .map(|app| app.name.clone().into())
-        .collect();
+/// The Start Menu catalogue behind the "起動アプリを追加" picker. A process-wide
+/// cache rather than manager state so the background loader thread can fill it
+/// (mirrors `GIT_CACHE`); the UI thread only ever reads it.
+static APP_CATALOG: std::sync::LazyLock<
+    std::sync::Mutex<Vec<crate::windowing::start_menu::StartMenuApp>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Reads the catalogue on a background thread and pushes it into the manager.
+/// Resolving a few hundred `.lnk` shortcuts takes long enough that doing it
+/// inline would stall opening the manager, so it loads once at startup (and
+/// again whenever the user asks for a refresh).
+fn spawn_app_catalog_load(manager: slint::Weak<WorksetManager>) {
+    std::thread::spawn(move || {
+        let apps = crate::windowing::start_menu::enumerate();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut catalog) = APP_CATALOG.lock() {
+                *catalog = apps;
+            }
+            if let Some(manager) = manager.upgrade() {
+                push_app_catalog(&manager);
+            }
+        });
+    });
+}
+
+/// Pushes the cached catalogue's names into the picker and clears the selection.
+fn push_app_catalog(manager: &WorksetManager) {
+    let names: Vec<slint::SharedString> = APP_CATALOG
+        .lock()
+        .map(|catalog| catalog.iter().map(|app| app.name.clone().into()).collect())
+        .unwrap_or_default();
     manager.set_app_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
     manager.set_app_selected_index(-1);
-    apply_app_selection(manager, state, -1);
+    apply_app_selection(manager, -1);
+}
+
+/// The catalogue entry at `index`, if any.
+fn catalog_app(index: i32) -> Option<crate::windowing::start_menu::StartMenuApp> {
+    let index = usize::try_from(index).ok()?;
+    APP_CATALOG.lock().ok()?.get(index).cloned()
 }
 
 /// Builds a `ManagedWindow` for an app chosen from the Start Menu catalogue.
@@ -1242,12 +1258,9 @@ fn build_catalog_window(
 
 /// Shows the one input the selected app actually needs: a folder/workspace for
 /// VS Code, a URL for a browser, free-form arguments for anything else.
-fn apply_app_selection(manager: &WorksetManager, state: &WorksetManagerState, index: i32) {
+fn apply_app_selection(manager: &WorksetManager, index: i32) {
     use crate::domain::workset::LaunchKind;
-    let Some(app) = usize::try_from(index)
-        .ok()
-        .and_then(|i| state.app_catalog.get(i))
-    else {
+    let Some(app) = catalog_app(index) else {
         manager.set_app_kind_label("".into());
         manager.set_app_input_visible(false);
         manager.set_app_input_is_path(false);
@@ -1744,8 +1757,6 @@ fn wire_workset_manager(
         let mut state = s.borrow_mut();
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
         refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
-        // Load the Start Menu catalogue once, on first open.
-        refresh_app_catalog(&manager, &mut state, false);
     });
 
     let m = manager.as_weak();
@@ -1799,18 +1810,19 @@ fn wire_workset_manager(
     });
 
     // ---- 起動アプリを追加 (Start Menu catalogue) ----
+    // Load the Start Menu catalogue once, now, so the picker is populated the
+    // first time the manager is opened.
+    spawn_app_catalog_load(manager.as_weak());
+
     let m = manager.as_weak();
-    let s = state.clone();
     manager.on_app_catalog_refresh_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        refresh_app_catalog(&manager, &mut s.borrow_mut(), true);
+        spawn_app_catalog_load(m.clone());
     });
 
     let m = manager.as_weak();
-    let s = state.clone();
     manager.on_app_selected(move |index| {
         let Some(manager) = m.upgrade() else { return };
-        apply_app_selection(&manager, &s.borrow(), index);
+        apply_app_selection(&manager, index);
     });
 
     let m = manager.as_weak();
@@ -1840,11 +1852,7 @@ fn wire_workset_manager(
 
         let added = {
             let state = s.borrow();
-            let Some(app) = usize::try_from(index)
-                .ok()
-                .and_then(|i| state.app_catalog.get(i))
-                .cloned()
-            else {
+            let Some(app) = catalog_app(index) else {
                 manager.set_status_text("追加するアプリを選んでください。".into());
                 manager.set_status_is_warning(true);
                 return;
