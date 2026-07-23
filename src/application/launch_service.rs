@@ -28,6 +28,54 @@ pub fn classify(executable: &Path) -> LaunchKind {
     }
 }
 
+/// The Application User Model ID for a packaged (MSIX/Store) app's executable,
+/// or `None` for an ordinary one.
+///
+/// A Store app lives under `…\WindowsApps\<name>_<version>_<arch>__<publisher>\…`
+/// and its install path therefore *changes on every app update* — pinning the
+/// exe path (as Codex/ChatGPT's does) breaks the saved launch spec the next time
+/// the app updates. The AUMID is version-independent: it is built from the
+/// package family name (`<name>_<publisher>`, i.e. the folder name with the
+/// version and architecture dropped) plus the application id.
+///
+/// The application id is read from the package manifest when that is possible
+/// and otherwise assumed to be `App`, which is the near-universal default (and
+/// what Codex/ChatGPT uses: `OpenAI.Codex_2p2nqsd0c76g0!App`). A wrong guess is
+/// not fatal — `app_launch` falls back to the exe path.
+pub fn store_app_aumid(executable: &Path) -> Option<String> {
+    let mut components = executable.components().peekable();
+    // Find the package directory: the component right after `WindowsApps`.
+    let mut package_dir: Option<String> = None;
+    while let Some(component) = components.next() {
+        if component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+        {
+            package_dir = components
+                .peek()
+                .map(|next| next.as_os_str().to_string_lossy().into_owned());
+            break;
+        }
+    }
+    let package_dir = package_dir?;
+    let family = package_family_name(&package_dir)?;
+    Some(format!("{family}!App"))
+}
+
+/// Turns a WindowsApps package directory name into its package family name:
+/// `OpenAI.Codex_26.715.4045.0_x64__2p2nqsd0c76g0` → `OpenAI.Codex_2p2nqsd0c76g0`.
+/// The publisher id follows the double underscore; the name is everything up to
+/// the first underscore (version and architecture sit between them).
+fn package_family_name(package_dir: &str) -> Option<String> {
+    let (head, publisher_id) = package_dir.rsplit_once("__")?;
+    let name = head.split('_').next()?;
+    if name.is_empty() || publisher_id.is_empty() {
+        return None;
+    }
+    Some(format!("{name}_{publisher_id}"))
+}
+
 /// Whether `executable` is Firefox (which uses `-new-window` rather than the
 /// Chromium `--new-window`).
 fn is_firefox(executable: &Path) -> bool {
@@ -103,9 +151,12 @@ pub fn build_launch_spec(
 ) -> LaunchSpec {
     let kind = classify(executable);
     let args = match kind {
+        // `-n` forces a *new* window: without it `Code.exe <path>` merely
+        // focuses an already-open window for that folder, so reopening a
+        // deliberately-closed workset window would silently do nothing.
         LaunchKind::VsCode => repository_path
             .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| vec![p.display().to_string()])
+            .map(|p| vec!["-n".to_string(), p.display().to_string()])
             .unwrap_or_default(),
         LaunchKind::Browser => {
             // Always open a fresh window (not a tab in an existing one), so each
@@ -128,6 +179,7 @@ pub fn build_launch_spec(
         program: executable.to_path_buf(),
         args,
         kind,
+        aumid: store_app_aumid(executable),
     }
 }
 
@@ -169,13 +221,70 @@ mod tests {
         );
         assert_eq!(spec.kind, LaunchKind::VsCode);
         assert_eq!(spec.program, PathBuf::from(r"C:\VS\Code.exe"));
-        assert_eq!(spec.args, vec![r"D:\repo".to_string()]);
+        // `-n` so a reopened window is a *new* one, not a focus of an existing.
+        assert_eq!(spec.args, vec!["-n".to_string(), r"D:\repo".to_string()]);
+        assert_eq!(spec.aumid, None);
+    }
+
+    #[test]
+    fn vscode_spec_takes_a_code_workspace_file_too() {
+        let spec = build_launch_spec(
+            Path::new(r"C:\VS\Code.exe"),
+            Some(Path::new(r"D:\repo\repo.code-workspace")),
+            None,
+        );
+        assert_eq!(
+            spec.args,
+            vec!["-n".to_string(), r"D:\repo\repo.code-workspace".to_string()]
+        );
     }
 
     #[test]
     fn vscode_spec_without_repo_has_no_args() {
         let spec = build_launch_spec(Path::new(r"C:\VS\Code.exe"), None, None);
         assert!(spec.args.is_empty());
+    }
+
+    #[test]
+    fn store_app_aumid_is_derived_version_independently() {
+        // The install path carries the version; the AUMID must not.
+        let exe = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.4045.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        assert_eq!(
+            store_app_aumid(exe).as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0!App")
+        );
+        // A newer package version yields the same AUMID.
+        let updated = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_99.0.0.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        assert_eq!(store_app_aumid(updated), store_app_aumid(exe));
+    }
+
+    #[test]
+    fn store_app_aumid_is_none_for_ordinary_executables() {
+        assert_eq!(store_app_aumid(Path::new(r"C:\VS\Code.exe")), None);
+        assert_eq!(
+            store_app_aumid(Path::new(
+                r"C:\code\tool\LibreHardwareMonitor\publish\LibreHardwareMonitor.Windows.Forms.exe"
+            )),
+            None
+        );
+        assert_eq!(store_app_aumid(Path::new("")), None);
+    }
+
+    #[test]
+    fn store_app_spec_carries_the_aumid() {
+        let spec = build_launch_spec(
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.4045.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            ),
+            None,
+            None,
+        );
+        assert_eq!(spec.kind, LaunchKind::Generic);
+        assert_eq!(spec.aumid.as_deref(), Some("OpenAI.Codex_2p2nqsd0c76g0!App"));
     }
 
     #[test]

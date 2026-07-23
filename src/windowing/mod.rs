@@ -13,5 +13,6 @@ pub mod popup_window;
 pub mod power_watch;
 pub mod process_info;
 pub mod session;
+pub mod start_menu;
 pub mod win32_error;
 pub mod window_ops_impl;

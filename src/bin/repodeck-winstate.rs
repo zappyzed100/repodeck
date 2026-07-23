@@ -73,6 +73,22 @@ fn main() {
             "--all-worksets" => {
                 all_worksets = true;
             }
+            // Dump the Start Menu apps the "add app" picker will offer, then exit.
+            "--list-apps" => {
+                for app in repodeck::windowing::start_menu::enumerate() {
+                    println!(
+                        "{:<40} {}{}",
+                        app.name,
+                        app.target.display(),
+                        if app.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  args={:?}", app.args)
+                        }
+                    );
+                }
+                return;
+            }
             _ => {}
         }
         i += 1;

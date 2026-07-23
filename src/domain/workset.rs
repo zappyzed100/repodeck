@@ -68,6 +68,12 @@ pub struct LaunchSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub kind: LaunchKind,
+    /// Application User Model ID for a packaged (MSIX/Store) app, e.g.
+    /// `OpenAI.Codex_2p2nqsd0c76g0!App`. Preferred over [`Self::program`] at
+    /// launch time because a Store app's install path contains its version and
+    /// therefore changes on every update; `program` stays as the fallback.
+    #[serde(default)]
+    pub aumid: Option<String>,
 }
 
 /// The app family a [`LaunchSpec`] targets, deciding how its args are built at
