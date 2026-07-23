@@ -211,7 +211,48 @@ fn run(opts: &Options) -> Result<Report, String> {
             main_ids: &main_ids,
             monitors: &monitors,
         };
-        validate(&ctx, &intents, &test_windows, &mut report);
+        let first = check(&ctx, &intents, &test_windows);
+
+        if first.is_empty() {
+            report.switches += 1;
+            current = target;
+            continue;
+        }
+
+        // Confirm pass: a real drift (the SET-10-A class of bug) persists, while
+        // a window still settling into its cell resolves within a second. Wait,
+        // re-measure, and keep only failures present in BOTH passes.
+        std::thread::sleep(Duration::from_millis(1800));
+        let monitors2 = enumerate_monitors().map_err(|e| format!("enumerate monitors: {e}"))?;
+        let windows2 = enumerate_top_level_windows(std::process::id())
+            .map_err(|e| format!("enumerate windows: {e}"))?;
+        let test_windows2: Vec<&TopLevelWindow> = windows2
+            .iter()
+            .filter(|w| is_configured(&w.title, &valid_titles))
+            .collect();
+        let ctx2 = CheckCtx {
+            iter,
+            target_name: &tw.name,
+            main_ids: &main_ids,
+            monitors: &monitors2,
+        };
+        let second = check(&ctx2, &intents, &test_windows2);
+        let persisted: std::collections::HashSet<(String, String)> = second
+            .iter()
+            .map(|f| (f.window.clone(), f.problem.clone()))
+            .collect();
+        let mut confirmed = 0;
+        for f in first {
+            if persisted.contains(&(f.window.clone(), f.problem.clone())) {
+                report.failures.push(f);
+                confirmed += 1;
+            } else {
+                report.transient += 1;
+            }
+        }
+        if confirmed > 0 {
+            eprintln!("[simtest] iter {iter} target={}: {confirmed} CONFIRMED failures", tw.name);
+        }
 
         report.switches += 1;
         current = target;
@@ -250,17 +291,22 @@ enum Intent {
     Minimize,
 }
 
-fn validate(
-    ctx: &CheckCtx,
-    intents: &[(isize, Intent)],
-    test_windows: &[&TopLevelWindow],
-    report: &mut Report,
-) {
+fn check(ctx: &CheckCtx, intents: &[(isize, Intent)], test_windows: &[&TopLevelWindow]) -> Vec<Failure> {
     use std::collections::HashMap;
     let by_hwnd: HashMap<isize, &TopLevelWindow> =
         test_windows.iter().map(|w| (w.hwnd, *w)).collect();
     let intent_hwnds: std::collections::HashSet<isize> =
         intents.iter().map(|(h, _)| *h).collect();
+    let mut out = Vec::new();
+    let mut fail = |window: &str, problem: &str, detail: Option<(PixelRect, PixelRect)>| {
+        out.push(Failure {
+            iter: ctx.iter,
+            target: ctx.target_name.to_string(),
+            window: window.to_string(),
+            problem: problem.to_string(),
+            detail,
+        });
+    };
 
     // 1. Every intended placement lands where it was placed.
     for (hwnd, intent) in intents {
@@ -270,12 +316,7 @@ fn validate(
         match intent {
             Intent::Minimize => {
                 if !is_minimized(*hwnd) {
-                    report.fail(
-                        ctx,
-                        &w.title,
-                        "should be minimized (overflow) but is not",
-                        None,
-                    );
+                    fail(&w.title, "should be minimized (overflow) but is not", None);
                 }
             }
             Intent::Fill(cell) => {
@@ -283,7 +324,7 @@ fn validate(
                     continue;
                 };
                 if !rect_matches(&vis, cell, 30, 60) {
-                    report.fail(ctx, &w.title, "drifted from its parking cell", Some((vis, *cell)));
+                    fail(&w.title, "drifted from its parking cell", Some((vis, *cell)));
                 }
             }
             Intent::Main(rect) => {
@@ -296,10 +337,9 @@ fn validate(
                 };
                 let covers = coverage(&vis, &mon.work_area_px) > 0.85;
                 if !is_main {
-                    report.fail(ctx, &w.title, "target restored onto a non-main monitor", None);
+                    fail(&w.title, "target restored onto a non-main monitor", None);
                 } else if !covers && !is_maximized_like(&vis, &mon.bounds_px) {
-                    report.fail(
-                        ctx,
+                    fail(
                         &w.title,
                         "target on main but not (near-)full monitor",
                         Some((vis, mon.work_area_px)),
@@ -312,8 +352,7 @@ fn validate(
     // 2. Every live SET window is accounted for by an intent (matched+managed).
     for w in test_windows {
         if !intent_hwnds.contains(&w.hwnd) && !is_minimized(w.hwnd) {
-            report.fail(
-                ctx,
+            fail(
                 &w.title,
                 "live SET window not managed this switch (unmatched / left in place)",
                 None,
@@ -330,8 +369,7 @@ fn validate(
     for i in 0..visible.len() {
         for j in (i + 1)..visible.len() {
             if overlap_area(&visible[i].1, &visible[j].1) > 4000 {
-                report.fail(
-                    ctx,
+                fail(
                     &format!("{} × {}", visible[i].0, visible[j].0),
                     "two visible windows overlap",
                     Some((visible[i].1, visible[j].1)),
@@ -339,6 +377,8 @@ fn validate(
             }
         }
     }
+
+    out
 }
 
 fn rect_matches(a: &PixelRect, b: &PixelRect, pos_tol: i32, size_tol: i32) -> bool {
@@ -440,9 +480,13 @@ impl LogTail {
     }
 
     /// Reads bytes appended since the last read, re-resolving the newest file in
-    /// case the day rolled over. Polls until `done(slice)` or `timeout`.
+    /// case the day rolled over. Polls until `done(acc)` or `timeout`,
+    /// *accumulating* every poll's bytes so a switch whose lines straddle a poll
+    /// boundary is never split (the appender is non-blocking, so `begin`..`park`
+    /// and `completed` can land in different reads).
     fn read_new_until(&mut self, done: impl Fn(&str) -> bool, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
+        let mut acc = String::new();
         loop {
             // Handle daily rotation: if a newer file appeared, switch to it.
             if let Some(newest) = newest_log(&self.dir)
@@ -451,9 +495,9 @@ impl LogTail {
                 self.path = newest;
                 self.offset = 0;
             }
-            let slice = self.read_from_offset();
-            if done(&slice) || Instant::now() >= deadline {
-                return slice;
+            acc.push_str(&self.read_from_offset());
+            if done(&acc) || Instant::now() >= deadline {
+                return acc;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -594,6 +638,9 @@ struct Report {
     worksets: usize,
     switches: usize,
     noops: usize,
+    /// Mismatches seen on the first measurement that resolved themselves by the
+    /// confirm re-measure — i.e. windows still settling, not real drift.
+    transient: usize,
     failures: Vec<Failure>,
 }
 
@@ -603,33 +650,19 @@ impl Report {
             worksets,
             switches: 0,
             noops: 0,
+            transient: 0,
             failures: Vec::new(),
         }
-    }
-
-    fn fail(
-        &mut self,
-        ctx: &CheckCtx,
-        window: &str,
-        problem: &str,
-        detail: Option<(PixelRect, PixelRect)>,
-    ) {
-        self.failures.push(Failure {
-            iter: ctx.iter,
-            target: ctx.target_name.to_string(),
-            window: window.to_string(),
-            problem: problem.to_string(),
-            detail,
-        });
     }
 
     fn print(&self) {
         println!("\n===== simtest report =====");
         println!(
-            "worksets={} switches={} noops={} failures={}",
+            "worksets={} switches={} noops={} transient={} failures={}",
             self.worksets,
             self.switches,
             self.noops,
+            self.transient,
             self.failures.len()
         );
         // Group failures by (window, problem) to keep the summary compact.
@@ -659,8 +692,8 @@ impl Report {
     fn to_json(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!(
-            "{{\"worksets\":{},\"switches\":{},\"noops\":{},\"failures\":[",
-            self.worksets, self.switches, self.noops
+            "{{\"worksets\":{},\"switches\":{},\"noops\":{},\"transient\":{},\"failures\":[",
+            self.worksets, self.switches, self.noops, self.transient
         ));
         for (i, f) in self.failures.iter().enumerate() {
             if i > 0 {
