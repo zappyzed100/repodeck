@@ -22,6 +22,13 @@ export struct RegistrationCandidate {
     checked: bool,
 }
 
+/// One row of the 起動候補 registry (`AppConfig.launch_apps`).
+export struct LaunchAppSummary {
+    name: string,
+    program: string,
+    args: string,
+}
+
 component GlassPanel inherits Rectangle {
     background: Theme.glass-panel;
     border-radius: Theme.radius-lg;
@@ -54,9 +61,6 @@ export component WorksetManager inherits Window {
     in property <[ManagedWindowSummary]> selected-workset-windows: [];
 
     in property <bool> registering: false;
-    in property <string> picked-folder-label: "（未選択）";
-    in property <string> resolved-repo-label: "";
-    in property <[RegistrationCandidate]> candidates: [];
     in property <[color]> color-choices: [#0a84ff, #30d158, #ff9f0a, #ff453a, #bf5af2, #64d2ff];
     in property <color> selected-color: #0a84ff;
     in-out property <bool> fullscreen-when-parked: false;
@@ -66,17 +70,15 @@ export component WorksetManager inherits Window {
     in property <[string]> parking-subs: [];
     in-out property <int> parking-selected-sub: -1;
 
-    // When true the registration view is editing an existing set ("配置を
-    // 再登録") rather than creating a new one; the name is pre-filled.
-    in property <bool> registration-editing: false;
     in-out property <string> registration-name: "";
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
 
     // "メイン画面を空にする" (moved here from Layout Studio): minimize the
-    // unregistered windows currently sitting on the main screen, so a clean
-    // set can be captured.
+    // unregistered windows currently sitting on the main screen. Reached from
+    // the set list — it is a housekeeping action on the live desktop, not part
+    // of defining a set.
     in property <bool> empty-screen-panel-visible: false;
     in property <[RegistrationCandidate]> main-screen-candidates: [];
     in property <bool> empty-undo-available: false;
@@ -87,22 +89,20 @@ export component WorksetManager inherits Window {
     callback workset-selected(index: int);
     callback delete-workset-requested();
     callback reopen-closed-requested();
-    callback recapture-placement-requested();
 
     callback start-registration();
     callback cancel-registration();
-    callback pick-folder-requested();
-    callback pick-workspace-requested();
-    callback refresh-candidates-requested();
-    callback candidate-toggled(index: int);
     callback color-selected(color: color);
     callback fullscreen-toggled();
     callback parking-sub-selected(index: int);
     callback register-requested(name: string);
 
-    // 起動アプリを追加: pick an app from the Start Menu catalogue, then fill in
-    // the one input that app actually needs (folder/workspace for VS Code, URL
-    // for a browser, arguments otherwise) — the fields follow the selection.
+    // --- UI 2: セットに紐づけ ---
+    // A set is *declared*, not captured: pick one of the registered launch apps
+    // (UI 1 below), fill in the one input that app needs (folder/workspace for
+    // VS Code, URL for a browser, arguments otherwise), and say which screen it
+    // opens on. The picked apps queue up in `pending-apps` and are attached
+    // when the set is registered, so they exist from the set's very first save.
     in property <[string]> app-catalog: [];
     in-out property <int> app-selected-index: -1;
     in property <string> app-kind-label: "";
@@ -111,10 +111,48 @@ export component WorksetManager inherits Window {
     in property <bool> app-input-visible: false;
     in property <bool> app-input-is-path: false;
     in-out property <string> app-input-text: "";
-    callback app-catalog-refresh-requested();
+    in property <[string]> pending-apps: [];
     callback app-selected(index: int);
     callback app-pick-path-requested();
     callback add-app-confirmed();
+    callback pending-app-removed(index: int);
+
+    // 起動時の画面表示: which main monitor the app opens on, how that monitor is
+    // split, and which cell of that split it takes. Cell order is reading order
+    // (左上→右下), matching Layout Studio's fixed parking slots.
+    in property <[string]> placement-monitors: [];
+    in-out property <int> placement-monitor-index: 0;
+    in property <[string]> placement-splits: ["1分割（全画面）", "2分割（左右）", "4分割"];
+    in-out property <int> placement-split-index: 0;
+    in property <[string]> placement-cells: ["全画面"];
+    in-out property <int> placement-cell-index: 0;
+    callback placement-split-selected(index: int);
+
+    // --- UI 1: 起動候補を登録 ---
+    // A standalone panel (over both the list and the registration view) where
+    // an app is registered once — by name and path, by browsing, or by picking
+    // a Start Menu entry, which fills both — into `AppConfig.launch_apps`.
+    in property <bool> managing-apps: false;
+    in property <[string]> start-menu-catalog: [];
+    in-out property <int> registry-catalog-index: -1;
+    in-out property <string> registry-search: "";
+    in property <string> registry-catalog-count: "";
+    in-out property <string> registry-name: "";
+    in-out property <string> registry-path: "";
+    // Carried from the picked catalogue entry, not user-editable: a wrapper
+    // shortcut's own flags and a packaged app's AUMID both have to survive
+    // registration, but they are noise in the form. Empty means "none".
+    in-out property <string> registry-args: "";
+    in-out property <string> registry-aumid: "";
+    in property <[LaunchAppSummary]> registered-apps: [];
+    callback open-app-registry();
+    callback close-app-registry();
+    callback registry-catalog-refresh-requested();
+    callback registry-search-changed(query: string);
+    callback registry-catalog-selected(index: int);
+    callback registry-browse-requested();
+    callback registry-save-requested();
+    callback registry-delete-requested(index: int);
 
     callback empty-main-screen-requested();
     callback empty-candidate-toggled(index: int);
@@ -136,7 +174,7 @@ export component WorksetManager inherits Window {
         padding: Theme.space-md;
         spacing: Theme.space-sm;
 
-        if !root.registering: HorizontalLayout {
+        if !root.registering && !root.managing-apps: HorizontalLayout {
             spacing: Theme.space-sm;
 
             // Left: workset list
@@ -182,9 +220,22 @@ export component WorksetManager inherits Window {
                     }
 
                     GlassButton {
-                        text: "+ 現在の配置をセットとして登録";
+                        text: "+ 新しいセットを作る";
                         primary: true;
                         clicked => { root.start-registration(); }
+                    }
+                    GlassButton {
+                        text: "起動候補を登録";
+                        clicked => { root.open-app-registry(); }
+                    }
+                    GlassButton {
+                        text: "メイン画面を空にする";
+                        clicked => { root.empty-main-screen-requested(); }
+                    }
+                    GlassButton {
+                        text: "空にしたのを元に戻す";
+                        enabled: root.empty-undo-available;
+                        clicked => { root.undo-empty-main-screen(); }
                     }
                 }
             }
@@ -208,11 +259,6 @@ export component WorksetManager inherits Window {
                             primary: root.selected-missing-count > 0;
                             enabled: root.selected-missing-count > 0;
                             clicked => { root.reopen-closed-requested(); }
-                        }
-                        GlassButton {
-                            text: "配置を再登録";
-                            enabled: root.selected-workset-index >= 0;
-                            clicked => { root.recapture-placement-requested(); }
                         }
                         GlassButton {
                             text: "このセットを削除";
@@ -247,63 +293,17 @@ export component WorksetManager inherits Window {
                         }
                     }
 
-                    // 起動アプリを追加 — for apps with no visible window to pick
-                    // (tray-resident like CodexBar) or simply not running.
-                    if root.selected-workset-index >= 0: VerticalLayout {
-                        spacing: Theme.space-xs;
-                        HorizontalLayout {
-                            spacing: Theme.space-xs;
-                            SectionLabel { text: "起動アプリを追加"; vertical-alignment: center; }
-                            Rectangle { horizontal-stretch: 1; }
-                            Text {
-                                text: root.app-kind-label;
-                                font-size: 11px;
-                                color: Theme.text-tertiary;
-                                vertical-alignment: center;
-                            }
-                            GlassButton {
-                                text: "一覧を更新";
-                                clicked => { root.app-catalog-refresh-requested(); }
-                            }
-                        }
-                        ComboBox {
-                            model: root.app-catalog;
-                            current-index <=> root.app-selected-index;
-                            selected => { root.app-selected(self.current-index); }
-                        }
-                        if root.app-input-visible: HorizontalLayout {
-                            spacing: Theme.space-xs;
-                            LineEdit {
-                                placeholder-text: root.app-input-placeholder;
-                                text <=> root.app-input-text;
-                                horizontal-stretch: 1;
-                            }
-                            if root.app-input-is-path: GlassButton {
-                                text: "参照";
-                                clicked => { root.app-pick-path-requested(); }
-                            }
-                        }
-                        HorizontalLayout {
-                            Rectangle { horizontal-stretch: 1; }
-                            GlassButton {
-                                text: "このセットに追加";
-                                primary: true;
-                                enabled: root.app-selected-index >= 0;
-                                clicked => { root.add-app-confirmed(); }
-                            }
-                        }
-                    }
                 }
             }
         }
 
-        if root.registering: GlassPanel {
+        if root.registering && !root.managing-apps: GlassPanel {
             VerticalLayout {
                 padding: Theme.space-lg;
                 spacing: Theme.space-sm;
 
                 Text {
-                    text: root.registration-editing ? "セットの配置を再登録" : "新しいワークセットを登録";
+                    text: "新しいワークセットを登録";
                     font-family: Theme.font-display;
                     font-size: 18px;
                     font-weight: 600;
@@ -311,22 +311,9 @@ export component WorksetManager inherits Window {
                     color: Theme.text-primary;
                 }
 
-                HorizontalLayout {
-                    spacing: Theme.space-xs;
-                    GlassButton {
-                        text: "フォルダーを選択（任意）";
-                        clicked => { root.pick-folder-requested(); }
-                    }
-                    GlassButton {
-                        text: "ワークスペースを選択";
-                        clicked => { root.pick-workspace-requested(); }
-                    }
-                    Text { text: root.picked-folder-label; font-size: 12px; color: Theme.text-secondary; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                }
-                Text { text: root.resolved-repo-label; font-size: 11px; color: Theme.text-tertiary; wrap: word-wrap; }
-
                 SectionLabel { text: "名前"; }
                 name-input := LineEdit {
+                    height: 36px;
                     placeholder-text: "ワークセット名";
                     text <=> root.registration-name;
                 }
@@ -346,50 +333,120 @@ export component WorksetManager inherits Window {
                     }
                 }
 
+                // UI 2 — the set's contents. A set is a list of apps plus, for
+                // each, where it opens: pick the app, fill in its one input,
+                // choose the screen, then 追加.
                 HorizontalLayout {
                     spacing: Theme.space-xs;
-                    SectionLabel { text: "候補ウィンドウ（メイン画面上で検出）"; vertical-alignment: center; }
+                    SectionLabel { text: "このセットのアプリ"; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
-                    GlassButton {
-                        text: "候補を更新";
-                        clicked => { root.refresh-candidates-requested(); }
+                    Text {
+                        text: root.app-kind-label;
+                        font-size: 11px;
+                        color: Theme.text-tertiary;
+                        vertical-alignment: center;
                     }
                     GlassButton {
-                        text: "メイン画面を空にする";
-                        clicked => { root.empty-main-screen-requested(); }
-                    }
-                    GlassButton {
-                        text: "元に戻す";
-                        enabled: root.empty-undo-available;
-                        clicked => { root.undo-empty-main-screen(); }
+                        text: "起動候補を登録…";
+                        clicked => { root.open-app-registry(); }
                     }
                 }
-                ScrollView {
-                    height: 150px;
-                    VerticalLayout {
-                        spacing: 2px;
-                        for candidate[i] in root.candidates: HorizontalLayout {
-                            spacing: Theme.space-xs;
-                            height: 26px;
-                            GlassCheckbox {
-                                checked: candidate.checked;
-                                toggled => { root.candidate-toggled(i); }
-                            }
-                            Text {
-                                text: candidate.title + "  (" + candidate.process_name + ")";
-                                font-size: 12px;
-                                color: Theme.text-secondary;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
                 Text {
-                    text: "「閉じたアプリを開き直す」対象: VS Codeはフォルダー、ブラウザはURL（新規ウィンドウ）で復元します。その他のアプリは実行ファイルを再起動します（開いていた文書までは復元されません）。";
+                    text: "セットに切り替えると、ここに並べたアプリが指定の画面に開きます。既に起動していればその窓を動かし、閉じていれば起動します。";
                     font-size: 10px;
                     color: Theme.text-tertiary;
                     wrap: word-wrap;
+                }
+                if root.app-catalog.length == 0: Text {
+                    text: "起動候補がまだありません。「起動候補を登録…」でアプリを登録すると、ここから選べます。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
+                }
+                // Every control below is pinned to the standard 36px control
+                // height: without it the layout hands its slack to whichever
+                // row can grow, and the app picker balloons.
+                if root.app-catalog.length > 0: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    ComboBox {
+                        model: root.app-catalog;
+                        current-index <=> root.app-selected-index;
+                        selected => { root.app-selected(self.current-index); }
+                        horizontal-stretch: 1;
+                    }
+                }
+                if root.app-input-visible: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text {
+                        text: root.app-input-label;
+                        font-size: 11px;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: root.app-input-placeholder;
+                        text <=> root.app-input-text;
+                        horizontal-stretch: 1;
+                    }
+                    if root.app-input-is-path: GlassButton {
+                        text: "参照";
+                        clicked => { root.app-pick-path-requested(); }
+                    }
+                }
+                if root.app-catalog.length > 0: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text { text: "画面"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-monitors;
+                        current-index <=> root.placement-monitor-index;
+                        horizontal-stretch: 1;
+                    }
+                    Text { text: "分割"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-splits;
+                        current-index <=> root.placement-split-index;
+                        selected => { root.placement-split-selected(self.current-index); }
+                    }
+                    Text { text: "位置"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-cells;
+                        current-index <=> root.placement-cell-index;
+                        enabled: root.placement-cells.length > 1;
+                    }
+                    GlassButton {
+                        text: "追加";
+                        primary: true;
+                        enabled: root.app-selected-index >= 0;
+                        clicked => { root.add-app-confirmed(); }
+                    }
+                }
+                // Takes the layout's leftover space so the fixed-height rows
+                // above keep their natural size.
+                ScrollView {
+                    vertical-stretch: 1;
+                    min-height: 90px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        for entry[i] in root.pending-apps: HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            height: 26px;
+                            Text {
+                                text: entry;
+                                font-size: 11px;
+                                color: Theme.text-secondary;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            GlassButton {
+                                text: "削除";
+                                clicked => { root.pending-app-removed(i); }
+                            }
+                        }
+                    }
                 }
 
                 HorizontalLayout {
@@ -437,9 +494,138 @@ export component WorksetManager inherits Window {
                         clicked => { root.cancel-registration(); }
                     }
                     GlassButton {
-                        text: root.registration-editing ? "更新" : "登録";
+                        text: "登録";
                         primary: true;
                         clicked => { root.register-requested(name-input.text); }
+                    }
+                }
+            }
+        }
+
+        // UI 1 — 起動候補を登録. Sits over whichever view opened it; closing
+        // returns there, so it can be reached mid-registration.
+        if root.managing-apps: GlassPanel {
+            VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-sm;
+
+                Text {
+                    text: "起動候補を登録";
+                    font-family: Theme.font-display;
+                    font-size: 18px;
+                    font-weight: 600;
+                    letter-spacing: -0.2px;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "ここで登録したアプリを、ワークセットの登録画面から選んでセットに紐づけます。ウィンドウが開いていないアプリ（常駐アプリなど）もこの経路で登録できます。";
+                    font-size: 11px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    SectionLabel { text: "スタートメニューから選ぶ（名称とパスを自動入力）"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.registry-catalog-count;
+                        font-size: 11px;
+                        color: Theme.text-tertiary;
+                        vertical-alignment: center;
+                    }
+                    GlassButton {
+                        text: "一覧を更新";
+                        clicked => { root.registry-catalog-refresh-requested(); }
+                    }
+                }
+                // Typing filters the list: a Start Menu has a few hundred
+                // entries, which is far too many to scroll through.
+                LineEdit {
+                    height: 36px;
+                    placeholder-text: "アプリ名で絞り込み（例: code）";
+                    text <=> root.registry-search;
+                    edited(text) => { root.registry-search-changed(text); }
+                }
+                ComboBox {
+                    height: 36px;
+                    model: root.start-menu-catalog;
+                    current-index <=> root.registry-catalog-index;
+                    selected => { root.registry-catalog-selected(self.current-index); }
+                }
+
+                SectionLabel { text: "名称"; }
+                LineEdit {
+                    height: 36px;
+                    placeholder-text: "例: CodexBar Desktop";
+                    text <=> root.registry-name;
+                }
+
+                SectionLabel { text: "パス"; }
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    LineEdit {
+                        placeholder-text: "例: C:\\Program Files\\App\\app.exe";
+                        text <=> root.registry-path;
+                        horizontal-stretch: 1;
+                    }
+                    GlassButton {
+                        text: "参照";
+                        clicked => { root.registry-browse-requested(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    GlassButton {
+                        text: "この内容で登録";
+                        primary: true;
+                        clicked => { root.registry-save-requested(); }
+                    }
+                }
+
+                SectionLabel { text: "登録済みの起動候補"; }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: Theme.space-xs;
+                        for app[i] in root.registered-apps: Rectangle {
+                            height: 46px;
+                            background: Theme.glass-panel-soft;
+                            border-radius: Theme.radius-md;
+
+                            HorizontalLayout {
+                                padding: Theme.space-xs;
+                                spacing: Theme.space-xs;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    Text { text: app.name; font-size: 12px; color: Theme.text-primary; overflow: elide; }
+                                    Text {
+                                        text: app.args == "" ? app.program : app.program + "  " + app.args;
+                                        font-size: 10px;
+                                        color: Theme.text-tertiary;
+                                        wrap: no-wrap;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    GlassButton {
+                                        text: "削除";
+                                        clicked => { root.registry-delete-requested(i); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    GlassButton {
+                        text: "閉じる";
+                        clicked => { root.close-app-registry(); }
                     }
                 }
             }

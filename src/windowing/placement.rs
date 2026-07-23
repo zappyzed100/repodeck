@@ -1,13 +1,13 @@
 //! Reading and changing a single window's placement, plus batched moves
 //! (PLAN.md §4.5 `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`).
 
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, GetWindowRect,
-    HDWP, HWND_TOP, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetWindowPos, ShowWindow, WINDOWPLACEMENT,
+    HDWP, HWND_TOP, PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED,
+    SW_SHOWMINIMIZED, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLOSE,
 };
 
 use crate::domain::placement::{PixelRect, SavedShowState};
@@ -276,6 +276,18 @@ pub fn maximize(hwnd: HWND) {
 pub fn minimize(hwnd: HWND) {
     // SAFETY: see `restore`.
     let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+}
+
+/// Asks `hwnd` to close, exactly as its title-bar × would.
+///
+/// `WM_CLOSE` is *posted*, not sent: the app decides what to do with it, and may
+/// well put up a "save changes?" prompt and stay open. That is the intended
+/// behaviour — RepoDeck never kills a process, so nothing the user hasn't
+/// confirmed is ever lost. Returns false if the message couldn't be posted (the
+/// window is already gone, or belongs to a higher-integrity process).
+pub fn close_window(hwnd: HWND) -> bool {
+    // SAFETY: `hwnd` is a live handle; `WM_CLOSE` carries no pointer payload.
+    unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
 /// Moves `hwnd` directly above `insert_after` in Z order without moving or

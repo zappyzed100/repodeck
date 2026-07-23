@@ -74,6 +74,11 @@ pub struct LaunchApp {
     /// Default arguments (e.g. those carried by a Start Menu shortcut).
     #[serde(default)]
     pub args: String,
+    /// For a packaged (Store/MSIX) app, the AUMID the shell reports for it.
+    /// Preferred over [`Self::program`] at launch time, since a packaged app's
+    /// install path contains its version and therefore changes on every update.
+    #[serde(default)]
+    pub aumid: Option<String>,
 }
 
 /// How to relaunch a managed window's application after it was closed.

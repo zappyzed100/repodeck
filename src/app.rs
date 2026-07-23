@@ -43,7 +43,7 @@ use crate::hotkey::mouse_wheel_hook::MouseWheelHook;
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
 use crate::ipc::named_pipe::{self, NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
-use crate::persistence::{clock, config_store, journal_store, runtime_store};
+use crate::persistence::{config_store, journal_store, runtime_store};
 use crate::windowing::autostart;
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
@@ -1103,14 +1103,29 @@ fn match_status_label(decision: Option<&MatchDecision>) -> (String, bool) {
     }
 }
 
+/// One app queued for the set being registered: which registered launch app,
+/// the one input that app needs, and the screen it opens on.
+///
+/// A set is *declared* rather than captured — the apps need not be running (or
+/// even installed on this desktop) at registration time — so the placement is
+/// chosen here instead of read off a live window.
+struct PendingApp {
+    app: crate::domain::workset::LaunchApp,
+    /// Folder/workspace for VS Code, URL for a browser, arguments otherwise.
+    input: String,
+    /// Index into `AppConfig.main_monitor_ids`.
+    monitor_index: usize,
+    /// How that monitor is divided, and which cell (reading order) this app takes.
+    split: AutoSplit,
+    cell_index: usize,
+}
+
 /// UI-only Workset Manager state: the last enumerated monitor list (needed to
-/// resolve a candidate's main-monitor index at registration time), the
-/// in-progress registration form, and which workset is selected in the list.
+/// label the 画面 picker), the in-progress registration form, and which workset
+/// is selected in the list.
 struct WorksetManagerState {
     monitors: Vec<MonitorInfo>,
     registering: bool,
-    picked_repository: Option<(PathBuf, crate::domain::workset::RepositoryKind)>,
-    registration_candidates: Vec<TopLevelWindow>,
     selected_color: slint::Color,
     selected_workset_index: Option<usize>,
     fullscreen_when_parked: bool,
@@ -1121,9 +1136,8 @@ struct WorksetManagerState {
     /// 退避先 selection for the workset being registered: -1 = 自動, otherwise
     /// an index into `AppConfig.sub_screens`.
     parking_selected_sub: i32,
-    /// When set, the registration view is editing (re-registering) this
-    /// existing workset rather than creating a new one.
-    editing_workset_id: Option<uuid::Uuid>,
+    /// The apps making up the set being registered, in the order they were added.
+    pending_apps: Vec<PendingApp>,
 }
 
 impl WorksetManagerState {
@@ -1131,22 +1145,21 @@ impl WorksetManagerState {
         Self {
             monitors: Vec::new(),
             registering: false,
-            picked_repository: None,
-            registration_candidates: Vec::new(),
             selected_color: hex_to_color("#2563eb"),
             selected_workset_index: None,
             fullscreen_when_parked: false,
             pending_empty_candidates: Vec::new(),
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
-            editing_workset_id: None,
+            pending_apps: Vec::new(),
         }
     }
 }
 
-/// The Start Menu catalogue behind the "起動アプリを追加" picker. A process-wide
-/// cache rather than manager state so the background loader thread can fill it
-/// (mirrors `GIT_CACHE`); the UI thread only ever reads it.
+/// The Start Menu catalogue behind the 起動候補 registry's "スタートメニューから
+/// 選ぶ" picker (UI 1). A process-wide cache rather than manager state so the
+/// background loader thread can fill it (mirrors `GIT_CACHE`); the UI thread
+/// only ever reads it.
 static APP_CATALOG: std::sync::LazyLock<
     std::sync::Mutex<Vec<crate::windowing::start_menu::StartMenuApp>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -1169,67 +1182,242 @@ fn spawn_app_catalog_load(manager: slint::Weak<WorksetManager>) {
     });
 }
 
-/// Pushes the cached catalogue's names into the picker and clears the selection.
+/// Which catalogue entries the registry's picker is currently showing, as
+/// indices into `APP_CATALOG`. The picker is filtered by the search box, so the
+/// combo's row index is not the catalogue index — this maps one to the other.
+static APP_CATALOG_VIEW: std::sync::LazyLock<std::sync::Mutex<Vec<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Pushes the catalogue entries matching the registry's search box into its
+/// picker and clears the selection. An empty query shows everything.
 fn push_app_catalog(manager: &WorksetManager) {
-    let names: Vec<slint::SharedString> = APP_CATALOG
-        .lock()
-        .map(|catalog| catalog.iter().map(|app| app.name.clone().into()).collect())
-        .unwrap_or_default();
+    let query = manager.get_registry_search().trim().to_lowercase();
+    let (names, view, total) = match APP_CATALOG.lock() {
+        Ok(catalog) => {
+            let mut names: Vec<slint::SharedString> = Vec::new();
+            let mut view: Vec<usize> = Vec::new();
+            for (index, app) in catalog.iter().enumerate() {
+                if query.is_empty() || app.name.to_lowercase().contains(&query) {
+                    names.push(app.name.clone().into());
+                    view.push(index);
+                }
+            }
+            (names, view, catalog.len())
+        }
+        Err(_) => (Vec::new(), Vec::new(), 0),
+    };
+
+    let shown = view.len();
+    if let Ok(mut current) = APP_CATALOG_VIEW.lock() {
+        *current = view;
+    }
+    manager.set_start_menu_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_registry_catalog_index(-1);
+    manager.set_registry_catalog_count(
+        if query.is_empty() {
+            format!("{total}件")
+        } else {
+            format!("{shown} / {total}件")
+        }
+        .into(),
+    );
+}
+
+/// Pushes `config.launch_apps` into both places it is shown: the registry's
+/// 登録済み list (UI 1) and the attach picker in the registration view (UI 2).
+/// Clears the picker's selection, since the indices it addresses just moved.
+fn refresh_launch_apps(manager: &WorksetManager, config: &AppConfig) {
+    let names: Vec<slint::SharedString> = config
+        .launch_apps
+        .iter()
+        .map(|app| app.name.clone().into())
+        .collect();
     manager.set_app_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
+
+    let rows: Vec<LaunchAppSummary> = config
+        .launch_apps
+        .iter()
+        .map(|app| LaunchAppSummary {
+            name: app.name.clone().into(),
+            program: app.program.display().to_string().into(),
+            args: app.args.clone().into(),
+        })
+        .collect();
+    manager.set_registered_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+
     manager.set_app_selected_index(-1);
-    apply_app_selection(manager, -1);
+    apply_app_selection(manager, None);
 }
 
-/// The catalogue entry at `index`, if any.
-fn catalog_app(index: i32) -> Option<crate::windowing::start_menu::StartMenuApp> {
+/// The 分割 options offered by the 画面 picker, in the order the combo lists them.
+const PLACEMENT_SPLITS: [(AutoSplit, &str); 3] = [
+    (AutoSplit::One, "1分割（全画面）"),
+    (AutoSplit::TwoColumns, "2分割（左右）"),
+    (AutoSplit::FourGrid, "4分割"),
+];
+
+/// The cell names for a split, in the same reading order as
+/// `layout_service::auto_split_cells`.
+fn placement_cell_labels(split: AutoSplit) -> Vec<&'static str> {
+    match split {
+        AutoSplit::One => vec!["全画面"],
+        AutoSplit::TwoColumns => vec!["左", "右"],
+        AutoSplit::FourGrid => vec!["左上", "右上", "左下", "右下"],
+    }
+}
+
+/// The 分割 at the combo's row index, defaulting to whole-monitor.
+fn placement_split_at(index: i32) -> AutoSplit {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| PLACEMENT_SPLITS.get(i))
+        .map_or(AutoSplit::One, |(split, _)| *split)
+}
+
+/// Fills the 画面 picker with the main monitors, keeping the row order aligned
+/// with `AppConfig.main_monitor_ids` so a row index *is* the monitor index.
+/// Falls back to the device name when the monitor isn't currently connected.
+fn refresh_placement_monitors(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &WorksetManagerState,
+) {
+    let names: Vec<slint::SharedString> = config
+        .main_monitor_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let live = state.monitors.iter().find(|m| &m.device_name == id);
+            match live {
+                Some(monitor) => format!(
+                    "画面{}: {}×{}{}",
+                    index + 1,
+                    monitor.bounds_px.width,
+                    monitor.bounds_px.height,
+                    if monitor.is_primary { "（主）" } else { "" }
+                )
+                .into(),
+                None => format!("画面{}: {id}（未接続）", index + 1).into(),
+            }
+        })
+        .collect();
+    let has_monitors = !names.is_empty();
+    manager.set_placement_monitors(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_placement_monitor_index(if has_monitors { 0 } else { -1 });
+}
+
+/// Fills the 位置 picker with the cells of the currently selected 分割.
+fn refresh_placement_cells(manager: &WorksetManager) {
+    let split = placement_split_at(manager.get_placement_split_index());
+    let labels: Vec<slint::SharedString> = placement_cell_labels(split)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    manager.set_placement_cells(std::rc::Rc::new(slint::VecModel::from(labels)).into());
+    manager.set_placement_cell_index(0);
+}
+
+/// How one queued app reads in the list: name, its input, and where it opens.
+fn pending_app_label(pending: &PendingApp) -> String {
+    let where_ = format!(
+        "画面{} {}",
+        pending.monitor_index + 1,
+        match pending.split {
+            AutoSplit::One => "全画面".to_string(),
+            split => format!(
+                "{}/{}",
+                PLACEMENT_SPLITS
+                    .iter()
+                    .find(|(s, _)| *s == split)
+                    .map_or("", |(_, label)| label),
+                placement_cell_labels(split)
+                    .get(pending.cell_index)
+                    .copied()
+                    .unwrap_or("")
+            ),
+        }
+    );
+    let input = pending.input.trim();
+    if input.is_empty() {
+        format!("{}  ―  {where_}", pending.app.name)
+    } else {
+        format!("{}  {input}  ―  {where_}", pending.app.name)
+    }
+}
+
+/// Pushes the apps queued for the set being registered (UI 2).
+fn refresh_pending_apps(manager: &WorksetManager, state: &WorksetManagerState) {
+    let rows: Vec<slint::SharedString> = state
+        .pending_apps
+        .iter()
+        .map(|pending| pending_app_label(pending).into())
+        .collect();
+    manager.set_pending_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+/// The registered launch app at `index` in `config.launch_apps`, if any.
+fn launch_app_at(config: &AppConfig, index: i32) -> Option<crate::domain::workset::LaunchApp> {
     let index = usize::try_from(index).ok()?;
-    APP_CATALOG.lock().ok()?.get(index).cloned()
+    config.launch_apps.get(index).cloned()
 }
 
-/// Builds a `ManagedWindow` for an app chosen from the Start Menu catalogue.
+/// The catalogue entry behind row `index` of the registry's (filtered) picker.
+fn catalog_app(index: i32) -> Option<crate::windowing::start_menu::StartMenuApp> {
+    let row = usize::try_from(index).ok()?;
+    let catalog_index = *APP_CATALOG_VIEW.lock().ok()?.get(row)?;
+    APP_CATALOG.lock().ok()?.get(catalog_index).cloned()
+}
+
+/// Builds a `ManagedWindow` for one declared app of a set.
 ///
-/// The matcher pairs the executable with the shortcut's name as a title hint:
-/// the executable alone scores below the auto-rebind threshold, so the name is
-/// what actually lets the window bind once the app is running. Placement
-/// defaults to filling the next main monitor in order — there is no live window
-/// to capture yet, and "配置を再登録" refines it once there is.
-fn build_catalog_window(
-    app: &crate::windowing::start_menu::StartMenuApp,
-    input: &str,
-    existing_count: usize,
+/// The matcher pairs the executable with the app's registered name as a title
+/// hint: the executable alone scores below the auto-rebind threshold, so the
+/// name is what actually lets the window bind once the app is running.
+/// Placement comes from the 画面 picker rather than a live window — the app may
+/// not be running (or even installed) when the set is declared.
+fn build_launch_app_window(
+    pending: &PendingApp,
+    z_order: usize,
     main_ids: &[String],
 ) -> crate::domain::workset::ManagedWindow {
-    use crate::domain::placement::{NormalizedRect, PixelRect, SavedPlacement, SavedShowState};
+    use crate::domain::placement::{PixelRect, SavedPlacement, SavedShowState};
     use crate::domain::workset::{LaunchKind, ManagedWindow, WindowMatcher};
 
-    let input = input.trim();
-    let kind = launch_service::classify(&app.target);
+    let app = &pending.app;
+    let input = pending.input.trim();
+    let kind = launch_service::classify(&app.program);
     let mut spec = match kind {
         LaunchKind::VsCode => launch_service::build_launch_spec(
-            &app.target,
+            &app.program,
             (!input.is_empty()).then(|| Path::new(input)),
             None,
         ),
         LaunchKind::Browser => launch_service::build_launch_spec(
-            &app.target,
+            &app.program,
             None,
             (!input.is_empty()).then_some(input),
         ),
-        LaunchKind::Generic => launch_service::build_launch_spec(&app.target, None, None),
+        LaunchKind::Generic => launch_service::build_launch_spec(&app.program, None, None),
     };
     // A generic app has no structured argument, so pass the field through as
-    // the shortcut's own command line would.
+    // the registered command line would.
     if kind == LaunchKind::Generic && !input.is_empty() {
         spec.args = input.split_whitespace().map(str::to_string).collect();
     }
+    // The registered AUMID is the shell's own, so it beats the one
+    // `build_launch_spec` guesses from the install path (which assumes the
+    // application id is `App` — true for ChatGPT, not for Claude or Teams).
+    if app.aumid.is_some() {
+        spec.aumid = app.aumid.clone();
+    }
 
-    let index = existing_count.min(main_ids.len().saturating_sub(1));
+    let monitor_index = pending.monitor_index.min(main_ids.len().saturating_sub(1));
     ManagedWindow {
         id: uuid::Uuid::new_v4(),
         matcher: WindowMatcher {
-            executable_path: app.target.clone(),
+            executable_path: app.program.clone(),
             process_name: app
-                .target
+                .program
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -1240,27 +1428,31 @@ fn build_catalog_window(
             title_regex: None,
         },
         main_placement: SavedPlacement {
-            monitor_id: main_ids.get(index).cloned().unwrap_or_default(),
-            main_monitor_index: index,
-            normalized_rect: NormalizedRect {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
+            monitor_id: main_ids.get(monitor_index).cloned().unwrap_or_default(),
+            main_monitor_index: monitor_index,
+            normalized_rect: layout_service::normalized_split_cell(
+                pending.split,
+                pending.cell_index,
+            ),
             physical_rect_at_capture: PixelRect::new(0, 0, 0, 0),
-            show_state: SavedShowState::Maximized,
+            // Only a whole-monitor app is maximized: a maximized window ignores
+            // its rect, which would silently undo a half/quarter cell.
+            show_state: if pending.split == AutoSplit::One {
+                SavedShowState::Maximized
+            } else {
+                SavedShowState::Normal
+            },
         },
-        z_order: i32::try_from(existing_count).unwrap_or(0),
+        z_order: i32::try_from(z_order).unwrap_or(0),
         launch_spec: Some(spec),
     }
 }
 
 /// Shows the one input the selected app actually needs: a folder/workspace for
 /// VS Code, a URL for a browser, free-form arguments for anything else.
-fn apply_app_selection(manager: &WorksetManager, index: i32) {
+fn apply_app_selection(manager: &WorksetManager, app: Option<&crate::domain::workset::LaunchApp>) {
     use crate::domain::workset::LaunchKind;
-    let Some(app) = catalog_app(index) else {
+    let Some(app) = app else {
         manager.set_app_kind_label("".into());
         manager.set_app_input_visible(false);
         manager.set_app_input_is_path(false);
@@ -1269,7 +1461,7 @@ fn apply_app_selection(manager: &WorksetManager, index: i32) {
     };
 
     let (kind_label, input_label, placeholder, is_path) =
-        match launch_service::classify(&app.target) {
+        match launch_service::classify(&app.program) {
             LaunchKind::VsCode => (
                 "VS Code",
                 "フォルダー / ワークスペース",
@@ -1284,7 +1476,8 @@ fn apply_app_selection(manager: &WorksetManager, index: i32) {
     manager.set_app_input_placeholder(placeholder.into());
     manager.set_app_input_visible(true);
     manager.set_app_input_is_path(is_path);
-    // Seed with the shortcut's own arguments so a wrapper shortcut keeps working.
+    // Seed with the app's registered arguments so a wrapper shortcut's flags
+    // keep working.
     manager.set_app_input_text(app.args.clone().into());
 }
 
@@ -1326,70 +1519,40 @@ fn refresh_color_choices(
     manager.set_selected_color(state.selected_color);
 }
 
-/// Builds the relaunch spec for a window being registered: VS Code gets the
-/// workset's repository path, a browser gets its live address-bar URL (read via
-/// UI Automation), and anything else just relaunches its bare exe. Returns
-/// `None` if the window has no known executable path.
-fn capture_launch_spec(
-    window: &TopLevelWindow,
-    repository_path: &Path,
-) -> Option<crate::domain::workset::LaunchSpec> {
-    use crate::domain::workset::LaunchKind;
-    let exe = window.executable_path.as_ref()?;
-    let kind = launch_service::classify(exe);
-    let browser_url = if kind == LaunchKind::Browser {
-        crate::windowing::browser_url::read_browser_url(window.hwnd)
-    } else {
-        None
-    };
-    // For VS Code, prefer the folder/workspace the window actually has open (read
-    // from its process command line) over the workset's `repository_path` — most
-    // worksets have no repository_path, so relying on it left VS Code relaunching
-    // with no folder (2026-07-23). Fall back to repository_path if the capture
-    // fails (protected process, or a bare window with no path argument).
-    let captured_vscode_folder = if kind == LaunchKind::VsCode {
-        // VS Code shares one process across its windows, so the command line may
-        // describe a *different* window. Keep the folder only when this window's
-        // title names it; otherwise fall back to `repository_path`.
-        let folder = crate::windowing::process_info::read_process_command_line(window.process_id)
-            .and_then(|cl| launch_service::extract_vscode_folder(&cl))
-            .filter(|folder| {
-                let matches = launch_service::vscode_folder_matches_title(folder, &window.title);
-                if !matches {
-                    tracing::info!(
-                        target: "launch",
-                        pid = window.process_id,
-                        %folder,
-                        title = %window.title,
-                        "capture: ignoring VS Code folder — it belongs to another window of the shared process"
-                    );
-                }
-                matches
-            });
-        tracing::info!(target: "launch", pid = window.process_id, folder = ?folder, "capture: VS Code open folder from command line");
-        folder
-    } else {
-        None
-    };
-    let repo_folder = captured_vscode_folder
-        .as_deref()
-        .map(Path::new)
-        .or_else(|| (!repository_path.as_os_str().is_empty()).then_some(repository_path));
-    Some(launch_service::build_launch_spec(
-        exe,
-        repo_folder,
-        browser_url.as_deref(),
-    ))
-}
+/// The repository a declared set describes: the folder or `.code-workspace`
+/// its VS Code entry opens.
+///
+/// The registration screen has no repository picker — a set is a list of apps,
+/// and the only one of them that names a repository is VS Code. Resolving it
+/// here keeps `repository_path` (agent matching, the quick switcher's git
+/// status) working without asking the user for the same path twice. `None`
+/// when the set has no VS Code entry, or its folder is blank or relative.
+fn derive_repository(
+    pending: &[PendingApp],
+) -> Option<(PathBuf, crate::domain::workset::RepositoryKind)> {
+    use crate::domain::workset::{LaunchKind, RepositoryKind};
 
-/// Japanese label for a repository kind, shown in the registration screen.
-fn repository_kind_label(kind: crate::domain::workset::RepositoryKind) -> &'static str {
-    use crate::domain::workset::RepositoryKind;
-    match kind {
-        RepositoryKind::Git => "Gitリポジトリ",
-        RepositoryKind::Directory => "通常フォルダー",
-        RepositoryKind::Workspace => "ワークスペース",
+    let entry = pending.iter().find(|p| {
+        launch_service::classify(&p.app.program) == LaunchKind::VsCode && !p.input.trim().is_empty()
+    })?;
+    let path = PathBuf::from(entry.input.trim());
+    if !path.is_absolute() {
+        return None;
     }
+    // A `.code-workspace` is stored as-is (that is what `RepositoryKind::
+    // Workspace` means); a folder resolves to its git root when it has one.
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("code-workspace"))
+    {
+        // Parsed eagerly so a malformed workspace file is caught now rather
+        // than silently breaking agent cwd matching later.
+        if workset_service::resolve_workspace_file(&path).is_err() {
+            return None;
+        }
+        return Some((path, RepositoryKind::Workspace));
+    }
+    Some(workset_service::resolve_repository(&path))
 }
 
 /// Populates the registration screen's 退避先 sub-screen chips from the current
@@ -1409,40 +1572,6 @@ fn refresh_parking_subs(
     }
     manager.set_parking_subs(std::rc::Rc::new(slint::VecModel::from(names)).into());
     manager.set_parking_selected_sub(state.parking_selected_sub);
-}
-
-/// Re-enumerates the top-level windows currently on the main screen and pushes
-/// them into the registration candidate list. Shared by "現在の配置をセットとして
-/// 登録" (start) and the "候補を更新" button. Returns whether any were found.
-fn refresh_registration_candidates(
-    manager: &WorksetManager,
-    config: &AppConfig,
-    state: &mut WorksetManagerState,
-) -> bool {
-    state.monitors = monitor::enumerate_monitors().unwrap_or_default();
-    let main_bounds = resolve_main_monitor_bounds(&state.monitors, &config.main_monitor_ids);
-    let live_windows =
-        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-    let candidates = layout_service::find_windows_on_main_screen(&live_windows, &main_bounds);
-
-    let model_items: Vec<RegistrationCandidate> = candidates
-        .iter()
-        .map(|w| RegistrationCandidate {
-            title: w.title.clone().into(),
-            process_name: w
-                .executable_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| w.window_class.clone())
-                .into(),
-            checked: true,
-        })
-        .collect();
-    manager.set_candidates(std::rc::Rc::new(slint::VecModel::from(model_items)).into());
-    let found = !candidates.is_empty();
-    state.registration_candidates = candidates;
-    found
 }
 
 fn refresh_workset_summaries(
@@ -1809,29 +1938,218 @@ fn wire_workset_manager(
         refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
     });
 
-    // ---- 起動アプリを追加 (Start Menu catalogue) ----
-    // Load the Start Menu catalogue once, now, so the picker is populated the
-    // first time the manager is opened.
+    // ---- UI 1: 起動候補を登録 (the launch-app registry) ----
+    // Load the Start Menu catalogue once, now, so the registry's picker is
+    // populated the first time it is opened.
     spawn_app_catalog_load(manager.as_weak());
+    refresh_launch_apps(manager, &config.borrow());
 
     let m = manager.as_weak();
-    manager.on_app_catalog_refresh_requested(move || {
+    let c = config.clone();
+    manager.on_open_app_registry(move || {
+        let Some(manager) = m.upgrade() else { return };
+        manager.set_registry_search("".into());
+        manager.set_registry_name("".into());
+        manager.set_registry_path("".into());
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+        push_app_catalog(&manager);
+        refresh_launch_apps(&manager, &c.borrow());
+        manager.set_managing_apps(true);
+        manager.set_status_text(
+            "アプリの名称とパスを入力するか、スタートメニューから選んでください。".into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    manager.on_close_app_registry(move || {
+        let Some(manager) = m.upgrade() else { return };
+        manager.set_managing_apps(false);
+        manager.set_status_text("".into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    manager.on_registry_catalog_refresh_requested(move || {
         spawn_app_catalog_load(m.clone());
     });
 
     let m = manager.as_weak();
-    manager.on_app_selected(move |index| {
+    manager.on_registry_search_changed(move |_query| {
         let Some(manager) = m.upgrade() else { return };
-        apply_app_selection(&manager, index);
+        // The query is read back off the property, which the LineEdit has
+        // already written — no need to thread the argument through.
+        push_app_catalog(&manager);
+    });
+
+    // Picking a Start Menu entry only *fills the form* — the user still presses
+    // 登録 — so a wrong pick can be corrected before anything is persisted.
+    let m = manager.as_weak();
+    manager.on_registry_catalog_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Some(app) = catalog_app(index) else {
+            return;
+        };
+        manager.set_registry_name(app.name.clone().into());
+        manager.set_registry_path(app.target.display().to_string().into());
+        manager.set_registry_args(app.args.clone().into());
+        manager.set_registry_aumid(app.aumid.clone().unwrap_or_default().into());
     });
 
     let m = manager.as_weak();
-    let s = state.clone();
+    manager.on_registry_browse_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("実行ファイル", &["exe"])
+            .pick_file()
+        else {
+            return;
+        };
+        // Fill the name from the file stem when it is still blank, so browsing
+        // alone is enough to register.
+        if manager.get_registry_name().trim().is_empty()
+            && let Some(stem) = path.file_stem()
+        {
+            manager.set_registry_name(stem.to_string_lossy().into_owned().into());
+        }
+        manager.set_registry_path(path.display().to_string().into());
+        // A browsed exe carries neither shortcut arguments nor an AUMID — drop
+        // whatever a catalogue entry picked earlier in this form left behind.
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let dir = data_dir.clone();
+    manager.on_registry_save_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let name = manager.get_registry_name().trim().to_string();
+        let program = PathBuf::from(manager.get_registry_path().trim());
+        let args = manager.get_registry_args().trim().to_string();
+        let aumid = Some(manager.get_registry_aumid().trim().to_string()).filter(|a| !a.is_empty());
+
+        if name.is_empty() {
+            manager.set_status_text("名称を入力してください。".into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+        if program.as_os_str().is_empty() {
+            manager.set_status_text("パスを入力してください。".into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+        // A missing target is a warning, not a rejection: a network or
+        // removable-drive app is still worth registering.
+        let missing = !program.exists();
+
+        {
+            let mut config = c.borrow_mut();
+            if config
+                .launch_apps
+                .iter()
+                .any(|a| a.name.eq_ignore_ascii_case(&name))
+            {
+                drop(config);
+                manager.set_status_text(format!("「{name}」は既に登録されています。").into());
+                manager.set_status_is_warning(true);
+                return;
+            }
+            config.launch_apps.push(crate::domain::workset::LaunchApp {
+                id: uuid::Uuid::new_v4(),
+                name: name.clone(),
+                program,
+                args,
+                aumid,
+            });
+        }
+
+        if let Err(err) = config_store::save(&dir, &c.borrow()) {
+            c.borrow_mut().launch_apps.pop();
+            tracing::warn!(error = %err, "launch-app registry: failed to save config");
+            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        refresh_launch_apps(&manager, &c.borrow());
+        manager.set_registry_catalog_index(-1);
+        manager.set_registry_name("".into());
+        manager.set_registry_path("".into());
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+        // Keep the search query: registering several apps in a row usually
+        // means several matches of the same search.
+        manager.set_status_text(
+            if missing {
+                format!("「{name}」を登録しました（指定のパスは現在見つかりません）。")
+            } else {
+                format!("「{name}」を登録しました。")
+            }
+            .into(),
+        );
+        manager.set_status_is_warning(missing);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let dir = data_dir.clone();
+    manager.on_registry_delete_requested(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+
+        let removed = {
+            let mut config = c.borrow_mut();
+            if index >= config.launch_apps.len() {
+                return;
+            }
+            config.launch_apps.remove(index)
+        };
+
+        if let Err(err) = config_store::save(&dir, &c.borrow()) {
+            c.borrow_mut().launch_apps.insert(index, removed);
+            tracing::warn!(error = %err, "launch-app registry: failed to save config");
+            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        refresh_launch_apps(&manager, &c.borrow());
+        manager.set_status_text(
+            format!(
+                "「{}」を起動候補から削除しました（登録済みセットはそのままです）。",
+                removed.name
+            )
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    // ---- UI 2: セットに紐づけ ----
+    let m = manager.as_weak();
+    let c = config.clone();
+    manager.on_app_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let app = launch_app_at(&c.borrow(), index);
+        apply_app_selection(&manager, app.as_ref());
+    });
+
+    let m = manager.as_weak();
+    manager.on_placement_split_selected(move |_index| {
+        let Some(manager) = m.upgrade() else { return };
+        // The cell list belongs to the split, so re-derive it (and reset to the
+        // first cell) whenever the split changes.
+        refresh_placement_cells(&manager);
+    });
+
+    let m = manager.as_weak();
     manager.on_app_pick_path_requested(move || {
         let Some(manager) = m.upgrade() else { return };
         // VS Code takes either a folder or a `.code-workspace` file, so offer
         // the file picker first and fall back to a folder pick when cancelled.
-        let _ = &s;
         let picked = rfd::FileDialog::new()
             .add_filter("VS Code ワークスペース", &["code-workspace"])
             .pick_file()
@@ -1844,47 +2162,64 @@ fn wire_workset_manager(
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
-    let dir = data_dir.clone();
     manager.on_add_app_confirmed(move || {
         let Some(manager) = m.upgrade() else { return };
         let input = manager.get_app_input_text().to_string();
         let index = manager.get_app_selected_index();
 
-        let added = {
-            let state = s.borrow();
-            let Some(app) = catalog_app(index) else {
-                manager.set_status_text("追加するアプリを選んでください。".into());
-                manager.set_status_is_warning(true);
-                return;
-            };
-            let Some(workset_index) = state.selected_workset_index else {
-                return;
-            };
-            let mut config = c.borrow_mut();
-            let main_ids = config.main_monitor_ids.clone();
-            let Some(workset) = config.worksets.get_mut(workset_index) else {
-                return;
-            };
-
-            let window = build_catalog_window(&app, &input, workset.windows.len(), &main_ids);
-            let name = app.name.clone();
-            workset.windows.push(window);
-            workset.updated_at = clock::now_rfc3339();
-            name
-        };
-
-        if let Err(err) = config_store::save(&dir, &c.borrow()) {
-            tracing::warn!(error = %err, "add-app: failed to save config");
-            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+        let Some(app) = launch_app_at(&c.borrow(), index) else {
+            manager.set_status_text("追加するアプリを選んでください。".into());
             manager.set_status_is_warning(true);
             return;
-        }
+        };
+
+        let monitor_index = manager.get_placement_monitor_index();
+        let Ok(monitor_index) = usize::try_from(monitor_index) else {
+            manager.set_status_text(
+                "メイン画面が設定されていません。レイアウトスタジオでメイン画面を指定してください。"
+                    .into(),
+            );
+            manager.set_status_is_warning(true);
+            return;
+        };
+        let split = placement_split_at(manager.get_placement_split_index());
+        let cell_index = usize::try_from(manager.get_placement_cell_index()).unwrap_or(0);
+
+        // Queued, not saved: the set doesn't exist yet, so the whole list is
+        // applied when 登録 is pressed.
+        let mut state = s.borrow_mut();
+        let name = app.name.clone();
+        state.pending_apps.push(PendingApp {
+            app,
+            input,
+            monitor_index,
+            split,
+            cell_index,
+        });
+        refresh_pending_apps(&manager, &state);
+        drop(state);
+
+        manager.set_app_selected_index(-1);
+        apply_app_selection(&manager, None);
         manager.set_status_text(
-            format!("「{added}」を追加しました。セット切り替え時に起動されます。").into(),
+            format!("「{name}」を追加しました。「登録」でセットに保存されます。").into(),
         );
         manager.set_status_is_warning(false);
-        let state = s.borrow();
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_pending_app_removed(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        if index >= state.pending_apps.len() {
+            return;
+        }
+        state.pending_apps.remove(index);
+        refresh_pending_apps(&manager, &state);
     });
 
     let m = manager.as_weak();
@@ -1971,10 +2306,15 @@ fn wire_workset_manager(
         let mut state = s.borrow_mut();
         let config = c.borrow();
 
-        let found = refresh_registration_candidates(&manager, &config, &mut state);
-        state.picked_repository = None;
-        state.editing_workset_id = None;
-        manager.set_registration_editing(false);
+        state.pending_apps.clear();
+        // Monitors are re-enumerated here so the 画面 picker labels the screens
+        // as they are *now*, not as they were when the manager opened.
+        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
+        refresh_pending_apps(&manager, &state);
+        refresh_launch_apps(&manager, &config);
+        refresh_placement_monitors(&manager, &config, &state);
+        manager.set_placement_split_index(0);
+        refresh_placement_cells(&manager);
         manager.set_registration_name("".into());
         state.fullscreen_when_parked = false;
         manager.set_fullscreen_when_parked(false);
@@ -1983,36 +2323,9 @@ fn wire_workset_manager(
         refresh_parking_subs(&manager, &config, &mut state);
         // Offer only colors not already taken by an existing workset.
         refresh_color_choices(&manager, &config, &mut state);
-        manager.set_picked_folder_label("（未選択）".into());
-        manager.set_resolved_repo_label("".into());
         manager.set_registering(true);
-        if found {
-            manager.set_status_text(
-                "登録するウィンドウを選び、名前を入力してください。リポジトリは任意です。".into(),
-            );
-            manager.set_status_is_warning(false);
-        } else {
-            manager.set_status_text(
-                "メイン画面に候補ウィンドウがありません。ウィンドウを配置して「候補を更新」を押してください。".into(),
-            );
-            manager.set_status_is_warning(false);
-        }
-    });
-
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_refresh_candidates_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        let mut state = s.borrow_mut();
-        let found = refresh_registration_candidates(&manager, &c.borrow(), &mut state);
         manager.set_status_text(
-            if found {
-                "候補ウィンドウを更新しました。"
-            } else {
-                "メイン画面に候補ウィンドウが見つかりませんでした。"
-            }
-            .into(),
+            "名前を入力し、このセットで開くアプリと画面を追加してください。".into(),
         );
         manager.set_status_is_warning(false);
     });
@@ -2377,100 +2690,12 @@ fn wire_workset_manager(
     let s = state.clone();
     manager.on_cancel_registration(move || {
         let Some(manager) = m.upgrade() else { return };
-        s.borrow_mut().editing_workset_id = None;
-        manager.set_registration_editing(false);
+        {
+            let mut state = s.borrow_mut();
+            state.pending_apps.clear();
+            refresh_pending_apps(&manager, &state);
+        }
         manager.set_registering(false);
-    });
-
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_pick_folder_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-
-        let (repository_path, repository_kind) = workset_service::resolve_repository(&folder);
-        if workset_service::is_duplicate_repository(&c.borrow().worksets, &repository_path) {
-            manager.set_status_text("このリポジトリは既に登録されています。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        manager.set_picked_folder_label(folder.display().to_string().into());
-        manager.set_resolved_repo_label(
-            format!(
-                "{}として登録されます: {}",
-                repository_kind_label(repository_kind),
-                repository_path.display()
-            )
-            .into(),
-        );
-        s.borrow_mut().picked_repository = Some((repository_path, repository_kind));
-        manager.set_status_text("".into());
-        manager.set_status_is_warning(false);
-    });
-
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_pick_workspace_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        let Some(file) = rfd::FileDialog::new()
-            .add_filter("VS Code ワークスペース", &["code-workspace"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        // Parsed eagerly (not just stored) so a malformed/empty workspace
-        // file is rejected at registration time — otherwise agent cwd
-        // matching (`agent_status_service::map_event_to_workset`) would
-        // silently never succeed for this workset instead of failing loudly
-        // here.
-        let folder = match workset_service::resolve_workspace_file(&file) {
-            Ok(folder) => folder,
-            Err(err) => {
-                manager.set_status_text(err.to_string().into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
-
-        let repository_kind = crate::domain::workset::RepositoryKind::Workspace;
-        if workset_service::is_duplicate_repository(&c.borrow().worksets, &file) {
-            manager.set_status_text("このワークスペースは既に登録されています。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        manager.set_picked_folder_label(file.display().to_string().into());
-        manager.set_resolved_repo_label(
-            format!(
-                "{}として登録されます: {}（フォルダー: {}）",
-                repository_kind_label(repository_kind),
-                file.display(),
-                folder.display()
-            )
-            .into(),
-        );
-        s.borrow_mut().picked_repository = Some((file, repository_kind));
-        manager.set_status_text("".into());
-        manager.set_status_is_warning(false);
-    });
-
-    let m = manager.as_weak();
-    manager.on_candidate_toggled(move |index| {
-        let Some(manager) = m.upgrade() else { return };
-        let Ok(index) = usize::try_from(index) else {
-            return;
-        };
-        let model = manager.get_candidates();
-        if let Some(mut row) = model.row_data(index) {
-            row.checked = !row.checked;
-            model.set_row_data(index, row);
-        }
     });
 
     let m = manager.as_weak();
@@ -2495,72 +2720,45 @@ fn wire_workset_manager(
         }
 
         let mut state = s.borrow_mut();
-        // Repository is optional: with no folder picked, register with an empty
-        // path (validation and de-dup both skip empty paths).
-        let (repository_path, repository_kind) = state.picked_repository.clone().unwrap_or_else(|| {
-            (
-                PathBuf::new(),
-                crate::domain::workset::RepositoryKind::Directory,
-            )
-        });
-
-        let model = manager.get_candidates();
-        let checked_windows: Vec<TopLevelWindow> = state
-            .registration_candidates
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| model.row_data(*i).is_some_and(|row| row.checked))
-            .map(|(_, w)| w.clone())
-            .collect();
-        if checked_windows.is_empty() {
-            manager.set_status_text("ウィンドウを1つ以上選択してください。".into());
+        if state.pending_apps.is_empty() {
+            manager.set_status_text("アプリを1つ以上追加してください。".into());
             manager.set_status_is_warning(true);
             return;
         }
 
-        let mut managed_windows = Vec::new();
-        // The authoritative HWND for each newly registered window: the user
-        // picked it explicitly, so seed the session binding from it.
-        let mut seed_bindings: Vec<(uuid::Uuid, isize)> = Vec::new();
-        for (z_order, window) in checked_windows.iter().enumerate() {
-            let hwnd = HWND(window.hwnd as *mut _);
-            let show_state = match win_placement::get_show_state(hwnd) {
-                Ok(show_state) => show_state,
-                Err(err) => {
-                    tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window, failed to read show state");
-                    continue;
-                }
-            };
-            let rect = match win_placement::get_normal_rect(hwnd) {
-                Ok(rect) => rect,
-                Err(err) => {
-                    tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window, failed to read normal rect");
-                    continue;
-                }
-            };
-            match workset_service::build_managed_window(window, rect, show_state, i32::try_from(z_order).unwrap_or(i32::MAX), &state.monitors, &c.borrow().main_monitor_ids) {
-                Ok(mut managed_window) => {
-                    managed_window.launch_spec =
-                        capture_launch_spec(window, repository_path.as_path());
-                    seed_bindings.push((managed_window.id, window.hwnd));
-                    managed_windows.push(managed_window);
-                }
-                Err(err) => tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window not on a main monitor"),
-            }
-        }
+        // The set's repository is whatever its VS Code entry has open — that is
+        // the only declared input that names a repository, and it drives agent
+        // matching and the quick switcher's git status.
+        let (repository_path, repository_kind) = derive_repository(&state.pending_apps)
+            .unwrap_or_else(|| {
+                (
+                    PathBuf::new(),
+                    crate::domain::workset::RepositoryKind::Directory,
+                )
+            });
 
-        if managed_windows.is_empty() {
-            manager.set_status_text("登録できるウィンドウがありませんでした。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
+        let managed_windows: Vec<crate::domain::workset::ManagedWindow> = {
+            let main_ids = c.borrow().main_monitor_ids.clone();
+            state
+                .pending_apps
+                .iter()
+                .enumerate()
+                .map(|(z_order, pending)| build_launch_app_window(pending, z_order, &main_ids))
+                .collect()
+        };
 
         let color_hex = color_to_hex(state.selected_color);
-        let editing_id = state.editing_workset_id;
         let save_result = {
             let mut config = c.borrow_mut();
             let sort_order = i32::try_from(config.worksets.len()).unwrap_or(i32::MAX);
-            let mut workset = workset_service::build_workset(name, color_hex, repository_path, repository_kind, sort_order, managed_windows);
+            let mut workset = workset_service::build_workset(
+                name,
+                color_hex,
+                repository_path,
+                repository_kind,
+                sort_order,
+                managed_windows,
+            );
             workset.fullscreen_when_parked = state.fullscreen_when_parked;
 
             // 退避先: -1 = 自動, otherwise the sub-screen at that index.
@@ -2574,30 +2772,7 @@ fn wire_workset_manager(
                 };
             }
 
-            // Editing ("配置を再登録") replaces the existing set's fields in
-            // place (keeping its id/created_at/sort_order/hotkey); a fresh
-            // registration appends a new set. Snapshot for rollback on error.
-            let backup = editing_id.and_then(|id| {
-                config
-                    .worksets
-                    .iter()
-                    .find(|w| w.id == id)
-                    .map(|w| (w.id, w.clone()))
-            });
-            if let Some((existing_id, _)) = &backup
-                && let Some(existing) = config.worksets.iter_mut().find(|w| &w.id == existing_id)
-            {
-                existing.name = workset.name.clone();
-                existing.repository_path = workset.repository_path.clone();
-                existing.repository_kind = workset.repository_kind;
-                existing.color = workset.color.clone();
-                existing.parking_policy = workset.parking_policy.clone();
-                existing.fullscreen_when_parked = workset.fullscreen_when_parked;
-                existing.windows = workset.windows.clone();
-                existing.updated_at = clock::now_rfc3339();
-            } else {
-                config.worksets.push(workset);
-            }
+            config.worksets.push(workset);
 
             let errors = config.validate();
             // Registering the same window in more than one workset is allowed —
@@ -2613,15 +2788,8 @@ fn wire_workset_manager(
                 })
                 .map(config_validation_message)
                 .collect();
-            let restore = |config: &mut AppConfig| match &backup {
-                Some((id, original)) => {
-                    if let Some(w) = config.worksets.iter_mut().find(|w| &w.id == id) {
-                        *w = original.clone();
-                    }
-                }
-                None => {
-                    config.worksets.pop();
-                }
+            let restore = |config: &mut AppConfig| {
+                config.worksets.pop();
             };
             if !fatal.is_empty() {
                 restore(&mut config);
@@ -2639,27 +2807,11 @@ fn wire_workset_manager(
 
         match save_result {
             Ok(()) => {
-                // Seed session HWND bindings from the exact windows the user
-                // picked, so switches re-find them even as titles/URLs change.
-                let mut runtime = runtime_store::load(&dir);
-                for (id, hwnd) in seed_bindings {
-                    runtime.window_bindings.insert(id, hwnd);
-                }
-                let _ = runtime_store::save(&dir, &runtime);
-
                 state.registering = false;
-                let was_editing = state.editing_workset_id.is_some();
-                state.editing_workset_id = None;
+                state.pending_apps.clear();
+                refresh_pending_apps(&manager, &state);
                 manager.set_registering(false);
-                manager.set_registration_editing(false);
-                manager.set_status_text(
-                    if was_editing {
-                        "セットを更新しました。"
-                    } else {
-                        "ワークセットを登録しました。"
-                    }
-                    .into(),
-                );
+                manager.set_status_text("ワークセットを登録しました。".into());
                 manager.set_status_is_warning(false);
                 refresh_workset_summaries(&manager, &c.borrow(), &mut state);
                 refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
@@ -2669,75 +2821,6 @@ fn wire_workset_manager(
                 manager.set_status_is_warning(true);
             }
         }
-    });
-
-    // "配置を再登録": re-enter the same registration flow as a first
-    // registration, but scoped to the selected set — detect the windows now on
-    // the main screen, let the user re-pick and adjust, then update the set.
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_recapture_placement_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        let mut state = s.borrow_mut();
-        let config = c.borrow();
-        let Some(workset) = state
-            .selected_workset_index
-            .and_then(|i| config.worksets.get(i))
-        else {
-            return;
-        };
-
-        // Pre-fill the registration view from the existing set.
-        state.editing_workset_id = Some(workset.id);
-        let repo = workset.repository_path.clone();
-        state.picked_repository = if repo.as_os_str().is_empty() {
-            None
-        } else {
-            Some((repo, workset.repository_kind))
-        };
-        state.selected_color = hex_to_color(&workset.color);
-        state.fullscreen_when_parked = workset.fullscreen_when_parked;
-        state.parking_selected_sub = match &workset.parking_policy {
-            crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } => config
-                .sub_screens
-                .iter()
-                .position(|sub| sub.id == *sub_screen_id)
-                .and_then(|i| i32::try_from(i).ok())
-                .unwrap_or(-1),
-            _ => -1,
-        };
-        manager.set_registration_name(workset.name.clone().into());
-        manager.set_registration_editing(true);
-        manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
-
-        let found = refresh_registration_candidates(&manager, &config, &mut state);
-        refresh_parking_subs(&manager, &config, &mut state);
-        // Show the full palette (including this set's current color) when editing.
-        manager.set_color_choices(
-            std::rc::Rc::new(slint::VecModel::from(
-                WORKSET_PALETTE.iter().map(|c| hex_to_color(c)).collect::<Vec<_>>(),
-            ))
-            .into(),
-        );
-        manager.set_selected_color(state.selected_color);
-
-        let repo_label = state
-            .picked_repository
-            .as_ref()
-            .map_or_else(|| "（リポジトリなし）".to_string(), |(p, _)| p.display().to_string());
-        manager.set_picked_folder_label(repo_label.into());
-        manager.set_resolved_repo_label("".into());
-        manager.set_registering(true);
-        manager.set_status_text(
-            if found {
-                "登録し直すウィンドウを選び直してください。"
-            } else {
-                "メイン画面に候補ウィンドウがありません。配置してから「候補を更新」を押してください。"
-            }
-            .into(),
-        );
-        manager.set_status_is_warning(false);
     });
 }
 
@@ -3249,6 +3332,67 @@ fn wire_quick_switcher(
         let Some(switcher) = s.upgrade() else { return };
         // `filter-text` is two-way bound to the TextInput, so it already holds
         // the new value (including IME-composed text); just re-filter.
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    // 「×」on a row: quit that set's apps without switching to it. The set stays
+    // registered — the next switch to it relaunches everything.
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_close_workset_requested(move |workset_id| {
+        let Some(switcher) = s.upgrade() else { return };
+        let Ok(workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+            return;
+        };
+
+        let (name, hwnds) = {
+            let config = c.borrow();
+            let Some(workset) = config.worksets.iter().find(|w| w.id == workset_id) else {
+                return;
+            };
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
+            let hwnds: Vec<isize> = workset
+                .windows
+                .iter()
+                .filter_map(|w| match decisions.get(&w.id) {
+                    Some(MatchDecision::AutoRebind { hwnd }) => Some(*hwnd),
+                    _ => None,
+                })
+                .collect();
+            (workset.name.clone(), hwnds)
+        };
+
+        if hwnds.is_empty() {
+            switcher.set_status_text(format!("「{name}」は開いていません。").into());
+            switcher.set_status_is_warning(false);
+            return;
+        }
+
+        let closed = hwnds
+            .iter()
+            .filter(|hwnd| win_placement::close_window(HWND(**hwnd as *mut _)))
+            .count();
+        tracing::info!(target: "switch", %workset_id, closed, "close-workset: posted WM_CLOSE");
+
+        // Drop the session bindings for the windows we asked to close, so a
+        // window that does close isn't chased by a stale HWND next switch.
+        let mut runtime = runtime_store::load(&d);
+        let config = c.borrow();
+        if let Some(workset) = config.worksets.iter().find(|w| w.id == workset_id) {
+            for window in &workset.windows {
+                runtime.window_bindings.remove(&window.id);
+            }
+        }
+        drop(config);
+        let _ = runtime_store::save(&d, &runtime);
+
+        switcher.set_status_text(
+            format!("「{name}」のウィンドウ{closed}個に終了を要求しました。").into(),
+        );
+        switcher.set_status_is_warning(false);
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
     });
 
@@ -4526,8 +4670,7 @@ fn spawn_gh_refresh(paths: Vec<PathBuf>) {
     std::thread::spawn(move || {
         for path in paths {
             let branch = cached_git_status(&path).branch;
-            let status =
-                crate::application::gh_status_service::fetch(&path, branch.as_deref());
+            let status = crate::application::gh_status_service::fetch(&path, branch.as_deref());
             if let Ok(mut cache) = GH_CACHE.lock() {
                 cache.insert(path, status);
             }

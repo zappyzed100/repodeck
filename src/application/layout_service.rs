@@ -11,7 +11,7 @@
 //! implementation of window enumeration — only the enumerated *data*.
 
 use crate::domain::monitor::AutoSplit;
-use crate::domain::placement::{PixelRect, SavedShowState, bounding_rect};
+use crate::domain::placement::{NormalizedRect, PixelRect, SavedShowState, bounding_rect};
 use crate::windowing::enumerate::TopLevelWindow;
 
 /// A monitor's bounds mapped onto a canvas, in logical pixels, preserving the
@@ -124,6 +124,46 @@ pub fn auto_split_cells(work_area: PixelRect, split: AutoSplit) -> Vec<PixelRect
     }
 }
 
+/// The same grid cell as [`auto_split_cells`], but expressed as a fraction of
+/// the monitor's work area rather than pixels.
+///
+/// This is what lets a workset declare "this app opens on the left half of
+/// DISPLAY1" without knowing that monitor's resolution: the fraction is stored
+/// in `SavedPlacement::normalized_rect` and resolved against whatever work area
+/// the monitor has at switch time. Cell order matches `auto_split_cells`
+/// exactly (reading order), so a `cell_index` means the same thing in both.
+/// An out-of-range `cell_index` falls back to the whole area.
+pub fn normalized_split_cell(split: AutoSplit, cell_index: usize) -> NormalizedRect {
+    let whole = NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+    if cell_index >= split.cell_count() {
+        return whole;
+    }
+    match split {
+        AutoSplit::One => whole,
+        AutoSplit::TwoColumns => NormalizedRect {
+            x: if cell_index == 0 { 0.0 } else { 0.5 },
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        },
+        AutoSplit::FourGrid => NormalizedRect {
+            x: if cell_index.is_multiple_of(2) {
+                0.0
+            } else {
+                0.5
+            },
+            y: if cell_index < 2 { 0.0 } else { 0.5 },
+            width: 0.5,
+            height: 0.5,
+        },
+    }
+}
+
 /// Selects the windows from `windows` whose center point falls on one of
 /// `main_monitor_bounds` (PLAN.md §3.6's candidate rule, reused here for
 /// "メインを空にする"'s "メイン画面と交差するトップレベルウィンドウを列挙").
@@ -171,6 +211,38 @@ impl UndoSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared cell (workset registration) and the parking cell (Layout
+    /// Studio) must describe the same rectangle, or "左半分" would mean two
+    /// different things in the two screens.
+    #[test]
+    fn normalized_split_cells_match_auto_split_cells() {
+        let work_area = PixelRect::new(100, 200, 1920, 1080);
+        for split in [AutoSplit::One, AutoSplit::TwoColumns, AutoSplit::FourGrid] {
+            let pixel_cells = auto_split_cells(work_area, split);
+            for (index, cell) in pixel_cells.iter().enumerate() {
+                let normalized = normalized_split_cell(split, index);
+                let expected_x = (cell.x - work_area.x) as f64 / work_area.width as f64;
+                let expected_y = (cell.y - work_area.y) as f64 / work_area.height as f64;
+                let expected_w = cell.width as f64 / work_area.width as f64;
+                let expected_h = cell.height as f64 / work_area.height as f64;
+                assert!(
+                    (normalized.x - expected_x).abs() < 0.001
+                        && (normalized.y - expected_y).abs() < 0.001
+                        && (normalized.width - expected_w).abs() < 0.001
+                        && (normalized.height - expected_h).abs() < 0.001,
+                    "{split:?} cell {index}: {normalized:?} != {cell:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_cell_falls_back_to_the_whole_monitor() {
+        let cell = normalized_split_cell(AutoSplit::TwoColumns, 7);
+        assert_eq!(cell.width, 1.0);
+        assert_eq!(cell.height, 1.0);
+    }
 
     #[test]
     fn project_single_monitor_fills_canvas_minus_padding() {

@@ -55,6 +55,9 @@ export component QuickSwitcher inherits Window {
     // composed input works.
     callback filter-changed(text: string);
     callback switch-requested(workset-id: string);
+    /// Close every live window belonging to that set (its apps quit; the set
+    /// itself stays registered and re-opens on the next switch).
+    callback close-workset-requested(workset-id: string);
     callback recover-requested();
     callback settings-requested();
     callback manager-requested();
@@ -237,6 +240,16 @@ export component QuickSwitcher inherits Window {
                         border-color: i == root.selected-index ? Theme.accent : Theme.hairline;
                         animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
 
+                        // Declared *before* the content so the row-wide click
+                        // target sits underneath it — otherwise it would cover
+                        // the per-row 閉じる button and swallow its clicks.
+                        TouchArea {
+                            clicked => {
+                                root.selected-index = i;
+                                root.switch-requested(row.workset-id);
+                            }
+                        }
+
                         HorizontalLayout {
                             padding: Theme.space-sm;
                             spacing: Theme.space-sm;
@@ -380,12 +393,30 @@ export component QuickSwitcher inherits Window {
                                     vertical-alignment: center;
                                 }
                             }
-                        }
 
-                        TouchArea {
-                            clicked => {
-                                root.selected-index = i;
-                                root.switch-requested(row.workset-id);
+                            // Quit this set's apps without switching to it.
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 26px;
+                                    height: 26px;
+                                    border-radius: 13px;
+                                    background: quit-touch.pressed || quit-touch.has-hover ? Theme.danger : Theme.glass-panel-strong;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                                    // "×" (U+00D7): the font lacks U+2715.
+                                    Text {
+                                        text: "×";
+                                        font-size: 15px;
+                                        color: quit-touch.has-hover ? Theme.text-primary : Theme.text-tertiary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    quit-touch := TouchArea {
+                                        clicked => { root.close-workset-requested(row.workset-id); }
+                                    }
+                                }
                             }
                         }
                     }

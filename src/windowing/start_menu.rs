@@ -32,6 +32,14 @@ pub struct StartMenuApp {
     /// The shortcut's own arguments, if any (kept so a wrapper shortcut that
     /// passes flags still launches the way the user expects).
     pub args: String,
+    /// For a packaged (Store/MSIX) app, its Application User Model ID as the
+    /// shell reports it. `None` for an ordinary shortcut.
+    ///
+    /// Carried rather than re-derived because the application id is *not*
+    /// reliably `App`: Claude is `Claude_pzs8sxrjxfjjc!Claude`, Teams
+    /// `MSTeams_8wekyb3d8bbwe!MSTeams`. `launch_service::store_app_aumid`'s
+    /// guess only covers the common case; this is the real thing.
+    pub aumid: Option<String>,
 }
 
 /// The two Start Menu roots: the current user's and the all-users one.
@@ -58,8 +66,10 @@ fn start_menu_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Every Start Menu shortcut that resolves to an existing `.exe`, de-duplicated
-/// by target and sorted by name. Uninstallers and other noise are filtered out.
+/// Every app the "起動候補を登録" picker offers: each Start Menu shortcut that
+/// resolves to an existing `.exe`, plus every installed Store/MSIX app (which
+/// has no shortcut at all — see [`crate::windowing::store_apps`]). De-duplicated
+/// by target and sorted by name; uninstallers and other noise are filtered out.
 pub fn enumerate() -> Vec<StartMenuApp> {
     let mut shortcuts = Vec::new();
     for root in start_menu_roots() {
@@ -71,6 +81,17 @@ pub fn enumerate() -> Vec<StartMenuApp> {
         .filter_map(|link| resolve_shortcut(link))
         .filter(|app| !is_noise(&app.name))
         .collect();
+
+    apps.extend(
+        crate::windowing::store_apps::enumerate()
+            .into_iter()
+            .map(|app| StartMenuApp {
+                name: app.name,
+                target: app.executable,
+                args: String::new(),
+                aumid: Some(app.aumid),
+            }),
+    );
 
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps.dedup_by(|a, b| a.target == b.target && a.args == b.args);
@@ -152,6 +173,7 @@ fn resolve_shortcut(link_path: &Path) -> Option<StartMenuApp> {
         name: link_path.file_stem()?.to_string_lossy().into_owned(),
         target,
         args,
+        aumid: None,
     })
 }
 
