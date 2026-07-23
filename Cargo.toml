@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "repodeck-hook"
 path = "src/bin/repodeck-hook.rs"
 
+[[bin]]
+name = "repodeck-simtest"
+path = "src/bin/repodeck-simtest.rs"
+
 [dependencies]
 slint = { version = "1.17", features = ["system-tray", "raw-window-handle-06"] }
 serde = { version = "1", features = ["derive"] }

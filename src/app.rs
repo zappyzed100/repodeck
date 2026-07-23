@@ -41,7 +41,7 @@ use crate::domain::placement::SavedShowState;
 use crate::domain::workset::ParkingPolicy;
 use crate::hotkey::mouse_wheel_hook::MouseWheelHook;
 use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
-use crate::ipc::named_pipe::{NamedPipeServer, PipeServerEvent};
+use crate::ipc::named_pipe::{self, NamedPipeServer, PipeServerEvent};
 use crate::ipc::protocol;
 use crate::persistence::{clock, config_store, journal_store, runtime_store};
 use crate::windowing::autostart;
@@ -3953,6 +3953,31 @@ fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
     }
 }
 
+/// Handles one command from the env-gated test-control pipe, on the UI thread.
+/// Only `switch <workset-uuid>` is understood today: it re-enters the fully-wired
+/// Quick-Switcher switch path (relaunch, journal, rollback, tray refresh) exactly
+/// as a user selection would, so a soak-test driver exercises the real code path.
+fn handle_test_control(bytes: &[u8]) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let command = text.trim();
+    let Some(rest) = command.strip_prefix("switch ") else {
+        tracing::warn!(target: "switch", command = %command, "test-control: unknown command");
+        return;
+    };
+    let id = rest.trim();
+    if uuid::Uuid::parse_str(id).is_err() {
+        tracing::warn!(target: "switch", arg = %id, "test-control: switch arg is not a uuid");
+        return;
+    }
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        tracing::info!(target: "switch", workset = %id, "test-control: switch requested");
+        switcher.invoke_switch_requested(id.into());
+    }
+}
+
 /// Send-safe projection of `ipc::named_pipe::PipeServerEvent::MessageReceived`,
 /// built on the pipe server's accept thread and handled on the UI thread via
 /// `slint::invoke_from_event_loop` — same shape as `HotkeyUiEvent`. Carries
@@ -4624,6 +4649,29 @@ pub fn run() -> Result<()> {
             tracing::warn!(error = %err, "failed to start the Codex agent-event named pipe server");
             None
         }
+    };
+
+    // Env-gated test-control pipe: only bound when `REPODECK_TEST_CONTROL` is
+    // set, letting an external soak-test driver command switches by workset id
+    // through the fully-wired switch path (journal, relaunch, rollback) without
+    // the UI. Never active in normal operation.
+    let _test_control_server = if std::env::var_os("REPODECK_TEST_CONTROL").is_some() {
+        match NamedPipeServer::spawn_on(named_pipe::TEST_CONTROL_PIPE_NAME, |event| {
+            if let PipeServerEvent::MessageReceived(bytes) = event {
+                let _ = slint::invoke_from_event_loop(move || handle_test_control(&bytes));
+            }
+        }) {
+            Ok(server) => {
+                tracing::info!(target: "switch", pipe = named_pipe::TEST_CONTROL_PIPE_NAME, "test-control pipe active");
+                Some(server)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to start the test-control pipe");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let hotkey_thread = Rc::new(HotkeyThread::spawn(

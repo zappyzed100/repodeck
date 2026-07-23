@@ -32,6 +32,12 @@ use super::protocol::MAX_EVENT_BYTES;
 /// Exact pipe name Codex hooks / `repodeck-hook.exe` target (PLAN.md §6.4).
 pub const PIPE_NAME: &str = r"\\.\pipe\RepoDeck.AgentEvents.v1";
 
+/// Pipe name for the env-gated test-control channel (only bound when
+/// `REPODECK_TEST_CONTROL` is set). An external test driver writes newline-free
+/// text commands here (e.g. `switch <uuid>`) to drive real-machine switch
+/// soak-tests without the UI. Never bound in normal operation.
+pub const TEST_CONTROL_PIPE_NAME: &str = r"\\.\pipe\RepoDeck.TestControl.v1";
+
 /// Pipe security allowing the non-elevated hook to reach an elevated server.
 ///
 /// `repodeck.exe` self-elevates (see `windowing::elevation`), but Codex spawns
@@ -80,14 +86,25 @@ impl NamedPipeServer {
     /// one can't fail at spawn time — this one can, since pipe creation is
     /// itself fallible in a way hotkey registration's retry loop isn't).
     pub fn spawn(on_event: impl Fn(PipeServerEvent) + Send + 'static) -> std::io::Result<Self> {
-        let first_handle = SendHandle(create_pipe_instance(true).map_err(to_io_error)?);
+        Self::spawn_on(PIPE_NAME, on_event)
+    }
+
+    /// Same accept loop as [`Self::spawn`] but on an arbitrary pipe name — used
+    /// by the env-gated test-control pipe (see `app.rs`) so an external driver
+    /// can command switches without going through the UI. Inbound, message-mode,
+    /// same ACL as the agent-event pipe.
+    pub fn spawn_on(
+        pipe_name: &'static str,
+        on_event: impl Fn(PipeServerEvent) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let first_handle = SendHandle(create_pipe_instance(true, pipe_name).map_err(to_io_error)?);
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let thread_shutdown_flag = Arc::clone(&shutdown_flag);
 
         std::thread::spawn(move || {
             let first_handle = first_handle; // captured whole, see `SendHandle`'s doc comment.
-            run_accept_loop(first_handle.0, &thread_shutdown_flag, &on_event);
+            run_accept_loop(first_handle.0, pipe_name, &thread_shutdown_flag, &on_event);
         });
 
         Ok(Self { shutdown_flag })
@@ -108,6 +125,7 @@ impl Drop for NamedPipeServer {
 
 fn run_accept_loop(
     first_handle: HANDLE,
+    pipe_name: &str,
     shutdown_flag: &Arc<AtomicBool>,
     on_event: &(impl Fn(PipeServerEvent) + Send + 'static),
 ) {
@@ -148,7 +166,7 @@ fn run_accept_loop(
             let _ = CloseHandle(handle);
         }
 
-        match create_pipe_instance(false) {
+        match create_pipe_instance(false, pipe_name) {
             Ok(next) => handle = next,
             Err(err) => {
                 on_event(PipeServerEvent::ConnectionError(err.to_string()));
@@ -200,7 +218,7 @@ fn read_one_message(handle: HANDLE) -> PipeServerEvent {
 /// pipe of this name already exists anywhere on the system — a defense
 /// against another process squatting on this name before RepoDeck starts,
 /// only meaningful (and only valid to pass) on the very first instance.
-fn create_pipe_instance(first: bool) -> windows::core::Result<HANDLE> {
+fn create_pipe_instance(first: bool, pipe_name: &str) -> windows::core::Result<HANDLE> {
     let sddl = HSTRING::from(PIPE_SDDL);
     let mut psd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl` is a valid, null-terminated wide string; `psd` receives
@@ -220,7 +238,7 @@ fn create_pipe_instance(first: bool) -> windows::core::Result<HANDLE> {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
 
-    let name = HSTRING::from(PIPE_NAME);
+    let name = HSTRING::from(pipe_name);
     // SAFETY: `name` is a valid wide string; `sa` is a fully-initialized,
     // stack-local `SECURITY_ATTRIBUTES` whose descriptor stays valid for the
     // duration of this call (freed only after it returns).
