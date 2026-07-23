@@ -263,40 +263,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // windows that want the browser full-screen keys are sent them at the
         // very end (after the target is focused), so the keys land on the parked
         // video and the foreground still ends up on the new workset.
-        let mut fullscreen_hwnds: Vec<isize> = Vec::new();
-        let worksets_with_windows: std::collections::HashSet<Uuid> =
-            parking.iter().map(|(w, _)| w.id).collect();
-        // Clear any stale foreign window out of the outgoing set's sub cell first.
-        self.park_evictees(&sub_evictees, &request);
-        // Auto sets park by window (spec §2): pool all their windows and
-        // distribute them across the general parking monitors together, so a
-        // monitor is split by its actual window count. Sub/Fixed sets park into
-        // their designated area per-set. All non-target live sets are re-placed
-        // every switch, so nothing lingers at a stale size/position.
-        let mut auto_windows: Vec<isize> = Vec::new();
-        for (w, resolved) in &parking {
-            if matches!(w.parking_policy, ParkingPolicy::Auto) {
-                auto_windows.extend(resolved.iter().map(|r| r.hwnd));
-                continue;
-            }
-            tracing::info!(
-                target: "switch", workset = %w.name, windows = resolved.len(),
-                policy = ?w.parking_policy, "switch: parking set"
-            );
-            match self.park_workset(
-                w,
-                resolved,
-                &request,
-                &mut runtime.auto_slot_assignments,
-                &worksets_with_windows,
-            ) {
-                Ok(hwnds) => fullscreen_hwnds.extend(hwnds),
-                Err(reason) => return Err(self.rollback(journal, reason)),
-            }
-        }
-        self.park_auto_windows(&auto_windows, &request);
-
-        // Step 6: restore the target workset to its main placement.
+        // Order (確定 2026-07-23): FIRST bring the target set to the main screen
+        // (a brief overlap with the still-parked outgoing set is fine), and only
+        // THEN park everything else. The set you asked for appears immediately
+        // and the parked windows settle behind it.
         let mut outcomes = Vec::with_capacity(target_resolved.len());
         for resolved in &target_resolved {
             match resolve_main_restore(
@@ -326,9 +296,6 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             _ => target.fullscreen_when_parked,
         };
         // Restore each target window to its saved main rect and show state.
-        // Un-maximize → move → re-maximize with drift re-assertion
-        // (`set_placement`); `SetWindowPlacement` was tried and empirically
-        // ignores the rectangle for maximized windows (問題2, 2026-07-23).
         for (resolved, outcome) in target_resolved.iter().zip(&outcomes) {
             let maximized = outcome.show_state == SavedShowState::Maximized;
             tracing::info!(
@@ -344,6 +311,39 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                     .set_placement(resolved.hwnd, outcome.rect, maximized, false);
             }
         }
+
+        // Now park the outgoing set and every other non-target live set.
+        let mut fullscreen_hwnds: Vec<isize> = Vec::new();
+        let worksets_with_windows: std::collections::HashSet<Uuid> =
+            parking.iter().map(|(w, _)| w.id).collect();
+        // Clear any stale foreign window out of the outgoing set's sub cell first.
+        self.park_evictees(&sub_evictees, &request);
+        // Auto sets park by window (spec §2): pool all their windows and
+        // distribute them across the general parking monitors together. Sub/Fixed
+        // sets park into their designated area per-set. All non-target live sets
+        // are re-placed every switch, so nothing lingers at a stale size.
+        let mut auto_windows: Vec<isize> = Vec::new();
+        for (w, resolved) in &parking {
+            if matches!(w.parking_policy, ParkingPolicy::Auto) {
+                auto_windows.extend(resolved.iter().map(|r| r.hwnd));
+                continue;
+            }
+            tracing::info!(
+                target: "switch", workset = %w.name, windows = resolved.len(),
+                policy = ?w.parking_policy, "switch: parking set"
+            );
+            match self.park_workset(
+                w,
+                resolved,
+                &request,
+                &mut runtime.auto_slot_assignments,
+                &worksets_with_windows,
+            ) {
+                Ok(hwnds) => fullscreen_hwnds.extend(hwnds),
+                Err(reason) => return Err(self.rollback(journal, reason)),
+            }
+        }
+        self.park_auto_windows(&auto_windows, &request);
 
         // Step 7: restore Z-order (ascending `z_order`, frontmost last).
         let mut z_ordered: Vec<&ResolvedWindow> = target_resolved.iter().collect();
@@ -660,7 +660,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
     /// a 2-column sub occupying the right half) contributes its **unused cells**
     /// as parking regions, so the free half isn't wasted (spec §3 / 2026-07-23).
     /// A monitor a sub fully uses (split = One) contributes nothing.
-    fn general_parking_screens(&self, request: &SwitchRequest) -> Vec<PixelRect> {
+    fn general_parking_screens(&self, request: &SwitchRequest) -> Vec<(PixelRect, usize)> {
         use crate::application::layout_service::auto_split_cells;
         let mut screens = Vec::new();
         for m in request.live_monitors {
@@ -674,27 +674,29 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             {
                 continue;
             }
+            let wa = m.work_area_px;
             let subs_here: Vec<&SubScreen> = request
                 .sub_screens
                 .iter()
                 .filter(|s| s.monitor_ids.iter().any(|id| id == &m.device_name))
                 .collect();
             if subs_here.is_empty() {
-                screens.push(m.work_area_px);
+                screens.push((wa, screen_capacity(wa)));
                 continue;
             }
             // Free = the cells of this monitor's sub grid that no sub occupies.
-            // (Uses the first sub's split as the monitor's grid; same-split subs
-            // mark their own cell used.)
+            // Each free cell's capacity is capped so its cells never fall below
+            // the *whole* monitor's smallest cell (a free half of a QHD holds 2,
+            // not 4 → no 1/8, spec §2 「サブは例外」).
             let split = subs_here[0].split;
             let used: std::collections::HashSet<usize> = subs_here
                 .iter()
                 .filter(|s| s.split == split)
                 .map(|s| s.cell_index)
                 .collect();
-            for (i, cell) in auto_split_cells(m.work_area_px, split).into_iter().enumerate() {
+            for (i, cell) in auto_split_cells(wa, split).into_iter().enumerate() {
                 if !used.contains(&i) {
-                    screens.push(cell);
+                    screens.push((cell, capped_capacity(cell, wa)));
                 }
             }
         }
@@ -711,7 +713,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             return;
         }
         let screens = self.general_parking_screens(request);
-        let (placements, overflow) = distribute_parking(&screens, hwnds);
+        let (placements, overflow) = distribute_parking_capped(&screens, hwnds);
         for (hwnd, cell) in placements {
             // Skip a window already at its cell (from a previous switch). This
             // avoids re-issuing a placement — and its 2.5s re-assert loop — for
@@ -745,7 +747,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         }
         let screens = self.general_parking_screens(request);
         let hwnds: Vec<isize> = evictees.iter().map(|w| w.hwnd).collect();
-        let (placements, overflow) = distribute_parking(&screens, &hwnds);
+        let (placements, overflow) = distribute_parking_capped(&screens, &hwnds);
         for (hwnd, cell) in placements {
             self.window_ops.set_placement(hwnd, cell, false, true);
         }
@@ -1006,12 +1008,44 @@ pub fn distribute_parking(
     screens: &[PixelRect],
     windows: &[isize],
 ) -> (Vec<(isize, PixelRect)>, Vec<isize>) {
+    let capped: Vec<(PixelRect, usize)> =
+        screens.iter().map(|s| (*s, screen_capacity(*s))).collect();
+    distribute_parking_capped(&capped, windows)
+}
+
+/// The largest number of windows a *partial* parking region (a free cell of a
+/// monitor a sub only partly uses) may hold before its cells would fall below
+/// the parent monitor's own smallest cell (1/6 of a QHD, 1/4 of an HD). Without
+/// this, a free half of a QHD would be split into quarters — i.e. 1/8 of the
+/// whole monitor — which is smaller than the 1/6 minimum (spec §2: サブは例外,
+/// 2026-07-23). A full monitor (`region == monitor`) yields its `screen_capacity`.
+pub fn capped_capacity(region: PixelRect, monitor: PixelRect) -> usize {
+    let full_min = smallest_cell_area(monitor, screen_capacity(monitor));
+    let mut cap = 1;
+    for n in 1..=screen_capacity(region) {
+        if smallest_cell_area(region, n) >= full_min {
+            cap = n;
+        } else {
+            break;
+        }
+    }
+    cap
+}
+
+/// Distributes `windows` across `(region, capacity)` parking screens, balanced
+/// so each window stays as large as possible (`smallest_cell_area`), never
+/// exceeding a screen's given capacity. See `distribute_parking`; this variant
+/// lets a partial region carry a reduced capacity (`capped_capacity`).
+pub fn distribute_parking_capped(
+    screens: &[(PixelRect, usize)],
+    windows: &[isize],
+) -> (Vec<(isize, PixelRect)>, Vec<isize>) {
     let mut occupants: Vec<Vec<isize>> = vec![Vec::new(); screens.len()];
     let mut overflow = Vec::new();
     for &hwnd in windows {
         let best = (0..screens.len())
-            .filter(|&i| occupants[i].len() < screen_capacity(screens[i]))
-            .max_by_key(|&i| (smallest_cell_area(screens[i], occupants[i].len() + 1), -(i as i64)));
+            .filter(|&i| occupants[i].len() < screens[i].1)
+            .max_by_key(|&i| (smallest_cell_area(screens[i].0, occupants[i].len() + 1), -(i as i64)));
         match best {
             Some(i) => occupants[i].push(hwnd),
             None => overflow.push(hwnd),
@@ -1019,7 +1053,7 @@ pub fn distribute_parking(
     }
     let mut placements = Vec::new();
     for (i, occ) in occupants.iter().enumerate() {
-        for (hwnd, cell) in occ.iter().zip(subdivide_for_count(screens[i], occ.len())) {
+        for (hwnd, cell) in occ.iter().zip(subdivide_for_count(screens[i].0, occ.len())) {
             placements.push((*hwnd, cell));
         }
     }
@@ -1609,6 +1643,20 @@ mod tests {
                 .iter()
                 .all(|(_, r)| r.width < 1000 && r.height < 800)
         );
+    }
+
+    #[test]
+    fn capped_capacity_keeps_partial_regions_above_the_full_min_cell() {
+        let qhd = PixelRect::new(0, 0, 2560, 1440);
+        let hd = PixelRect::new(0, 0, 1920, 1080);
+        // A full monitor keeps its own capacity.
+        assert_eq!(capped_capacity(qhd, qhd), 6);
+        assert_eq!(capped_capacity(hd, hd), 4);
+        // A free HALF of a QHD holds 2, not 4 — otherwise its cells would be a
+        // quarter of the half = 1/8 of the monitor, below the 1/6 minimum.
+        assert_eq!(capped_capacity(PixelRect::new(0, 0, 1280, 1440), qhd), 2);
+        // A free half of an HD holds 2 (each 1/4 of the monitor, the HD minimum).
+        assert_eq!(capped_capacity(PixelRect::new(0, 0, 960, 1080), hd), 2);
     }
 
     #[test]
