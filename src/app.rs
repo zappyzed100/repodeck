@@ -1124,6 +1124,9 @@ struct WorksetManagerState {
     /// When set, the registration view is editing (re-registering) this
     /// existing workset rather than creating a new one.
     editing_workset_id: Option<uuid::Uuid>,
+    /// Start Menu apps offered by the "起動アプリを追加" picker, in the same
+    /// order as the UI's `app-catalog` names.
+    app_catalog: Vec<crate::windowing::start_menu::StartMenuApp>,
 }
 
 impl WorksetManagerState {
@@ -1140,8 +1143,136 @@ impl WorksetManagerState {
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
             editing_workset_id: None,
+            app_catalog: Vec::new(),
         }
     }
+}
+
+/// Pushes the Start Menu catalogue into the manager UI, (re)reading it from disk
+/// when it hasn't been loaded yet. Resolving a few hundred `.lnk` shortcuts is
+/// fast enough to do inline, and only happens when the manager is opened or the
+/// user asks for a refresh.
+fn refresh_app_catalog(
+    manager: &WorksetManager,
+    state: &mut WorksetManagerState,
+    force: bool,
+) {
+    if force || state.app_catalog.is_empty() {
+        state.app_catalog = crate::windowing::start_menu::enumerate();
+    }
+    let names: Vec<slint::SharedString> = state
+        .app_catalog
+        .iter()
+        .map(|app| app.name.clone().into())
+        .collect();
+    manager.set_app_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_app_selected_index(-1);
+    apply_app_selection(manager, state, -1);
+}
+
+/// Builds a `ManagedWindow` for an app chosen from the Start Menu catalogue.
+///
+/// The matcher pairs the executable with the shortcut's name as a title hint:
+/// the executable alone scores below the auto-rebind threshold, so the name is
+/// what actually lets the window bind once the app is running. Placement
+/// defaults to filling the next main monitor in order — there is no live window
+/// to capture yet, and "配置を再登録" refines it once there is.
+fn build_catalog_window(
+    app: &crate::windowing::start_menu::StartMenuApp,
+    input: &str,
+    existing_count: usize,
+    main_ids: &[String],
+) -> crate::domain::workset::ManagedWindow {
+    use crate::domain::placement::{NormalizedRect, PixelRect, SavedPlacement, SavedShowState};
+    use crate::domain::workset::{LaunchKind, ManagedWindow, WindowMatcher};
+
+    let input = input.trim();
+    let kind = launch_service::classify(&app.target);
+    let mut spec = match kind {
+        LaunchKind::VsCode => launch_service::build_launch_spec(
+            &app.target,
+            (!input.is_empty()).then(|| Path::new(input)),
+            None,
+        ),
+        LaunchKind::Browser => launch_service::build_launch_spec(
+            &app.target,
+            None,
+            (!input.is_empty()).then_some(input),
+        ),
+        LaunchKind::Generic => launch_service::build_launch_spec(&app.target, None, None),
+    };
+    // A generic app has no structured argument, so pass the field through as
+    // the shortcut's own command line would.
+    if kind == LaunchKind::Generic && !input.is_empty() {
+        spec.args = input.split_whitespace().map(str::to_string).collect();
+    }
+
+    let index = existing_count.min(main_ids.len().saturating_sub(1));
+    ManagedWindow {
+        id: uuid::Uuid::new_v4(),
+        matcher: WindowMatcher {
+            executable_path: app.target.clone(),
+            process_name: app
+                .target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            // Unknown until the window exists; the name carries the match.
+            window_class: String::new(),
+            registered_title: app.name.clone(),
+            title_contains: Some(app.name.clone()),
+            title_regex: None,
+        },
+        main_placement: SavedPlacement {
+            monitor_id: main_ids.get(index).cloned().unwrap_or_default(),
+            main_monitor_index: index,
+            normalized_rect: NormalizedRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            physical_rect_at_capture: PixelRect::new(0, 0, 0, 0),
+            show_state: SavedShowState::Maximized,
+        },
+        z_order: i32::try_from(existing_count).unwrap_or(0),
+        launch_spec: Some(spec),
+    }
+}
+
+/// Shows the one input the selected app actually needs: a folder/workspace for
+/// VS Code, a URL for a browser, free-form arguments for anything else.
+fn apply_app_selection(manager: &WorksetManager, state: &WorksetManagerState, index: i32) {
+    use crate::domain::workset::LaunchKind;
+    let Some(app) = usize::try_from(index)
+        .ok()
+        .and_then(|i| state.app_catalog.get(i))
+    else {
+        manager.set_app_kind_label("".into());
+        manager.set_app_input_visible(false);
+        manager.set_app_input_is_path(false);
+        manager.set_app_input_text("".into());
+        return;
+    };
+
+    let (kind_label, input_label, placeholder, is_path) =
+        match launch_service::classify(&app.target) {
+            LaunchKind::VsCode => (
+                "VS Code",
+                "フォルダー / ワークスペース",
+                "例: C:\\code\\myrepo（または .code-workspace）",
+                true,
+            ),
+            LaunchKind::Browser => ("ブラウザー", "URL", "例: https://example.com", false),
+            LaunchKind::Generic => ("アプリ", "引数（任意）", "例: --flag", false),
+        };
+    manager.set_app_kind_label(kind_label.into());
+    manager.set_app_input_label(input_label.into());
+    manager.set_app_input_placeholder(placeholder.into());
+    manager.set_app_input_visible(true);
+    manager.set_app_input_is_path(is_path);
+    // Seed with the shortcut's own arguments so a wrapper shortcut keeps working.
+    manager.set_app_input_text(app.args.clone().into());
 }
 
 /// Distinct workset colors offered at registration. A workset's color is its
@@ -1597,6 +1728,8 @@ fn wire_workset_manager(
         let mut state = s.borrow_mut();
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
         refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
+        // Load the Start Menu catalogue once, on first open.
+        refresh_app_catalog(&manager, &mut state, false);
     });
 
     let m = manager.as_weak();
@@ -1646,6 +1779,87 @@ fn wire_workset_manager(
             }
         }
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
+    });
+
+    // ---- 起動アプリを追加 (Start Menu catalogue) ----
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_app_catalog_refresh_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        refresh_app_catalog(&manager, &mut s.borrow_mut(), true);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_app_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        apply_app_selection(&manager, &s.borrow(), index);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_app_pick_path_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        // VS Code takes either a folder or a `.code-workspace` file, so offer
+        // the file picker first and fall back to a folder pick when cancelled.
+        let _ = &s;
+        let picked = rfd::FileDialog::new()
+            .add_filter("VS Code ワークスペース", &["code-workspace"])
+            .pick_file()
+            .or_else(|| rfd::FileDialog::new().pick_folder());
+        if let Some(path) = picked {
+            manager.set_app_input_text(path.display().to_string().into());
+        }
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    manager.on_add_app_confirmed(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let input = manager.get_app_input_text().to_string();
+        let index = manager.get_app_selected_index();
+
+        let added = {
+            let state = s.borrow();
+            let Some(app) = usize::try_from(index)
+                .ok()
+                .and_then(|i| state.app_catalog.get(i))
+                .cloned()
+            else {
+                manager.set_status_text("追加するアプリを選んでください。".into());
+                manager.set_status_is_warning(true);
+                return;
+            };
+            let Some(workset_index) = state.selected_workset_index else {
+                return;
+            };
+            let mut config = c.borrow_mut();
+            let main_ids = config.main_monitor_ids.clone();
+            let Some(workset) = config.worksets.get_mut(workset_index) else {
+                return;
+            };
+
+            let window = build_catalog_window(&app, &input, workset.windows.len(), &main_ids);
+            let name = app.name.clone();
+            workset.windows.push(window);
+            workset.updated_at = clock::now_rfc3339();
+            name
+        };
+
+        if let Err(err) = config_store::save(&dir, &c.borrow()) {
+            tracing::warn!(error = %err, "add-app: failed to save config");
+            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+        manager.set_status_text(
+            format!("「{added}」を追加しました。セット切り替え時に起動されます。").into(),
+        );
+        manager.set_status_is_warning(false);
+        let state = s.borrow();
         refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
     });
 

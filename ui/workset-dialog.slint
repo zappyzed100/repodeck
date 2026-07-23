@@ -1,4 +1,4 @@
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { GlassButton, GlassCheckbox, StatusBanner, Theme } from "theme.slint";
 
 export struct WorksetSummary {
@@ -99,6 +99,22 @@ export component WorksetManager inherits Window {
     callback fullscreen-toggled();
     callback parking-sub-selected(index: int);
     callback register-requested(name: string);
+
+    // 起動アプリを追加: pick an app from the Start Menu catalogue, then fill in
+    // the one input that app actually needs (folder/workspace for VS Code, URL
+    // for a browser, arguments otherwise) — the fields follow the selection.
+    in property <[string]> app-catalog: [];
+    in-out property <int> app-selected-index: -1;
+    in property <string> app-kind-label: "";
+    in property <string> app-input-label: "";
+    in property <string> app-input-placeholder: "";
+    in property <bool> app-input-visible: false;
+    in property <bool> app-input-is-path: false;
+    in-out property <string> app-input-text: "";
+    callback app-catalog-refresh-requested();
+    callback app-selected(index: int);
+    callback app-pick-path-requested();
+    callback add-app-confirmed();
 
     callback empty-main-screen-requested();
     callback empty-candidate-toggled(index: int);
@@ -227,6 +243,53 @@ export component WorksetManager inherits Window {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // 起動アプリを追加 — for apps with no visible window to pick
+                    // (tray-resident like CodexBar) or simply not running.
+                    if root.selected-workset-index >= 0: VerticalLayout {
+                        spacing: Theme.space-xs;
+                        HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            SectionLabel { text: "起動アプリを追加"; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text {
+                                text: root.app-kind-label;
+                                font-size: 11px;
+                                color: Theme.text-tertiary;
+                                vertical-alignment: center;
+                            }
+                            GlassButton {
+                                text: "一覧を更新";
+                                clicked => { root.app-catalog-refresh-requested(); }
+                            }
+                        }
+                        ComboBox {
+                            model: root.app-catalog;
+                            current-index <=> root.app-selected-index;
+                            selected => { root.app-selected(self.current-index); }
+                        }
+                        if root.app-input-visible: HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            LineEdit {
+                                placeholder-text: root.app-input-placeholder;
+                                text <=> root.app-input-text;
+                                horizontal-stretch: 1;
+                            }
+                            if root.app-input-is-path: GlassButton {
+                                text: "参照";
+                                clicked => { root.app-pick-path-requested(); }
+                            }
+                        }
+                        HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            GlassButton {
+                                text: "このセットに追加";
+                                primary: true;
+                                enabled: root.app-selected-index >= 0;
+                                clicked => { root.add-app-confirmed(); }
                             }
                         }
                     }
