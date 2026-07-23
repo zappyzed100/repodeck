@@ -1,13 +1,21 @@
-//! RepoDeck's normalized agent-event wire schema v1, and the Codex-hook-JSON
-//! adapter (PLAN.md §6.3, §6.4, §11).
+//! RepoDeck's normalized agent-event wire schema v1, and the coding-agent
+//! hook-JSON adapter (PLAN.md §6.3, §6.4, §11).
 //!
-//! This file is deliberately the *only* place that should need to change if
-//! Codex's own hook JSON schema shifts upstream (PLAN.md §6.3's own
+//! This file is deliberately the *only* place that should need to change if a
+//! supported agent's hook JSON schema shifts upstream (PLAN.md §6.3's own
 //! instruction) — [`NormalizedEvent`] is RepoDeck's stable internal shape;
-//! [`CodexHookEvent`] and [`parse_and_adapt`] are the volatile adapter layer.
+//! [`HookEvent`] and [`parse_and_adapt`] are the volatile adapter layer.
 //! Stateful interpretation (e.g. "was this turn pending input") belongs in
 //! `application::agent_status_service`, not here — this module stays a pure,
-//! stateless mapping from one Codex hook invocation to one normalized event.
+//! stateless mapping from one hook invocation to one normalized event.
+//!
+//! Two agents are supported natively, distinguished only by their hook field
+//! names and values (both send `session_id` + `cwd` + `hook_event_name` on
+//! stdin, so one struct covers both):
+//! - **Codex**: `UserPromptSubmit` / `PermissionRequest` / `PostToolUse` /
+//!   `Stop`, plus a `turn_id`.
+//! - **Claude Code**: `UserPromptSubmit` / `Notification` / `PostToolUse` /
+//!   `Stop`, no `turn_id` (it collapses to one run per session).
 
 use serde::{Deserialize, Serialize};
 
@@ -54,47 +62,57 @@ pub enum ProtocolError {
     UnrecognizedHookEvent(String),
 }
 
-/// Raw shape of Codex's own hook JSON (PLAN.md §6.3's field list). Kept
-/// separate from [`NormalizedEvent`] since it's the volatile side of the
-/// adapter. Deliberately has no `transcript_path` field at all — forwarding
-/// prompt content is structurally impossible here, not just avoided by
-/// convention (PLAN.md §6.3/§11's privacy requirement). Any other unknown
-/// JSON fields (including `transcript_path`, if present) are silently
-/// ignored by serde's default behavior, which PLAN.md §11 explicitly allows.
-/// `permission_mode` (also listed in PLAN.md §6.3's consumed-fields list) is
-/// deliberately not modeled here: nothing in §6.2's aggregation, §6.3's event
-/// mapping, or §6.7's notifications ever branches on it, and §6.4's own wire
-/// JSON example doesn't carry it either — same "ignored, not forwarded"
-/// treatment as any other field this adapter doesn't need, via serde's
-/// default unknown-field handling (PLAN.md §11).
+/// Raw shape of a coding agent's hook JSON (PLAN.md §6.3's field list),
+/// covering both Codex and Claude Code. Kept separate from [`NormalizedEvent`]
+/// since it's the volatile side of the adapter. `turn_id` is optional: Codex
+/// sends one, Claude Code does not (its events then share the empty turn id, so
+/// `agent_status_service` tracks one run per session — the correct behaviour for
+/// an agent without a per-turn identifier). Deliberately has no
+/// `transcript_path` field at all — forwarding prompt content is structurally
+/// impossible here, not just avoided by convention (PLAN.md §6.3/§11's privacy
+/// requirement). Any other unknown JSON fields (including `transcript_path` or
+/// Claude Code's `tool_name`, if present) are silently ignored by serde's
+/// default behavior, which PLAN.md §11 explicitly allows. `permission_mode`
+/// (also listed in PLAN.md §6.3's consumed-fields list) is deliberately not
+/// modeled here: nothing in §6.2's aggregation, §6.3's event mapping, or §6.7's
+/// notifications ever branches on it, and §6.4's own wire JSON example doesn't
+/// carry it either — same "ignored, not forwarded" treatment.
 #[derive(Debug, Deserialize)]
-struct CodexHookEvent {
+struct HookEvent {
     session_id: String,
+    #[serde(default)]
     turn_id: String,
     cwd: String,
     hook_event_name: String,
     model: Option<String>,
 }
 
-/// Parses one Codex hook invocation's JSON and adapts it to RepoDeck's
+/// Parses one agent hook invocation's JSON and adapts it to RepoDeck's
 /// normalized schema (PLAN.md §6.3). Enforces the 1 MiB cap before parsing.
+/// Accepts both Codex and Claude Code hook payloads (see the module docs).
 pub fn parse_and_adapt(raw: &[u8]) -> Result<NormalizedEvent, ProtocolError> {
     if raw.len() > MAX_EVENT_BYTES {
         return Err(ProtocolError::TooLarge { actual: raw.len() });
     }
-    let hook: CodexHookEvent = serde_json::from_slice(raw)?;
+    let hook: HookEvent = serde_json::from_slice(raw)?;
 
     let event = match hook.hook_event_name.as_str() {
         "UserPromptSubmit" => NormalizedEventKind::RunStarted,
-        "PermissionRequest" => NormalizedEventKind::NeedsInput,
+        // Codex asks for input via `PermissionRequest`; Claude Code via
+        // `Notification` — both mean "the agent is now waiting on the user".
+        "PermissionRequest" | "Notification" => NormalizedEventKind::NeedsInput,
         "PostToolUse" => NormalizedEventKind::ToolUseObserved,
         "Stop" => NormalizedEventKind::RunCompleted,
         other => return Err(ProtocolError::UnrecognizedHookEvent(other.to_string())),
     };
 
+    // Codex carries a per-turn id; Claude Code does not. Use it as the source
+    // label so downstream logs/telemetry can tell the two apart.
+    let source = if hook.turn_id.is_empty() { "claude" } else { "codex" };
+
     Ok(NormalizedEvent {
         schema_version: SCHEMA_VERSION,
-        source: "codex".to_string(),
+        source: source.to_string(),
         event,
         session_id: hook.session_id,
         turn_id: hook.turn_id,
@@ -157,6 +175,31 @@ mod tests {
             assert_eq!(event.session_id, "sess-1");
             assert_eq!(event.turn_id, "turn-1");
         }
+    }
+
+    #[test]
+    fn claude_code_event_without_turn_id_maps_and_is_labelled_claude() {
+        // Claude Code omits turn_id and uses `Notification` for "needs input".
+        let raw = serde_json::json!({
+            "session_id": "claude-sess",
+            "transcript_path": r"C:\x\t.jsonl",
+            "cwd": r"C:\repo",
+            "hook_event_name": "Notification",
+        })
+        .to_string()
+        .into_bytes();
+        let event = parse_and_adapt(&raw).unwrap();
+        assert_eq!(event.event, NormalizedEventKind::NeedsInput);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.turn_id, "");
+        assert_eq!(event.session_id, "claude-sess");
+    }
+
+    #[test]
+    fn codex_event_with_turn_id_is_labelled_codex() {
+        let event = parse_and_adapt(&valid_json("UserPromptSubmit")).unwrap();
+        assert_eq!(event.source, "codex");
+        assert_eq!(event.turn_id, "turn-1");
     }
 
     #[test]
