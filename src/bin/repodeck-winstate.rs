@@ -13,7 +13,7 @@
 //! (`repodeck-hook` -> named pipe -> `runtime.json`).
 //!
 //! Usage: `repodeck-winstate [--title repodeck] [--folder path] [--secs 30]
-//!        [--out path] [--data-dir path]`.
+//!        [--all-worksets] [--out path] [--data-dir path]`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ fn main() {
     let mut title = "repodeck".to_string();
     let mut secs = 30u64;
     let mut out: Option<String> = None;
+    let mut all_worksets = false;
     // Fallback folder for git when the VS Code open-folder capture returns
     // nothing (VS Code shares one process across windows, so a secondary window
     // has no folder on its command line). Defaults to the logger's cwd.
@@ -69,6 +70,9 @@ fn main() {
                 data_dir = args.get(i + 1).map(PathBuf::from);
                 i += 1;
             }
+            "--all-worksets" => {
+                all_worksets = true;
+            }
             _ => {}
         }
         i += 1;
@@ -85,10 +89,17 @@ fn main() {
         None => Box::new(std::io::stdout()),
     };
 
-    // One-shot "home dashboard" for the target repo: the full per-repository
-    // picture the home screen is meant to show, including the slower network
-    // fields (open PRs / CI) fetched once so they stay out of the 1s loop.
-    if let Some(folder) = folder_fallback.as_deref() {
+    // One-shot "home dashboard": the same repository fields the Quick
+    // Switcher shows. GitHub calls stay out of the 1s loop. `--all-worksets`
+    // gives Codex the complete RepoDeck home view; without it, only the target
+    // folder is projected.
+    if all_worksets {
+        if let Some(data_dir) = data_dir.as_deref() {
+            for line in all_worksets_dashboard(data_dir) {
+                let _ = writeln!(sink, "{line}");
+            }
+        }
+    } else if let Some(folder) = folder_fallback.as_deref() {
         for line in home_dashboard(Path::new(folder), data_dir.as_deref()) {
             let _ = writeln!(sink, "{line}");
         }
@@ -252,6 +263,90 @@ fn home_dashboard(folder: &Path, data_dir: Option<&Path>) -> Vec<String> {
     ]
 }
 
+/// One parse-friendly line per configured workset for Codex's RepoDeck home
+/// view. Repository probes run in parallel because each `gh` call has its own
+/// timeout and serial execution would multiply that timeout by the workset
+/// count.
+fn all_worksets_dashboard(data_dir: &Path) -> Vec<String> {
+    let config = match config_store::load(data_dir) {
+        Ok(Some(loaded)) => loaded.config,
+        Ok(None) => return vec!["repositories=[no-config]".into()],
+        Err(error) => return vec![format!("repositories=[config-error:{error}]")],
+    };
+    let worksets: Vec<_> = config
+        .worksets
+        .into_iter()
+        .filter(|workset| !workset.repository_path.as_os_str().is_empty())
+        .collect();
+
+    let rows = std::thread::scope(|scope| {
+        let handles: Vec<_> = worksets
+            .into_iter()
+            .map(|workset| {
+                scope.spawn(move || {
+                    let folder = repodeck::application::workset_service::resolve_match_path(
+                        &workset.repository_path,
+                        workset.repository_kind,
+                    );
+                    repository_dashboard_line(&workset.name, &folder, workset.sort_order, data_dir)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect::<Vec<_>>()
+    });
+
+    let mut lines = vec!["===== repositories (Quick Switcher projection) =====".into()];
+    let mut rows = rows;
+    rows.sort_by_key(|(sort_order, _)| *sort_order);
+    lines.extend(rows.into_iter().map(|(_, line)| line));
+    lines.push("====================================================".into());
+    lines
+}
+
+fn repository_dashboard_line(
+    name: &str,
+    folder: &Path,
+    sort_order: i32,
+    data_dir: &Path,
+) -> (i32, String) {
+    let git = git_status_service::fetch(folder);
+    let gh = gh_status_service::fetch(folder, git.branch.as_deref());
+    let (ci_symbol, ci_label) = gh.ci.symbol_label();
+    let ci = if gh.gh_available {
+        format!("{ci_symbol} {ci_label}")
+    } else {
+        "unavailable".into()
+    };
+    let pr = gh
+        .current_branch_pr
+        .as_ref()
+        .map(|pr| format!("#{}", pr.number))
+        .unwrap_or_else(|| "-".into());
+    let unpushed = if git.has_upstream {
+        git.ahead.to_string()
+    } else {
+        "no-upstream".into()
+    };
+    let (owners, last_agent_activity) = agent_owners_and_activity(data_dir, folder);
+
+    (
+        sort_order,
+        format!(
+            "repo={name:?} path={:?} branch={:?} changed={} unpushed={} open_prs={} pr={pr:?} ci={ci:?} gh_available={} owners={owners:?} last_commit={:?} last_agent_activity={last_agent_activity:?}",
+            folder.display().to_string(),
+            git.branch.as_deref().unwrap_or("-"),
+            git.changed_count,
+            unpushed,
+            gh.open_pr_count,
+            gh.gh_available,
+            git.last_commit_at.as_deref().unwrap_or("-"),
+        ),
+    )
+}
+
 /// Git projection produced by the exact service used to fill Quick Switcher.
 fn git_state(folder: &Path) -> String {
     let git = git_status_service::fetch(folder);
@@ -303,8 +398,13 @@ fn agent_state(data_dir: &Path, folder: &Path) -> String {
         .iter()
         .filter(|run| run.workset_id == workset_id)
         .map(|run| {
+            let owner = if run.turn_id.is_empty() {
+                "Claude"
+            } else {
+                "Codex"
+            };
             format!(
-                "{}:{}={:?}",
+                "{owner}/{}:{}={:?}",
                 run.session_id,
                 if run.turn_id.is_empty() {
                     "-"
@@ -318,6 +418,45 @@ fn agent_state(data_dir: &Path, folder: &Path) -> String {
         .join(",");
 
     format!("agent=[workset={workset_name:?} aggregate={aggregate:?} runs={runs:?}]")
+}
+
+fn agent_owners_and_activity(data_dir: &Path, folder: &Path) -> (String, String) {
+    let Ok(Some(loaded)) = config_store::load(data_dir) else {
+        return ("-".into(), "-".into());
+    };
+    let Some(workset_id) =
+        agent_status_service::map_event_to_workset(&loaded.config.worksets, folder)
+    else {
+        return ("-".into(), "-".into());
+    };
+    let runtime = runtime_store::load(data_dir);
+    let mut owners: Vec<&str> = runtime
+        .agent_runs
+        .iter()
+        .filter(|run| run.workset_id == workset_id)
+        .map(|run| {
+            if run.turn_id.is_empty() {
+                "Claude"
+            } else {
+                "Codex"
+            }
+        })
+        .collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let owners = if owners.is_empty() {
+        "-".into()
+    } else {
+        owners.join(",")
+    };
+    let last_activity = runtime
+        .agent_runs
+        .iter()
+        .filter(|run| run.workset_id == workset_id)
+        .map(|run| run.last_transition_at.as_str())
+        .max()
+        .unwrap_or("-");
+    (owners, last_activity.to_string())
 }
 
 fn window_rect(hwnd: HWND) -> Option<PixelRect> {
