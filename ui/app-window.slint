@@ -343,7 +343,7 @@ export component AppWindow inherits Window {
             }
 
             Text {
-                text: "Codex: hooks.jsonへ貼り、CLIの /hooks で4つのフックを信頼するまでイベントは届きません。Claude Code: ~/.claude/settings.json のhooksへ貼り、新しいセッションから有効になります。";
+                text: "Codex: hooks.jsonへ貼り、CLIの /hooks でフックを信頼するまでイベントは届きません。Claude Code: ~/.claude/settings.json のhooksへ貼り、新しいセッションから有効になります（PreToolUseで選択待ちも検知）。";
                 font-size: 11px;
                 color: Theme.text-tertiary;
                 wrap: word-wrap;

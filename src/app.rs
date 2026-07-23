@@ -4410,16 +4410,29 @@ fn build_hooks_json_snippet(hook_path: &Path, flavor: HookFlavor) -> String {
         HookFlavor::Codex => "PermissionRequest",
         HookFlavor::ClaudeCode => "Notification",
     };
-    let value = serde_json::json!({
-        "hooks": {
-            "UserPromptSubmit": [hook_group()],
-            needs_input_event: [hook_group()],
-            "PostToolUse": [hook_group()],
-            "Stop": [hook_group()],
-        }
+    let mut hooks = serde_json::json!({
+        "UserPromptSubmit": [hook_group()],
+        needs_input_event: [hook_group()],
+        "PostToolUse": [hook_group()],
+        "Stop": [hook_group()],
     });
 
-    serde_json::to_string_pretty(&value).unwrap_or_default()
+    // Claude Code は選択プロンプト（AskUserQuestion）に `Notification` を撃たない。
+    // その実行直前の `PreToolUse` を、対話ツールだけに絞る `matcher` 付きで拾い、
+    // 「選択待ち（入力待ち）」を検知する。matcher でツールを限定するので、通常の
+    // ツール実行ごとに毎回フックが起動することはない。
+    if flavor == HookFlavor::ClaudeCode {
+        hooks["PreToolUse"] = serde_json::json!([{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [{
+                "type": "command",
+                command_key: command,
+                "timeout": 2,
+            }],
+        }]);
+    }
+
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap_or_default()
 }
 
 /// `%USERPROFILE%\.codex`, falling back to bare `%USERPROFILE%` if Codex
@@ -5956,9 +5969,10 @@ mod hook_snippet_tests {
         assert_eq!(cmd["timeout"], 2);
     }
 
-    /// Claude Codeスニペットは `command` キーと `Notification` を使う。
+    /// Claude Codeスニペットは `command` キーと `Notification` を使い、選択待ち
+    /// 検知用の `PreToolUse`（対話ツールに絞る matcher 付き）を含む。
     #[test]
-    fn claude_snippet_uses_command_and_notification() {
+    fn claude_snippet_uses_command_notification_and_pretooluse() {
         let s =
             build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::ClaudeCode);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -5968,19 +5982,35 @@ mod hook_snippet_tests {
         let cmd = &hooks["UserPromptSubmit"][0]["hooks"][0];
         assert_eq!(cmd["command"], r#""C:\x\repodeck-hook.exe""#);
         assert!(cmd.get("commandWindows").is_none());
+        // PreToolUse は対話ツールだけに絞る matcher 付き。
+        assert_eq!(
+            hooks["PreToolUse"][0]["matcher"],
+            "AskUserQuestion|ExitPlanMode"
+        );
     }
 
-    /// どちらも4イベントを持ち、有効なJSONである。
+    /// Codexは4イベント、Claude Codeは選択待ち検知用のPreToolUseを加えた5イベント。
     #[test]
-    fn both_flavors_cover_all_four_lifecycle_events() {
-        for flavor in [HookFlavor::Codex, HookFlavor::ClaudeCode] {
-            let s = build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), flavor);
-            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-            let hooks = v["hooks"].as_object().unwrap();
-            assert_eq!(hooks.len(), 4, "expected exactly 4 hook events");
-            assert!(hooks.contains_key("UserPromptSubmit"));
-            assert!(hooks.contains_key("PostToolUse"));
-            assert!(hooks.contains_key("Stop"));
+    fn each_flavor_covers_its_lifecycle_events() {
+        let codex =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::Codex);
+        let codex: serde_json::Value = serde_json::from_str(&codex).unwrap();
+        assert_eq!(codex["hooks"].as_object().unwrap().len(), 4);
+        assert!(codex["hooks"].get("PreToolUse").is_none());
+
+        let claude =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::ClaudeCode);
+        let claude: serde_json::Value = serde_json::from_str(&claude).unwrap();
+        let hooks = claude["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 5);
+        for k in [
+            "UserPromptSubmit",
+            "Notification",
+            "PostToolUse",
+            "Stop",
+            "PreToolUse",
+        ] {
+            assert!(hooks.contains_key(k), "missing {k}");
         }
     }
 }

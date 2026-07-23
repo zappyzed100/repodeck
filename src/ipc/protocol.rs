@@ -85,6 +85,19 @@ struct HookEvent {
     cwd: String,
     hook_event_name: String,
     model: Option<String>,
+    /// Claude Code の `PreToolUse` が実行しようとしているツール名。選択待ちを
+    /// 表す対話ツール（`AskUserQuestion`/`ExitPlanMode`）を見分けるためだけに読む。
+    /// 他のイベントでは無い。
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
+/// ユーザーの選択・承認を待つ対話ツールか。これらの `PreToolUse` は「今まさに
+/// ユーザー入力待ち」を意味する。Claude Code は選択プロンプト（AskUserQuestion）に
+/// 対して `Notification` を撃たないため、この `PreToolUse` が唯一の検知手段
+/// （ユーザー報告 2026-07-24：選択待ちが「実行中」のままだった）。
+fn is_user_wait_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "AskUserQuestion" | "ExitPlanMode")
 }
 
 /// Parses one agent hook invocation's JSON and adapts it to RepoDeck's
@@ -101,6 +114,12 @@ pub fn parse_and_adapt(raw: &[u8]) -> Result<NormalizedEvent, ProtocolError> {
         // Codex asks for input via `PermissionRequest`; Claude Code via
         // `Notification` — both mean "the agent is now waiting on the user".
         "PermissionRequest" | "Notification" => NormalizedEventKind::NeedsInput,
+        // 対話ツール（AskUserQuestion/ExitPlanMode）の実行直前は「選択待ち」。
+        // それ以外の `PreToolUse` はツール実行の開始＝稼働中の合図として扱う。
+        "PreToolUse" => match hook.tool_name.as_deref() {
+            Some(name) if is_user_wait_tool(name) => NormalizedEventKind::NeedsInput,
+            _ => NormalizedEventKind::ToolUseObserved,
+        },
         "PostToolUse" => NormalizedEventKind::ToolUseObserved,
         "Stop" => NormalizedEventKind::RunCompleted,
         other => return Err(ProtocolError::UnrecognizedHookEvent(other.to_string())),
@@ -179,6 +198,38 @@ mod tests {
             assert_eq!(event.session_id, "sess-1");
             assert_eq!(event.turn_id, "turn-1");
         }
+    }
+
+    #[test]
+    fn pre_tool_use_of_an_interactive_tool_maps_to_needs_input() {
+        // AskUserQuestion / ExitPlanMode の実行直前＝ユーザーの選択待ち。
+        // Claude CodeはこれらにNotificationを撃たないので、PreToolUseで拾う。
+        for tool in ["AskUserQuestion", "ExitPlanMode"] {
+            let raw = serde_json::json!({
+                "session_id": "claude-sess",
+                "cwd": r"C:\repo",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+            })
+            .to_string()
+            .into_bytes();
+            let event = parse_and_adapt(&raw).unwrap();
+            assert_eq!(event.event, NormalizedEventKind::NeedsInput, "tool={tool}");
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_of_a_normal_tool_is_activity_not_needs_input() {
+        let raw = serde_json::json!({
+            "session_id": "claude-sess",
+            "cwd": r"C:\repo",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+        })
+        .to_string()
+        .into_bytes();
+        let event = parse_and_adapt(&raw).unwrap();
+        assert_eq!(event.event, NormalizedEventKind::ToolUseObserved);
     }
 
     #[test]
