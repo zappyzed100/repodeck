@@ -8,7 +8,9 @@ use crate::application::layout_service::auto_split_cells;
 use crate::application::monitor_resolution::{
     find_live_monitor_by_stable_id, sort_monitors_reading_order,
 };
-use crate::application::switch_coordinator::{screen_capacity, subdivide_for_count};
+use crate::application::switch_coordinator::{
+    screen_capacity, smallest_cell_area, subdivide_for_count,
+};
 use crate::domain::monitor::{AutoSplit, SavedMonitor};
 use crate::domain::placement::PixelRect;
 use crate::domain::workset::{FixedParkingSlot, ParkingPolicy, Workset};
@@ -204,44 +206,26 @@ pub fn allocate_parking(input: &AllocationInput) -> AllocationResult {
         }
     };
 
-    // Distribute worksets across monitors so total parked area is maximised:
-    // light up the largest empty monitor first (never shrink a window while a
-    // screen is empty), then the monitor whose next cell stays largest
-    // (`area/(count+1)`). Same rule as `switch_coordinator::distribute_parking`.
-    let index_by_id: HashMap<&str, usize> = auto_monitors
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.device_name.as_str(), i))
-        .collect();
+    // Distribute worksets across monitors so cells stay as large and even as
+    // possible: each set goes to the monitor whose SMALLEST resulting cell would
+    // be largest (`smallest_cell_area` after adding it). An empty monitor's
+    // smallest cell is the whole screen, so empties fill first (largest first);
+    // once every monitor holds one, a second set goes to whichever keeps the
+    // biggest cell — which balances the load instead of piling onto the largest
+    // screen and leaving a set at 1/4 while another monitor still has a free half
+    // (2026-07-23). This is deterministic (worksets in sort order), so a set
+    // lands on the same monitor across switches without an explicit stability
+    // pass, as long as the live set is unchanged.
     let mut occupants: Vec<Vec<&Workset>> = vec![Vec::new(); auto_monitors.len()];
     let mut placed: HashSet<Uuid> = HashSet::new();
-
-    // Stability (§4.4 step 5): keep a workset on its previous monitor when that
-    // monitor is still an auto target with spare capacity, so windows don't
-    // needlessly jump screens between switches.
     for workset in &auto_pool {
-        if let Some(previous) = input.previous_assignments.get(&workset.id)
-            && let Some(&i) = index_by_id.get(previous.monitor_id.as_str())
-            && occupants[i].len() < capacity(&auto_monitors[i])
-        {
-            occupants[i].push(workset);
-            placed.insert(workset.id);
-        }
-    }
-
-    for workset in &auto_pool {
-        if placed.contains(&workset.id) {
-            continue;
-        }
         let best = (0..auto_monitors.len())
             .filter(|&i| occupants[i].len() < capacity(&auto_monitors[i]))
             .max_by_key(|&i| {
-                let area = i64::from(auto_monitors[i].work_area_px.width)
-                    * i64::from(auto_monitors[i].work_area_px.height);
-                let count = occupants[i].len() as i64;
-                let lights_up = count == 0;
-                let metric = if lights_up { area } else { area / (count + 1) };
-                (lights_up, metric, -(i as i64))
+                (
+                    smallest_cell_area(auto_monitors[i].work_area_px, occupants[i].len() + 1),
+                    -(i as i64),
+                )
             });
         // No monitor with room → left unplaced, minimized below.
         if let Some(i) = best {
@@ -314,11 +298,15 @@ mod tests {
     use crate::domain::monitor::AutoSplit;
 
     fn monitor(device_name: &str, x: i32, work_width: i32) -> MonitorInfo {
+        monitor_wh(device_name, x, work_width, 1080)
+    }
+
+    fn monitor_wh(device_name: &str, x: i32, w: i32, h: i32) -> MonitorInfo {
         MonitorInfo {
             handle: 0,
             device_name: device_name.to_string(),
-            bounds_px: PixelRect::new(x, 0, work_width, 1080),
-            work_area_px: PixelRect::new(x, 0, work_width, 1080),
+            bounds_px: PixelRect::new(x, 0, w, h),
+            work_area_px: PixelRect::new(x, 0, w, h),
             dpi_x: 96,
             dpi_y: 96,
             is_primary: x == 0,
@@ -659,18 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn stable_previous_assignment_is_kept_over_a_different_first_fit_choice() {
+    fn auto_slots_are_assigned_deterministically_in_sort_order() {
+        // Stability pass dropped (2026-07-23): assignments are a deterministic
+        // function of the live set, so two Auto worksets on one 2-column monitor
+        // land in sort order (a→cell 0, b→cell 1). A stale previous assignment
+        // must NOT override that — a set only relocates when it is next parked,
+        // and always to the balanced best spot.
         let live = vec![monitor("MAIN", 0, 1920), monitor("SIDE", 1920, 1920)];
         let saved = vec![saved_monitor("SIDE", AutoSplit::TwoColumns)];
         let a = auto_workset(0);
         let b = auto_workset(1);
         let worksets = vec![a.clone(), b.clone()];
-        let main_monitor_ids = vec!["MAIN".to_string()];
 
-        // `b` previously held cell 0 — the cell plain First-Fit (which visits
-        // worksets in `sort_order`, so `a` before `b`) would otherwise hand to
-        // `a`. Stability must override that and keep `b` on cell 0, pushing
-        // `a` onto cell 1 instead.
         let mut previous = HashMap::new();
         previous.insert(
             b.id,
@@ -684,7 +672,7 @@ mod tests {
             worksets: &worksets,
             current_workset_id: None,
             fixed_slots: &[],
-            main_monitor_ids: &main_monitor_ids,
+            main_monitor_ids: &["MAIN".to_string()],
             live_monitors: &live,
             saved_monitors: &saved,
             sub_screen_monitor_ids: &[],
@@ -700,7 +688,7 @@ mod tests {
             AutoSplit::TwoColumns,
         );
         assert_eq!(
-            result.assignments[&b.id],
+            result.assignments[&a.id],
             ParkAssignment::AutoSlot {
                 slot: ParkingSlotId {
                     monitor_id: "SIDE".to_string(),
@@ -710,7 +698,7 @@ mod tests {
             }
         );
         assert_eq!(
-            result.assignments[&a.id],
+            result.assignments[&b.id],
             ParkAssignment::AutoSlot {
                 slot: ParkingSlotId {
                     monitor_id: "SIDE".to_string(),
@@ -719,6 +707,135 @@ mod tests {
                 rect: side_cells[1]
             }
         );
+    }
+
+    // Two HD monitors + one QHD, plus the main — the reported real topology.
+    fn mixed_parking_topology() -> Vec<MonitorInfo> {
+        vec![
+            monitor_wh("MAIN", 0, 1920, 1080),
+            monitor_wh("HD1", 1920, 1920, 1080),
+            monitor_wh("HD2", 3840, 1920, 1080),
+            monitor_wh("QHD", 5760, 2560, 1440),
+        ]
+    }
+
+    fn simulate(
+        worksets: &[Workset],
+        live: &[MonitorInfo],
+        target: Option<Uuid>,
+        with_windows: &HashSet<Uuid>,
+    ) -> AllocationResult {
+        allocate_parking(&AllocationInput {
+            worksets,
+            current_workset_id: target,
+            fixed_slots: &[],
+            main_monitor_ids: &["MAIN".to_string()],
+            live_monitors: live,
+            saved_monitors: &[], // all 「自動」 → size-based capacity
+            sub_screen_monitor_ids: &[],
+            previous_assignments: &HashMap::new(),
+            worksets_with_windows: with_windows,
+        })
+    }
+
+    fn assigned_cells(result: &AllocationResult, worksets: &[Workset]) -> Vec<PixelRect> {
+        worksets
+            .iter()
+            .filter_map(|w| match result.assignments.get(&w.id) {
+                Some(ParkAssignment::AutoSlot { rect, .. }) => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn any_overlap(cells: &[PixelRect]) -> bool {
+        for (i, a) in cells.iter().enumerate() {
+            for b in &cells[i + 1..] {
+                if a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn simulation_six_live_sets_balance_2_2_2_with_no_quarter_cells() {
+        // Six live Auto sets on two HD + one QHD parking monitor must spread
+        // 2+2+2 — every set at least a half — NOT pile three onto the QHD and
+        // shrink one to a quarter while an HD still had a free half (2026-07-23).
+        let live = mixed_parking_topology();
+        let worksets: Vec<Workset> = (0..6).map(auto_workset).collect();
+        let ids = all_ids(&worksets);
+
+        let result = simulate(&worksets, &live, None, &ids);
+
+        let mut per_monitor: HashMap<String, usize> = HashMap::new();
+        let mut min_cell = i64::MAX;
+        for w in &worksets {
+            if let ParkAssignment::AutoSlot { slot, rect } = &result.assignments[&w.id] {
+                *per_monitor.entry(slot.monitor_id.clone()).or_default() += 1;
+                min_cell = min_cell.min(i64::from(rect.width) * i64::from(rect.height));
+            }
+        }
+        assert_eq!(per_monitor.len(), 3, "all three parking monitors are used");
+        for (mon, count) in &per_monitor {
+            assert_eq!(*count, 2, "{mon} holds a balanced 2 sets");
+        }
+        // Smallest cell is at least a half of an HD monitor — no quarters.
+        assert!(
+            min_cell >= i64::from(960 * 1080),
+            "no set smaller than a half-monitor; smallest was {min_cell}"
+        );
+        assert!(!any_overlap(&assigned_cells(&result, &worksets)));
+    }
+
+    #[test]
+    fn simulation_fifteen_sets_switch_through_every_one_without_overlap() {
+        // Register 15 Auto sets and "switch" to each in turn (it is the target,
+        // excluded from parking; the other 14 park). Capacity is 4+4+6 = 14, so
+        // every non-target set gets a distinct, non-overlapping cell each time.
+        let live = mixed_parking_topology();
+        let worksets: Vec<Workset> = (0..15).map(auto_workset).collect();
+        let ids = all_ids(&worksets);
+
+        for target in &worksets {
+            let result = simulate(&worksets, &live, Some(target.id), &ids);
+            let cells = assigned_cells(&result, &worksets);
+            assert_eq!(
+                cells.len(),
+                14,
+                "all 14 non-target sets are parked when switching to {}",
+                target.name
+            );
+            assert!(
+                !any_overlap(&cells),
+                "no two parked cells overlap when switching to {}",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_closed_apps_free_space_for_the_live_sets() {
+        // 15 registered sets but only 6 have live windows (the rest are closed).
+        // The 6 live ones must still spread 2+2+2 — the closed sets reserve
+        // nothing (2026-07-23 fix).
+        let live = mixed_parking_topology();
+        let worksets: Vec<Workset> = (0..15).map(auto_workset).collect();
+        let live_ids: HashSet<Uuid> = worksets.iter().take(6).map(|w| w.id).collect();
+
+        let result = simulate(&worksets, &live, None, &live_ids);
+
+        let cells = assigned_cells(&result, &worksets);
+        assert_eq!(cells.len(), 6, "only the six live sets are parked");
+        let min_cell = cells
+            .iter()
+            .map(|r| i64::from(r.width) * i64::from(r.height))
+            .min()
+            .unwrap();
+        assert!(min_cell >= i64::from(960 * 1080), "live sets get at least halves");
+        assert!(!any_overlap(&cells));
     }
 
     #[test]

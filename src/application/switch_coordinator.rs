@@ -892,24 +892,31 @@ pub fn subdivide_for_count(rect: PixelRect, count: usize) -> Vec<PixelRect> {
     }
 }
 
-/// Distributes `windows` across the available parking `screens` so the **sum of
-/// the resulting window areas is maximised**, subdividing each screen by how many
-/// windows it ends up holding (see `subdivide_for_count`), never stacking. Each
-/// screen's capacity depends on its size (`screen_capacity` — 4 for a 1080p-class
-/// monitor, 6 for QHD-class); any window beyond every screen's capacity is
-/// returned in the overflow list (to be minimized).
+/// The area of the *smallest* cell a region is cut into for `count` windows.
+/// Used to pick a parking screen by how large its worst cell would stay after
+/// adding one more window — the basis for a balanced distribution.
+pub fn smallest_cell_area(rect: PixelRect, count: usize) -> i64 {
+    subdivide_for_count(rect, count)
+        .iter()
+        .map(|r| i64::from(r.width) * i64::from(r.height))
+        .min()
+        .unwrap_or(0)
+}
+
+/// Distributes `windows` across the available parking `screens` so cells stay as
+/// large and even as possible, subdividing each screen by how many windows it
+/// ends up holding (see `subdivide_for_count`), never stacking. Each screen's
+/// capacity depends on its size (`screen_capacity` — 4 for a 1080p-class monitor,
+/// 6 for QHD-class); any window beyond every screen's capacity is returned in the
+/// overflow list (to be minimized).
 ///
-/// Because a screen's windows always *tile it completely*, the total parked area
-/// equals the sum of the areas of the screens that hold at least one window —
-/// independent of how many each holds. So maximising the sum means: light up an
-/// empty screen (largest first) in preference to adding to an already-occupied
-/// one, since the latter leaves the total unchanged. Among already-occupied
-/// screens (where the total no longer grows) the next window goes to the one that
-/// keeps windows largest — the greatest resulting cell area, `area / (count+1)`.
-///
-/// 確定仕様（development-plan.md「退避の優先順位ルール」, 2026-07-23）: 「空いてる
-/// 画面を面積の大きい順に優先」「既に入っていれば重ねず、次のセルが最大になる画面へ」
-/// 「QHDは3×2の6分割まで」。
+/// Each window goes to the screen whose **smallest resulting cell would be
+/// largest** (`smallest_cell_area` after adding it). An empty screen's smallest
+/// cell is the whole screen, so empty screens fill first, largest first; once
+/// every screen holds one, the next window goes to whichever keeps the biggest
+/// cell — which *balances* the load rather than piling onto the largest screen
+/// and leaving a window at 1/4 while another screen still has a free half
+/// (2026-07-23).
 pub fn distribute_parking(
     screens: &[PixelRect],
     windows: &[isize],
@@ -917,20 +924,9 @@ pub fn distribute_parking(
     let mut occupants: Vec<Vec<isize>> = vec![Vec::new(); screens.len()];
     let mut overflow = Vec::new();
     for &hwnd in windows {
-        // Among screens with room, pick the one that most increases the total
-        // parked area (see the doc comment): an empty screen (ranked by its full
-        // area) always beats an occupied one (ranked by its next cell size,
-        // `area / (count+1)`). Ties resolve to the earliest (reading-order)
-        // screen via `-index`.
         let best = (0..screens.len())
             .filter(|&i| occupants[i].len() < screen_capacity(screens[i]))
-            .max_by_key(|&i| {
-                let area = i64::from(screens[i].width) * i64::from(screens[i].height);
-                let count = occupants[i].len() as i64;
-                let lights_up = count == 0;
-                let metric = if lights_up { area } else { area / (count + 1) };
-                (lights_up, metric, -(i as i64))
-            });
+            .max_by_key(|&i| (smallest_cell_area(screens[i], occupants[i].len() + 1), -(i as i64)));
         match best {
             Some(i) => occupants[i].push(hwnd),
             None => overflow.push(hwnd),
@@ -1572,6 +1568,49 @@ mod tests {
         ];
         let evictees = stale_sub_occupants(cell, &incoming, &managed);
         assert_eq!(evictees, vec![20, 40]);
+    }
+
+    #[test]
+    fn simulation_sub_screen_sharers_tile_the_region_without_gaps() {
+        use crate::domain::config::SubScreen;
+
+        let sub = SubScreen {
+            id: Uuid::new_v4(),
+            name: "サブ".to_string(),
+            monitor_ids: vec!["SUB".to_string()],
+            split: AutoSplit::One,
+            cell_index: 0,
+            fullscreen: false,
+        };
+        let policy = ParkingPolicy::SubScreen {
+            sub_screen_id: sub.id,
+        };
+        let live = vec![monitor("SUB", 1920)];
+        let region = sub_screen_target_rect(&sub, &live).unwrap();
+        let region_area = i64::from(region.width) * i64::from(region.height);
+
+        // 1..=4 worksets sharing the sub-screen each get a cell; together the
+        // cells tile the region exactly — no overlaps, no gaps.
+        for n in 1..=4i32 {
+            let worksets: Vec<Workset> =
+                (0..n).map(|i| workset(i, policy.clone(), vec![])).collect();
+            let cells: Vec<PixelRect> = worksets
+                .iter()
+                .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live).unwrap())
+                .collect();
+            for (i, a) in cells.iter().enumerate() {
+                for b in &cells[i + 1..] {
+                    let overlap =
+                        a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                    assert!(!overlap, "{n} sharers: {a:?} overlaps {b:?}");
+                }
+            }
+            let covered: i64 = cells
+                .iter()
+                .map(|r| i64::from(r.width) * i64::from(r.height))
+                .sum();
+            assert_eq!(covered, region_area, "{n} sharers must tile the sub region exactly");
+        }
     }
 
     #[test]
