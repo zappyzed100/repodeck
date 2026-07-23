@@ -623,27 +623,50 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             .collect()
     }
 
-    /// The general parking monitors' work areas: every live monitor that is not
-    /// a main monitor, not a sub-screen monitor, and not excluded (spec §2/§5).
+    /// The general parking regions: every live monitor that is not a main
+    /// monitor and not excluded. A monitor a sub-screen only *partly* uses (e.g.
+    /// a 2-column sub occupying the right half) contributes its **unused cells**
+    /// as parking regions, so the free half isn't wasted (spec §3 / 2026-07-23).
+    /// A monitor a sub fully uses (split = One) contributes nothing.
     fn general_parking_screens(&self, request: &SwitchRequest) -> Vec<PixelRect> {
-        let sub_monitor_ids: std::collections::HashSet<&str> = request
-            .sub_screens
-            .iter()
-            .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
-            .collect();
-        request
-            .live_monitors
-            .iter()
-            .filter(|m| !request.main_monitor_ids.iter().any(|id| id == &m.device_name))
-            .filter(|m| {
-                !request
-                    .saved_monitors
-                    .iter()
-                    .any(|s| s.stable_id == m.device_name && s.excluded)
-            })
-            .filter(|m| !sub_monitor_ids.contains(m.device_name.as_str()))
-            .map(|m| m.work_area_px)
-            .collect()
+        use crate::application::layout_service::auto_split_cells;
+        let mut screens = Vec::new();
+        for m in request.live_monitors {
+            if request.main_monitor_ids.iter().any(|id| id == &m.device_name) {
+                continue;
+            }
+            if request
+                .saved_monitors
+                .iter()
+                .any(|s| s.stable_id == m.device_name && s.excluded)
+            {
+                continue;
+            }
+            let subs_here: Vec<&SubScreen> = request
+                .sub_screens
+                .iter()
+                .filter(|s| s.monitor_ids.iter().any(|id| id == &m.device_name))
+                .collect();
+            if subs_here.is_empty() {
+                screens.push(m.work_area_px);
+                continue;
+            }
+            // Free = the cells of this monitor's sub grid that no sub occupies.
+            // (Uses the first sub's split as the monitor's grid; same-split subs
+            // mark their own cell used.)
+            let split = subs_here[0].split;
+            let used: std::collections::HashSet<usize> = subs_here
+                .iter()
+                .filter(|s| s.split == split)
+                .map(|s| s.cell_index)
+                .collect();
+            for (i, cell) in auto_split_cells(m.work_area_px, split).into_iter().enumerate() {
+                if !used.contains(&i) {
+                    screens.push(cell);
+                }
+            }
+        }
+        screens
     }
 
     /// Parks Auto-policy windows **by window** (spec §2): pool every auto set's
@@ -658,6 +681,18 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let screens = self.general_parking_screens(request);
         let (placements, overflow) = distribute_parking(&screens, hwnds);
         for (hwnd, cell) in placements {
+            // Skip a window already at its cell (from a previous switch). This
+            // avoids re-issuing a placement — and its 2.5s re-assert loop — for
+            // every already-correct window each switch, which otherwise makes the
+            // parking monitors flicker as old and new re-assert threads compete.
+            let already_placed = request
+                .live_windows
+                .iter()
+                .find(|w| w.hwnd == hwnd)
+                .is_some_and(|w| roughly_at(w.rect_px, cell));
+            if already_placed {
+                continue;
+            }
             tracing::info!(
                 target: "parking", hwnd, cell = ?cell, windows = hwnds.len(),
                 "auto-park: place window into cell"
@@ -861,6 +896,19 @@ pub fn screen_capacity(rect: PixelRect) -> usize {
     } else {
         4
     }
+}
+
+/// Whether a window's current frame is essentially already at `target` (its
+/// desired visible cell). Loose tolerance: the frame includes the invisible DWM
+/// border (~8px), so an already-placed window sits slightly outside its visible
+/// cell — far tighter than the gap between two distinct cells, so different cells
+/// never compare equal. Used to skip re-placing already-correct parked windows.
+fn roughly_at(current: PixelRect, target: PixelRect) -> bool {
+    const TOL: i32 = 40;
+    (current.x - target.x).abs() <= TOL
+        && (current.y - target.y).abs() <= TOL
+        && (current.width - target.width).abs() <= TOL
+        && (current.height - target.height).abs() <= TOL
 }
 
 /// Cells for `count` windows on `rect`, using **equal-size grid cells** and

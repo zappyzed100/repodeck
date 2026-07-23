@@ -186,7 +186,7 @@ export component QuickSwitcher inherits Window {
                 }
             }
 
-            Rectangle {
+            list-clip := Rectangle {
                 vertical-stretch: 1;
                 clip: true;
                 // Wraps the row list so the mouse wheel moves the selection the
@@ -205,6 +205,18 @@ export component QuickSwitcher inherits Window {
                     VerticalLayout {
                         alignment: start;
                         spacing: Theme.space-xs;
+
+                        // Scroll so the selected row is always visible even with
+                        // more rows than fit (kept roughly centred). row-h = row
+                        // height (62) + inter-row spacing.
+                        property <length> row-h: 62px + Theme.space-xs;
+                        property <length> content-h: root.rows.length * self.row-h;
+                        y: -Math.clamp(
+                            Math.min(root.selected-index, root.rows.length) * self.row-h
+                                + self.row-h / 2 - list-clip.height / 2,
+                            0px,
+                            Math.max(0px, self.content-h - list-clip.height)
+                        );
 
                         for row[i] in root.rows: Rectangle {
                         height: 62px;
