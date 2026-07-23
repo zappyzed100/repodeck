@@ -430,11 +430,26 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy {
             let sub = request.sub_screens.iter().find(|s| s.id == *sub_screen_id);
             let target = sub.and_then(|s| {
-                sub_screen_slot_rect(s, request.worksets, workset.id, request.live_monitors)
+                sub_screen_slot_rect(
+                    s,
+                    request.worksets,
+                    workset.id,
+                    request.live_monitors,
+                    worksets_with_windows,
+                )
             });
-            // Full-screen only when this workset owns the whole area — a shared
-            // sub-screen can't have overlapping full-screen windows.
-            let sole_occupant = sub_screen_sharer_count(request.worksets, *sub_screen_id) <= 1;
+            // Full-screen only when this workset is the sole sharer *parking now*
+            // — a sub shared with another currently-parked set can't have
+            // overlapping full-screen windows.
+            let parked_sharers = request
+                .worksets
+                .iter()
+                .filter(|w| {
+                    matches!(&w.parking_policy, ParkingPolicy::SubScreen { sub_screen_id: id } if id == sub_screen_id)
+                })
+                .filter(|w| worksets_with_windows.contains(&w.id))
+                .count();
+            let sole_occupant = parked_sharers <= 1;
             let fullscreen = sole_occupant
                 && (workset.fullscreen_when_parked || sub.is_some_and(|s| s.fullscreen));
             return match target {
@@ -577,9 +592,26 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let Some(sub) = request.sub_screens.iter().find(|s| s.id == *sub_screen_id) else {
             return Vec::new();
         };
-        let Some(cell) =
-            sub_screen_slot_rect(sub, request.worksets, current.id, request.live_monitors)
-        else {
+        // Same sharer set the actual park uses (non-target sets with live
+        // windows), so the eviction cell matches where `current` will land.
+        let parking_sharers: std::collections::HashSet<Uuid> = request
+            .worksets
+            .iter()
+            .filter(|w| w.id != request.target_workset_id)
+            .filter(|w| {
+                w.windows.iter().any(|mw| {
+                    matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                })
+            })
+            .map(|w| w.id)
+            .collect();
+        let Some(cell) = sub_screen_slot_rect(
+            sub,
+            request.worksets,
+            current.id,
+            request.live_monitors,
+            &parking_sharers,
+        ) else {
             return Vec::new();
         };
 
@@ -1032,16 +1064,19 @@ pub fn sub_screen_sharer_count(worksets: &[Workset], sub_screen_id: Uuid) -> usi
 }
 
 /// The specific, non-overlapping cell of a sub-screen that `workset_id` parks
-/// into. Worksets sharing the same sub-screen are ordered by their position in
-/// `worksets`, so each keeps a stable cell across switches. Returns `None` when
-/// the sub-screen's monitors are all offline, `workset_id` does not park onto
-/// this sub-screen, or it exceeds the region's capacity (`screen_capacity` — 4
-/// for a small region, 6 for a QHD-class one → the caller minimizes it).
+/// into. The region is divided among only the sharers **actually parking now**
+/// (`parking_sharers` — those with live windows that aren't the active set), not
+/// every set that merely designates the sub. So a lone parking sharer uses the
+/// whole sub (its windows then split it), and two split it in half, etc. (spec
+/// §2/§3, 2026-07-23). Ordered by position in `worksets` for a stable cell.
+/// Returns `None` when the sub's monitors are offline, `workset_id` isn't
+/// parking here, or it exceeds capacity (→ caller minimizes it).
 pub fn sub_screen_slot_rect(
     sub: &SubScreen,
     worksets: &[Workset],
     workset_id: Uuid,
     live_monitors: &[MonitorInfo],
+    parking_sharers: &std::collections::HashSet<Uuid>,
 ) -> Option<PixelRect> {
     let region = sub_screen_target_rect(sub, live_monitors)?;
     let sharers: Vec<Uuid> = worksets
@@ -1052,6 +1087,7 @@ pub fn sub_screen_slot_rect(
                 ParkingPolicy::SubScreen { sub_screen_id } if *sub_screen_id == sub.id
             )
         })
+        .filter(|w| parking_sharers.contains(&w.id))
         .map(|w| w.id)
         .collect();
     let index = sharers.iter().position(|id| *id == workset_id)?;
@@ -1650,9 +1686,10 @@ mod tests {
         for n in 1..=4i32 {
             let worksets: Vec<Workset> =
                 (0..n).map(|i| workset(i, policy.clone(), vec![])).collect();
+            let all: std::collections::HashSet<Uuid> = worksets.iter().map(|w| w.id).collect();
             let cells: Vec<PixelRect> = worksets
                 .iter()
-                .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live).unwrap())
+                .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live, &all).unwrap())
                 .collect();
             for (i, a) in cells.iter().enumerate() {
                 for b in &cells[i + 1..] {
@@ -1696,10 +1733,11 @@ mod tests {
         let worksets: Vec<Workset> = (0..5).map(|i| workset(i, policy.clone(), vec![])).collect();
         // A non-main monitor at x=1920 so the sub has a live work area.
         let live = vec![monitor("SUB", 1920)];
+        let all: std::collections::HashSet<Uuid> = worksets.iter().map(|w| w.id).collect();
 
         let cells: Vec<Option<PixelRect>> = worksets
             .iter()
-            .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live))
+            .map(|w| sub_screen_slot_rect(&sub, &worksets, w.id, &live, &all))
             .collect();
 
         // First four get a cell; the fifth overflows to None (→ minimized).

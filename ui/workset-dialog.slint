@@ -7,6 +7,7 @@ export struct WorksetSummary {
     window_count: int,
     color: color,
     status_label: string,
+    parking_label: string,
 }
 
 export struct ManagedWindowSummary {
@@ -144,7 +145,7 @@ export component WorksetManager inherits Window {
                         VerticalLayout {
                             spacing: Theme.space-xs;
                             for w[i] in root.worksets: Rectangle {
-                                height: 58px;
+                                height: 72px;
                                 background: root.selected-workset-index == i ? Theme.glass-selected : Theme.glass-panel-soft;
                                 border-radius: Theme.radius-md;
                                 border-width: 2px;
@@ -155,6 +156,7 @@ export component WorksetManager inherits Window {
                                     padding: Theme.space-xs;
                                     Text { text: w.name; font-size: 12px; font-weight: 700; color: Theme.text-primary; }
                                     Text { text: w.repository_path; font-size: 10px; color: Theme.text-tertiary; wrap: no-wrap; overflow: elide; }
+                                    Text { text: w.parking_label; font-size: 10px; font-weight: 600; color: Theme.accent; }
                                     Text { text: w.status_label; font-size: 10px; color: Theme.text-secondary; }
                                 }
 

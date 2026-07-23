@@ -1318,6 +1318,20 @@ fn refresh_workset_summaries(
                 )
             };
 
+            let parking_label = match &workset.parking_policy {
+                ParkingPolicy::Auto => "退避先: 自動".to_string(),
+                ParkingPolicy::SubScreen { sub_screen_id } => {
+                    let name = config
+                        .sub_screens
+                        .iter()
+                        .find(|s| s.id == *sub_screen_id)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("不明なサブ");
+                    format!("退避先: サブ「{name}」")
+                }
+                ParkingPolicy::Fixed { .. } => "退避先: 固定枠".to_string(),
+            };
+
             WorksetSummary {
                 name: workset.name.clone().into(),
                 repository_path: if workset.repository_path.as_os_str().is_empty() {
@@ -1328,6 +1342,7 @@ fn refresh_workset_summaries(
                 window_count: workset.windows.len() as i32,
                 color: hex_to_color(&workset.color),
                 status_label: status_label.into(),
+                parking_label: parking_label.into(),
             }
         })
         .collect();
@@ -1967,12 +1982,26 @@ fn wire_workset_manager(
                             .iter()
                             .find(|s| s.id == *sub_screen_id)
                             .and_then(|sub| {
+                                let live_ids: std::collections::HashSet<uuid::Uuid> = config
+                                    .worksets
+                                    .iter()
+                                    .filter(|w| {
+                                        w.windows.iter().any(|mw| {
+                                            matches!(
+                                                decisions.get(&mw.id),
+                                                Some(MatchDecision::AutoRebind { .. })
+                                            )
+                                        })
+                                    })
+                                    .map(|w| w.id)
+                                    .collect();
                                 let slot =
                                     crate::application::switch_coordinator::sub_screen_slot_rect(
                                         sub,
                                         &config.worksets,
                                         workset.id,
                                         &live_monitors,
+                                        &live_ids,
                                     )?;
                                 // Full-screen only for a sole occupant — a shared
                                 // sub-screen can't have overlapping full windows.
@@ -2822,8 +2851,25 @@ fn compute_empty_main_destinations(
             .iter()
             .find(|s| s.id == *sub_screen_id)
             .and_then(|sub| {
-                let slot =
-                    sc::sub_screen_slot_rect(sub, &config.worksets, workset.id, live_monitors)?;
+                // Empty-main parks every registered window, so all live sets are
+                // the "parking sharers" that divide the sub.
+                let live_ids: std::collections::HashSet<uuid::Uuid> = config
+                    .worksets
+                    .iter()
+                    .filter(|w| {
+                        w.windows.iter().any(|mw| {
+                            matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                        })
+                    })
+                    .map(|w| w.id)
+                    .collect();
+                let slot = sc::sub_screen_slot_rect(
+                    sub,
+                    &config.worksets,
+                    workset.id,
+                    live_monitors,
+                    &live_ids,
+                )?;
                 let sole = sc::sub_screen_sharer_count(&config.worksets, *sub_screen_id) <= 1;
                 Some((
                     slot,
