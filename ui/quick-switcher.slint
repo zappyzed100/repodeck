@@ -39,8 +39,8 @@ export component QuickSwitcher inherits Window {
     icon: @image-url("../assets/repodeck-icon.svg");
     no-frame: true;
     always-on-top: true;
-    width: 680px;
-    height: 840px;
+    width: 820px;
+    height: 880px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -86,7 +86,7 @@ export component QuickSwitcher inherits Window {
 
             HorizontalLayout {
                 spacing: Theme.space-xs;
-                height: 32px;
+                height: 40px;
                 Rectangle {
                     border-radius: Theme.radius-md;
                     background: Theme.glass-panel-soft;
@@ -99,7 +99,7 @@ export component QuickSwitcher inherits Window {
                         x: Theme.space-sm;
                         text: "検索…";
                         color: Theme.text-tertiary;
-                        font-size: 13px;
+                        font-size: 15px;
                         vertical-alignment: center;
                     }
 
@@ -112,7 +112,7 @@ export component QuickSwitcher inherits Window {
                         width: parent.width - 2 * Theme.space-sm;
                         text <=> root.filter-text;
                         color: Theme.text-primary;
-                        font-size: 13px;
+                        font-size: 15px;
                         vertical-alignment: center;
                         single-line: true;
                         edited => { root.filter-changed(self.text); }
@@ -156,7 +156,7 @@ export component QuickSwitcher inherits Window {
                 }
 
                 manage-button := Rectangle {
-                    width: 92px;
+                    width: 104px;
                     border-radius: Theme.radius-md;
                     background: manage-touch.pressed || manage-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft;
                     border-width: 1px;
@@ -166,7 +166,7 @@ export component QuickSwitcher inherits Window {
                     Text {
                         text: "セット管理";
                         color: Theme.text-secondary;
-                        font-size: 12px;
+                        font-size: 14px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -224,7 +224,7 @@ export component QuickSwitcher inherits Window {
                         // Scroll so the selected row is always visible even with
                         // more rows than fit (kept roughly centred). row-h = row
                         // height (62) + inter-row spacing.
-                        property <length> row-h: 84px + Theme.space-xs;
+                        property <length> row-h: 104px + Theme.space-xs;
                         property <length> content-h: root.rows.length * self.row-h;
                         y: -Math.clamp(
                             Math.min(root.selected-index, root.rows.length) * self.row-h
@@ -234,7 +234,7 @@ export component QuickSwitcher inherits Window {
                         );
 
                         for row[i] in root.rows: Rectangle {
-                        height: 84px;
+                        height: 104px;
                         border-radius: Theme.radius-md;
                         // The up/down selection is shown by the accent border;
                         // the current workset by the filled background.
@@ -258,8 +258,8 @@ export component QuickSwitcher inherits Window {
                             spacing: Theme.space-sm;
 
                             Rectangle {
-                                width: 8px;
-                                border-radius: 4px;
+                                width: 10px;
+                                border-radius: 5px;
                                 background: row.color;
                             }
 
@@ -273,21 +273,21 @@ export component QuickSwitcher inherits Window {
                                     spacing: Theme.space-xs;
                                     Text {
                                         text: row.name;
-                                        font-size: 14px;
+                                        font-size: 18px;
                                         font-weight: 600;
                                         color: Theme.text-primary;
                                         overflow: elide;
                                     }
                                     if row.is-current: Text {
                                         text: "現在";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         font-weight: 700;
                                         color: Theme.accent;
                                         vertical-alignment: center;
                                     }
                                     if row.is-parking-target: Text {
                                         text: "固定枠";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                         vertical-alignment: center;
                                     }
@@ -313,13 +313,13 @@ export component QuickSwitcher inherits Window {
 
                                             Text {
                                                 text: row.agent-symbol;
-                                                font-size: row.agent-is-active ? 15px : 12px;
+                                                font-size: row.agent-is-active ? 19px : 15px;
                                                 color: row.agent-status-color;
                                                 vertical-alignment: center;
                                             }
                                             Text {
                                                 text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
-                                                font-size: row.agent-is-active ? 14px : 11px;
+                                                font-size: row.agent-is-active ? 17px : 14px;
                                                 font-weight: row.agent-is-active ? 700 : 400;
                                                 color: row.agent-is-active ? row.agent-status-color : Theme.text-secondary;
                                                 vertical-alignment: center;
@@ -334,38 +334,38 @@ export component QuickSwitcher inherits Window {
                                     spacing: Theme.space-xs;
                                     Text {
                                         text: row.branch-text == "" ? row.repository-name : row.branch-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: row.branch-text == "" ? Theme.text-secondary : Theme.text-primary;
                                         overflow: elide;
                                     }
                                     if row.changed-text != "": Text {
                                         text: "·";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     if row.changed-text != "": Text {
                                         text: row.changed-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     if row.unpushed-text != "": Text {
                                         text: "·";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     if row.unpushed-text != "": Text {
                                         text: row.unpushed-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.accent;
                                     }
                                     if row.last-commit-text != "": Text {
                                         text: "·";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     if row.last-commit-text != "": Text {
                                         text: row.last-commit-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
@@ -378,24 +378,24 @@ export component QuickSwitcher inherits Window {
                                     spacing: Theme.space-xs;
                                     if row.pr-text != "": Text {
                                         text: row.pr-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-secondary;
                                         vertical-alignment: center;
                                     }
                                     if row.pr-text != "" && row.ci-text != "": Text {
                                         text: "·";
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-tertiary;
                                     }
                                     if row.ci-text != "": Text {
                                         text: row.ci-symbol;
-                                        font-size: 12px;
+                                        font-size: 15px;
                                         color: row.ci-color;
                                         vertical-alignment: center;
                                     }
                                     if row.ci-text != "": Text {
                                         text: "CI " + row.ci-text;
-                                        font-size: 11px;
+                                        font-size: 14px;
                                         color: Theme.text-secondary;
                                         vertical-alignment: center;
                                     }
@@ -404,13 +404,13 @@ export component QuickSwitcher inherits Window {
                             }
 
                             if row.number-hint > 0: Rectangle {
-                                width: 20px;
-                                height: 20px;
-                                border-radius: 10px;
+                                width: 26px;
+                                height: 26px;
+                                border-radius: 13px;
                                 background: Theme.glass-panel-strong;
                                 Text {
                                     text: row.number-hint;
-                                    font-size: 11px;
+                                    font-size: 14px;
                                     color: Theme.text-secondary;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
@@ -421,16 +421,16 @@ export component QuickSwitcher inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 Rectangle {
-                                    width: 26px;
-                                    height: 26px;
-                                    border-radius: 13px;
+                                    width: 30px;
+                                    height: 30px;
+                                    border-radius: 15px;
                                     background: quit-touch.pressed || quit-touch.has-hover ? Theme.danger : Theme.glass-panel-strong;
                                     animate background { duration: Theme.duration-fast; easing: ease-out; }
 
                                     // "×" (U+00D7): the font lacks U+2715.
                                     Text {
                                         text: "×";
-                                        font-size: 15px;
+                                        font-size: 18px;
                                         color: quit-touch.has-hover ? Theme.text-primary : Theme.text-tertiary;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
@@ -451,7 +451,7 @@ export component QuickSwitcher inherits Window {
                 spacing: Theme.space-xs;
                 Text {
                     text: root.status-text;
-                    font-size: 12px;
+                    font-size: 14px;
                     color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
                     wrap: word-wrap;
                     horizontal-stretch: 1;
