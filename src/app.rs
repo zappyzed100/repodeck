@@ -1127,6 +1127,9 @@ struct PendingApp {
     app: crate::domain::workset::LaunchApp,
     /// Folder/workspace for VS Code, URL for a browser, arguments otherwise.
     input: String,
+    /// ウィンドウごとの起動引数（UIの「引数」欄）。既定は登録アプリの引数だが、
+    /// ここで上書きできる。ブラウザーを用途別に分ける `--user-data-dir` もここ。
+    extra_args: String,
     /// Index into `AppConfig.main_monitor_ids`.
     monitor_index: usize,
     /// How that monitor is divided, and which cell (reading order) this app takes.
@@ -1482,12 +1485,12 @@ fn build_launch_app_window(
     if kind == LaunchKind::Generic && !input.is_empty() {
         spec.args = input.split_whitespace().map(str::to_string).collect();
     }
-    // 起動候補に登録された既定引数を先頭に付ける。これがブラウザの
-    // `--user-data-dir=...` を通す経路で、用途ごとに独立した Brave を
-    // 「Brave - 開発」のような名前で登録して使えるようになる。
-    let registered = launch_service::split_registered_args(&app.args);
-    if !registered.is_empty() {
-        spec.args = [registered, std::mem::take(&mut spec.args)].concat();
+    // UIの「引数」欄の内容を先頭に付ける。既定値は登録アプリの引数だが、画面に
+    // 出ているのでウィンドウごとに変えられる。ブラウザーの `--user-data-dir=...`
+    // もここを通る（用途別に独立した Brave を扱うための経路）。
+    let extra = launch_service::split_registered_args(&pending.extra_args);
+    if !extra.is_empty() {
+        spec.args = [extra, std::mem::take(&mut spec.args)].concat();
     }
     // The registered AUMID is the shell's own, so it beats the one
     // `build_launch_spec` guesses from the install path (which assumes the
@@ -1573,31 +1576,68 @@ fn pending_from_managed_window(
             aumid: window.launch_spec.as_ref().and_then(|s| s.aumid.clone()),
         });
 
-    // Recover the declared input from the launch spec's arguments, dropping the
-    // flags `build_launch_spec` adds (`-n`, `--new-window`).
-    let input = window
-        .launch_spec
-        .as_ref()
-        .map_or_else(String::new, |spec| match spec.kind {
-            LaunchKind::VsCode | LaunchKind::Browser => spec
-                .args
-                .iter()
-                .find(|a| !a.starts_with('-'))
-                .cloned()
-                .unwrap_or_default(),
-            LaunchKind::Generic => spec.args.join(" "),
-        });
+    // 保存済みの起動引数から、UIの2つの欄（フォルダー/URL と 引数）を復元する。
+    // `build_launch_spec` が付ける定型フラグ（`-n` / `--new-window`）は、編集時に
+    // 再度付くので引数欄には出さない。
+    let (input, extra_args) = window.launch_spec.as_ref().map_or_else(
+        || (String::new(), String::new()),
+        |spec| {
+            let is_kind_flag =
+                |a: &String| matches!(a.as_str(), "-n" | "--new-window" | "-new-window");
+            match spec.kind {
+                LaunchKind::VsCode | LaunchKind::Browser => {
+                    let input = spec
+                        .args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .cloned()
+                        .unwrap_or_default();
+                    let extra: Vec<&String> = spec
+                        .args
+                        .iter()
+                        .filter(|a| a.starts_with('-') && !is_kind_flag(a))
+                        .collect();
+                    (input, join_args_for_display(&extra))
+                }
+                // 汎用アプリは入力欄も引数なので、まとめて引数欄へ出す。
+                LaunchKind::Generic => (
+                    String::new(),
+                    join_args_for_display(&spec.args.iter().collect::<Vec<_>>()),
+                ),
+            }
+        },
+    );
 
     let (split, cell_index) =
         layout_service::split_cell_from_normalized(window.main_placement.normalized_rect);
     PendingApp {
         app,
         input,
+        extra_args,
         monitor_index: window.main_placement.main_monitor_index,
         split,
         cell_index,
         minimize_when_parked: window.minimize_when_parked,
     }
+}
+
+/// 引数の配列を、UIの引数欄へ出せる1行にする。空白を含む引数は引用符で包むので、
+/// そのまま再度 `split_registered_args` に通しても元のトークンに戻る。
+fn join_args_for_display(args: &[&String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(' ') && !a.contains('"') {
+                // `--user-data-dir=D:\Brave Data\x` → `--user-data-dir="D:\Brave Data\x"`
+                match a.split_once('=') {
+                    Some((flag, value)) => format!("{flag}=\"{value}\""),
+                    None => format!("\"{a}\""),
+                }
+            } else {
+                (*a).clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Shows the one input the selected app actually needs: a folder/workspace for
@@ -1628,10 +1668,10 @@ fn apply_app_selection(manager: &WorksetManager, app: Option<&crate::domain::wor
     manager.set_app_input_placeholder(placeholder.into());
     manager.set_app_input_visible(true);
     manager.set_app_input_is_path(is_path);
-    // 起動候補に登録された既定引数は起動時に自動で付くので、ここへは入れない。
-    // 入れると Generic では二重に付き、VS Code / ブラウザーではフォルダー・URL 欄に
-    // 引数が混ざってしまう（ブラウザーなら `https://--user-data-dir=...` になる）。
+    // フォルダー/URL 欄は空から。引数は専用の「引数」欄へ、登録アプリの既定値を
+    // 初期表示する（何が付くのかが見え、ウィンドウごとに変えられる）。
     manager.set_app_input_text(slint::SharedString::new());
+    manager.set_app_args_text(app.args.clone().into());
 }
 
 /// Distinct workset colors offered at registration. A workset's color is its
@@ -2654,6 +2694,7 @@ fn wire_workset_manager(
     manager.on_add_app_confirmed(move || {
         let Some(manager) = m.upgrade() else { return };
         let input = manager.get_app_input_text().to_string();
+        let extra_args = manager.get_app_args_text().to_string();
         let index = manager.get_app_selected_index();
 
         let Some(app) = launch_app_at(&c.borrow(), index) else {
@@ -2681,6 +2722,7 @@ fn wire_workset_manager(
         state.pending_apps.push(PendingApp {
             app,
             input,
+            extra_args,
             monitor_index,
             split,
             cell_index,

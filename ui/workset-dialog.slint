@@ -132,6 +132,8 @@ export component WorksetManager inherits Window {
     in property <bool> app-input-visible: false;
     in property <bool> app-input-is-path: false;
     in-out property <string> app-input-text: "";
+    /// ウィンドウごとの起動引数。アプリ選択時に登録済みの既定引数が入る。
+    in-out property <string> app-args-text: "";
     in property <[string]> pending-apps: [];
     callback app-selected(index: int);
     // VS Code takes either a folder or a `.code-workspace` file. They get a
@@ -457,6 +459,25 @@ export component WorksetManager inherits Window {
                     if root.app-input-is-path: GlassButton {
                         text: "ワークスペースを選択";
                         clicked => { root.app-pick-workspace-requested(); }
+                    }
+                }
+
+                // 引数はウィンドウごとに指定する。起動候補の既定引数を初期値として
+                // 入れておくので「何が付くのか」が見えるし、ここで変えられる。
+                // ブラウザーを用途別に分ける --user-data-dir もここに書く。
+                if root.app-input-visible: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text {
+                        text: "引数";
+                        font-size: 11px;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: "例: --user-data-dir=\"D:\\BraveData\\開発\"";
+                        text <=> root.app-args-text;
+                        horizontal-stretch: 1;
                     }
                 }
                 // 配置プレビュー：画面名だけでは配置が分からないので、メイン画面を

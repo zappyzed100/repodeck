@@ -182,8 +182,7 @@ pub fn split_registered_args(raw: &str) -> Vec<String> {
 /// `--profile-directory` は同じ `--user-data-dir` の既存プロセスが窓を開くため、
 /// 窓の持ち主プロセスのコマンドラインには現れないことがある。判別には使わない。
 pub fn browser_identity_arg(args: &[String]) -> Option<&String> {
-    args.iter()
-        .find(|a| a.starts_with("--user-data-dir"))
+    args.iter().find(|a| a.starts_with("--user-data-dir"))
 }
 
 /// From a VS Code process command line, the folder/workspace path it was opened

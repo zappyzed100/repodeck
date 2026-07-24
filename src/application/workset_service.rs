@@ -261,7 +261,9 @@ fn find_by_launch_identity(
 ) -> Option<isize> {
     let spec = window.launch_spec.as_ref()?;
     let identity = crate::application::launch_service::browser_identity_arg(&spec.args)?;
-    let needle = identity.trim_start_matches("--user-data-dir=").trim_matches('"');
+    let needle = identity
+        .trim_start_matches("--user-data-dir=")
+        .trim_matches('"');
     if needle.is_empty() {
         return None;
     }
