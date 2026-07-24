@@ -2,6 +2,7 @@ pub mod app_launch;
 pub mod autostart;
 pub mod browser_url;
 pub mod display_reset;
+pub mod display_watch;
 pub mod dpi;
 pub mod elevation;
 pub mod enumerate;

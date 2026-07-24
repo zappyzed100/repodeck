@@ -25,6 +25,7 @@ use crate::application::crash_recovery::{self, JournalRecoveryChoice};
 use crate::application::display_recovery_service::{self, RecoveryDecision};
 use crate::application::launch_service;
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
+use crate::application::monitor_identity::{self, LiveMonitor};
 use crate::application::monitor_watch_service;
 use crate::application::popup_placement;
 use crate::application::quick_switcher_service;
@@ -51,7 +52,7 @@ use crate::windowing::monitor::{self, MonitorInfo};
 use crate::windowing::placement as win_placement;
 use crate::windowing::popup_window;
 use crate::windowing::window_ops_impl::Win32WindowOps;
-use crate::windowing::{display_reset, power_watch};
+use crate::windowing::{display_reset, display_watch, power_watch};
 
 slint::include_modules!();
 
@@ -1054,7 +1055,11 @@ fn wire_layout_studio(
             .map(|monitor| crate::domain::monitor::SavedMonitor {
                 stable_id: monitor.device_name.clone(),
                 device_name: monitor.device_name.clone(),
-                device_path: None,
+                // ハードウェア由来の同一性。これを落とすと、あとで
+                // `\\.\DISPLAYn` が入れ替わったときに
+                // `monitor_identity::plan_remap` が bounds でしか
+                // 追跡できなくなる。
+                device_path: crate::windowing::monitor::device_interface_path(&monitor.device_name),
                 friendly_name: None,
                 bounds_px: monitor.bounds_px,
                 work_area_px: monitor.work_area_px,
@@ -1923,6 +1928,8 @@ fn reopen_place_workset(
     data_dir: &Path,
     coordinator: &SwitchCoordinator<Win32WindowOps>,
 ) {
+    reconcile_monitor_identity(data_dir, config, "reopen");
+
     let mut runtime = runtime_store::load(data_dir);
     if runtime.current_workset_id == Some(workset_id) {
         runtime.current_workset_id = None;
@@ -4131,6 +4138,11 @@ fn wire_quick_switcher(
             return;
         };
 
+        // 保存済みの配置を読む前に、モニターのデバイス名が入れ替わって
+        // いないか確かめる。入れ替わりは無音で起きるので、実際に配置を
+        // 使う直前に見るのがいちばん確実。
+        reconcile_monitor_identity(&d, &c, "switch");
+
         // Pre-launch snapshot, then relaunch any closed windows of the target
         // (switch = alive windows move, dead windows get launched).
         let live_windows =
@@ -5566,6 +5578,67 @@ fn attempt_auto_recovery(
     }
 }
 
+/// 現在つながっているモニターを、同一性判定に必要な形
+/// ([`LiveMonitor`]) で読み出す。
+fn live_monitor_identities() -> Vec<LiveMonitor> {
+    monitor::enumerate_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| LiveMonitor {
+            device_path: monitor::device_interface_path(&m.device_name),
+            device_name: m.device_name,
+            bounds_px: m.bounds_px,
+        })
+        .collect()
+}
+
+/// `\\.\DISPLAYn` と物理モニターの対応が入れ替わっていないか確かめ、
+/// 入れ替わっていれば保存済み設定のデバイス名参照をまとめて付け替える
+/// (`application::monitor_identity` のモジュールドキュメントを参照)。
+///
+/// [`attempt_auto_recovery`] とは別物であることに注意: あちらは「保存済み
+/// モニターが live から消えた」ケースを直す。こちらは「7枚とも居るのに
+/// 名前だけ入れ替わった」ケースを直す。後者は解像度も配置も変わらないため
+/// `WM_DISPLAYCHANGE` すら飛ばず、イベント任せでは検知できない。だから
+/// 配置を実際に使う直前 (起動時・復帰時・各切り替えの直前) に呼ぶ。
+///
+/// 何も入れ替わっていなければモニターの列挙だけで戻る安価な処理。
+fn reconcile_monitor_identity(data_dir: &Path, config: &Rc<RefCell<AppConfig>>, reason: &str) {
+    let live = live_monitor_identities();
+    if live.is_empty() {
+        return;
+    }
+
+    let mut cfg = config.borrow_mut();
+    let renames = monitor_identity::plan_remap(&cfg.monitors, &live);
+    let mut config_changed = false;
+
+    if !renames.is_empty() {
+        let mut runtime = runtime_store::load(data_dir);
+        let rewritten =
+            monitor_identity::apply_remap(&mut cfg, &mut runtime.auto_slot_assignments, &renames);
+        tracing::warn!(
+            target: "monitors",
+            reason,
+            ?renames,
+            rewritten,
+            "モニターのデバイス名が入れ替わっていたので保存済みの参照を付け替えた"
+        );
+        if let Err(err) = runtime_store::save(data_dir, &runtime) {
+            tracing::warn!(error = %err, "failed to persist remapped slot assignments");
+        }
+        config_changed = true;
+    }
+
+    // 付け替えの有無にかかわらず、次回はハードウェア由来の同一性で
+    // 判定できるよう device_path を焼き直しておく。
+    config_changed |= monitor_identity::refresh_device_paths(&mut cfg, &live);
+
+    if config_changed && let Err(err) = config_store::save(data_dir, &cfg) {
+        tracing::warn!(error = %err, "failed to persist the monitor identity remap");
+    }
+}
+
 thread_local! {
     /// Per-resume retry counter and the settle-delay timer for automatic display
     /// recovery. UI-thread-only (the suspend/resume callback marshals here before
@@ -5582,6 +5655,7 @@ fn handle_resume_ui_event() {
         return;
     };
     tracing::info!("system resume detected; evaluating display recovery");
+    reconcile_monitor_identity(&ctx.data_dir, &ctx.config, "resume");
     let attempts = RECOVERY_ATTEMPTS.with(std::clone::Clone::clone);
     let timer = RECOVERY_TIMER.with(std::clone::Clone::clone);
     // Each resume starts a fresh retry budget.
@@ -5616,6 +5690,9 @@ pub fn run() -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "RepoDeck starting");
 
     let config = Rc::new(RefCell::new(load_or_default_config(&data_dir)));
+    // 前回終了中にモニターのデバイス名が入れ替わっていることがあるので、
+    // 保存済みの配置を使い始める前に付け替える。
+    reconcile_monitor_identity(&data_dir, &config, "startup");
     let layout_studio_state = Rc::new(RefCell::new(LayoutStudioState::new()));
     let workset_manager_state = Rc::new(RefCell::new(WorksetManagerState::new()));
 
@@ -5707,13 +5784,15 @@ pub fn run() -> Result<()> {
     let window = AppWindow::new().context("failed to create the RepoDeck settings window")?;
     apply_glass_backdrop(window.window());
 
-    // Monitor-change recovery (Phase 9): watches the Settings window's
-    // WNDPROC because, unlike the Quick Switcher, it exists for the whole
-    // process lifetime even while hidden — `WM_DISPLAYCHANGE` needs a
-    // persistent window to subclass.
+    // Monitor-change recovery (Phase 9): RepoDeck 自前の不可視ウィンドウで
+    // `WM_DISPLAYCHANGE` を受ける。以前は設定ウィンドウを subclass していたが、
+    // 一度も開かれていない Slint ウィンドウには HWND が無く、登録が黙って
+    // 失敗し続けていた (`windowing::display_watch` のモジュールドキュメント)。
     let config_for_display = config.clone();
     let data_dir_for_display = data_dir.clone();
-    let _display_change_watch = popup_window::watch_display_changes(window.window(), move || {
+    let _display_change_watch = display_watch::watch_display_changes(move || {
+        reconcile_monitor_identity(&data_dir_for_display, &config_for_display, "display change");
+
         let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
         let fingerprint = monitor_watch_service::compute_fingerprint(&live_monitors);
 
@@ -5772,6 +5851,15 @@ pub fn run() -> Result<()> {
         runtime.last_seen_monitor_fingerprint = Some(fingerprint);
         let _ = runtime_store::save(&data_dir_for_display, &runtime);
     });
+    if _display_change_watch.is_none() {
+        // `reconcile_monitor_identity` が切り替えのたびに拾い直すので致命的では
+        // ないが、黙って監視なしになるのが今回の原因だったので必ず残す。
+        tracing::warn!(
+            target: "monitors",
+            "could not create the WM_DISPLAYCHANGE watch window; \
+             monitor changes are only picked up on the next switch"
+        );
+    }
 
     // Automatic display recovery: register a window-free suspend/resume callback
     // (see `power_watch` for why a window subclass can't work at startup) and, on

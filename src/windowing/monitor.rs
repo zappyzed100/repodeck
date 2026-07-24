@@ -2,11 +2,13 @@
 
 use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY};
 use windows::core::BOOL;
+use windows::core::HSTRING;
 
 use crate::domain::placement::PixelRect;
 use crate::windowing::win32_error::WindowError;
@@ -100,6 +102,48 @@ fn describe_monitor(hmonitor: HMONITOR) -> Option<MonitorInfo> {
     })
 }
 
+/// `EnumDisplayDevicesW` の `dwFlags`: `DeviceID` に、レジストリキーではなく
+/// デバイスインターフェース名を入れさせる。`windows` クレートが定数を
+/// 出力していないのでここで定義する (Wingdi.h の `EDD_GET_DEVICE_INTERFACE_NAME`)。
+const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 0x0000_0001;
+
+/// `\\.\DISPLAYn` に今つながっている物理モニターのデバイスインターフェース名
+/// (`\\?\DISPLAY#HKC2496#5&2da23&0&UID4357#{GUID}`) を返す。
+///
+/// `\\.\DISPLAYn` 自体は GPU の再列挙で物理モニターとの対応が入れ替わるが、
+/// この名前は EDID とコネクタ (`UIDxxxx`) 由来なので同じモニターを指し続ける。
+/// `application::monitor_identity` が入れ替わりの検知に使う。
+/// 取得できなければ `None` (呼び出し側は bounds 一致にフォールバックする)。
+pub fn device_interface_path(device_name: &str) -> Option<String> {
+    let mut device = DISPLAY_DEVICEW {
+        cb: u32::try_from(std::mem::size_of::<DISPLAY_DEVICEW>()).ok()?,
+        ..Default::default()
+    };
+    let name = HSTRING::from(device_name);
+
+    // SAFETY: `name` は NUL 終端の wide 文字列、`device` は `cb` を正しく
+    // 埋めた `DISPLAY_DEVICEW` バッファ。呼び出し中だけ参照される。
+    let ok = unsafe {
+        EnumDisplayDevicesW(
+            &name,
+            0,
+            std::ptr::from_mut(&mut device),
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    let nul_pos = device
+        .DeviceID
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(device.DeviceID.len());
+    let path = String::from_utf16_lossy(&device.DeviceID[..nul_pos]);
+    (!path.is_empty()).then_some(path)
+}
+
 /// Reads the current physical-pixel cursor position (PLAN.md §3.3's
 /// `CursorMonitorCenter` popup placement).
 pub fn cursor_position() -> Result<(i32, i32), WindowError> {
@@ -137,5 +181,27 @@ mod tests {
             assert!(monitor.dpi_x > 0 && monitor.dpi_y > 0);
             assert!(!monitor.device_name.is_empty());
         }
+    }
+
+    #[test]
+    fn every_monitor_reports_a_distinct_hardware_interface_path() {
+        let monitors = enumerate_monitors().expect("EnumDisplayMonitors should succeed");
+
+        let paths: Vec<String> = monitors
+            .iter()
+            .filter_map(|m| device_interface_path(&m.device_name))
+            .collect();
+
+        assert_eq!(
+            paths.len(),
+            monitors.len(),
+            "every live monitor should resolve to an interface path"
+        );
+        let unique: std::collections::HashSet<&String> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "interface paths must distinguish otherwise-identical monitors"
+        );
     }
 }

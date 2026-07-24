@@ -6,6 +6,7 @@ pub mod git_status_service;
 pub mod launch_service;
 pub mod layout_service;
 pub mod main_placement;
+pub mod monitor_identity;
 pub mod monitor_resolution;
 pub mod monitor_watch_service;
 pub mod parking_allocator;

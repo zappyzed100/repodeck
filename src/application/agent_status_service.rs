@@ -114,8 +114,17 @@ pub fn apply_event(
                 find_run_mut(&mut state.agent_runs, &event.session_id, &event.turn_id)
                 && matches!(run.state, AgentState::NeedsInput | AgentState::Ready)
             {
+                // `Ready` からの復帰は「完了」が早すぎただけで、作業自体は
+                // 途切れていない。ここで `last_transition_at`（UI の経過時間の
+                // 起点）を打ち直すと、実行中の表示が何度も 0 に戻る——PC が
+                // スリープから復帰した直後に届く `PostToolUse` で、それまでの
+                // 計算時間が丸ごと消える（ユーザー報告 2026-07-24）。
+                // 一方 `NeedsInput` からの復帰は、人間の返事を待っていた区間が
+                // 終わった合図なので、そこからを計算時間として数え直す。
+                if run.state == AgentState::NeedsInput {
+                    run.last_transition_at = event.occurred_at.clone();
+                }
                 run.state = AgentState::Running;
-                run.last_transition_at = event.occurred_at.clone();
                 run.confirmed = false;
             }
         }
@@ -235,6 +244,16 @@ mod tests {
         session_id: &str,
         turn_id: &str,
     ) -> NormalizedEvent {
+        event_at(kind, cwd, session_id, turn_id, "2026-07-21T00:00:00Z")
+    }
+
+    fn event_at(
+        kind: NormalizedEventKind,
+        cwd: &Path,
+        session_id: &str,
+        turn_id: &str,
+        occurred_at: &str,
+    ) -> NormalizedEvent {
         NormalizedEvent {
             schema_version: 1,
             source: "codex".to_string(),
@@ -243,7 +262,7 @@ mod tests {
             turn_id: turn_id.to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
             model: None,
-            occurred_at: "2026-07-21T00:00:00Z".to_string(),
+            occurred_at: occurred_at.to_string(),
         }
     }
 
@@ -482,6 +501,87 @@ mod tests {
         let state = runtime_store::load(dir.path());
         assert_eq!(state.agent_runs[0].state, AgentState::Running);
         assert!(!state.agent_runs[0].confirmed);
+    }
+
+    #[test]
+    fn resuming_from_ready_keeps_the_elapsed_time_origin() {
+        // スリープ復帰直後に届く `PostToolUse` で計算時間が 0 に戻らないこと。
+        // 作業は Ready を挟んで continuous なので、起点は動かさない。
+        let dir = tempdir().unwrap();
+        let repo = PathBuf::from(r"D:\repos\a");
+        let worksets = [workset_at(&repo)];
+        let mut unmatched = Vec::new();
+
+        for kind in [
+            NormalizedEventKind::RunStarted,
+            NormalizedEventKind::RunCompleted,
+        ] {
+            apply_event(
+                dir.path(),
+                &worksets,
+                &mut unmatched,
+                event_at(kind, &repo, "s1", "t1", "2026-07-24T00:00:00Z"),
+            )
+            .unwrap();
+        }
+
+        apply_event(
+            dir.path(),
+            &worksets,
+            &mut unmatched,
+            event_at(
+                NormalizedEventKind::ToolUseObserved,
+                &repo,
+                "s1",
+                "t1",
+                "2026-07-24T03:45:59Z",
+            ),
+        )
+        .unwrap();
+
+        let run = &runtime_store::load(dir.path()).agent_runs[0];
+        assert_eq!(run.state, AgentState::Running);
+        assert_eq!(run.last_transition_at, "2026-07-24T00:00:00Z");
+    }
+
+    #[test]
+    fn resuming_from_needs_input_restarts_the_elapsed_time_origin() {
+        // 人間の返事待ちが終わってからが「計算時間」なので、ここは数え直す。
+        let dir = tempdir().unwrap();
+        let repo = PathBuf::from(r"D:\repos\a");
+        let worksets = [workset_at(&repo)];
+        let mut unmatched = Vec::new();
+
+        for kind in [
+            NormalizedEventKind::RunStarted,
+            NormalizedEventKind::NeedsInput,
+        ] {
+            apply_event(
+                dir.path(),
+                &worksets,
+                &mut unmatched,
+                event_at(kind, &repo, "s1", "t1", "2026-07-24T00:00:00Z"),
+            )
+            .unwrap();
+        }
+
+        apply_event(
+            dir.path(),
+            &worksets,
+            &mut unmatched,
+            event_at(
+                NormalizedEventKind::ToolUseObserved,
+                &repo,
+                "s1",
+                "t1",
+                "2026-07-24T03:45:59Z",
+            ),
+        )
+        .unwrap();
+
+        let run = &runtime_store::load(dir.path()).agent_runs[0];
+        assert_eq!(run.state, AgentState::Running);
+        assert_eq!(run.last_transition_at, "2026-07-24T03:45:59Z");
     }
 
     #[test]
