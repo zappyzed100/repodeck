@@ -7,6 +7,10 @@ export struct QuickSwitcherRow {
     color: color,
     is-current: bool,
     is-parking-target: bool,
+    // このセットの登録ウィンドウのうち、今開いている数と総数。全部閉じている
+    // セットを一目で見分けられるようにする。
+    windows-open: int,
+    windows-total: int,
     // Codex agent status (PLAN.md §6, Phase 8). Always shown now: `agent-symbol`
     // + `agent-status-label` (✓成功 / ×失敗 / ●実行中・入力待ち / —未実行),
     // coloured by `agent-status-color`.
@@ -259,10 +263,21 @@ export component QuickSwitcher inherits Window {
                             padding: Theme.space-sm;
                             spacing: Theme.space-sm;
 
+                            // 左のカラーバーはセットの識別色。ウィンドウが全部
+                            // 閉じているセットは、色を消して沈んだ灰色にする。
+                            // 文字を読まなくても「これは閉じている」と一瞬で分かる。
+                            //
+                            // ここで `opacity` は使わない。Slint は不透明度を指定した
+                            // 要素をオフスクリーンのテクスチャへ描いてから合成するため、
+                            // スクロールで y が半端な位置になると再サンプリングされて
+                            // 文字がボケる。減光は「色そのもの」で表現する。
                             Rectangle {
                                 width: 10px;
                                 border-radius: 5px;
-                                background: row.color;
+                                background: row.windows-total > 0 && row.windows-open == 0
+                                    ? Theme.closed-dim
+                                    : row.color;
+                                animate background { duration: Theme.duration-fast; easing: ease-out; }
                             }
 
                             VerticalLayout {
@@ -277,7 +292,10 @@ export component QuickSwitcher inherits Window {
                                         text: row.name;
                                         font-size: 18px;
                                         font-weight: 600;
-                                        color: Theme.text-primary;
+                                        // 閉じているセットは名前も沈める（色で減光）。
+                                        color: row.windows-total > 0 && row.windows-open == 0
+                                            ? Theme.closed-dim
+                                            : Theme.text-primary;
                                         overflow: elide;
                                     }
                                     if row.is-current: Text {
@@ -293,6 +311,7 @@ export component QuickSwitcher inherits Window {
                                         color: Theme.text-tertiary;
                                         vertical-alignment: center;
                                     }
+
 
                                     Rectangle { horizontal-stretch: 1; }
 
@@ -337,7 +356,9 @@ export component QuickSwitcher inherits Window {
                                     Text {
                                         text: row.branch-text == "" ? row.repository-name : row.branch-text;
                                         font-size: 14px;
-                                        color: row.branch-text == "" ? Theme.text-secondary : Theme.text-primary;
+                                        color: row.windows-total > 0 && row.windows-open == 0
+                                            ? Theme.closed-dim
+                                            : (row.branch-text == "" ? Theme.text-secondary : Theme.text-primary);
                                         overflow: elide;
                                     }
                                     if row.changed-text != "": Text {
@@ -437,12 +458,13 @@ export component QuickSwitcher inherits Window {
                                     height: 24px;
                                     border-radius: Theme.radius-sm;
                                     background: up-touch.has-hover && i > 0 ? Theme.glass-hover : Theme.glass-panel-strong;
-                                    opacity: i > 0 ? 1.0 : 0.3;
                                     animate background { duration: Theme.duration-fast; easing: ease-out; }
                                     Text {
                                         text: "▲";
                                         font-size: 12px;
-                                        color: Theme.text-secondary;
+                                        // 端の行では押せないので沈めるが、`opacity` は
+                                        // 使わない（テクスチャ合成で滲むため）。
+                                        color: i > 0 ? Theme.text-secondary : Theme.closed-dim;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
@@ -456,12 +478,11 @@ export component QuickSwitcher inherits Window {
                                     height: 24px;
                                     border-radius: Theme.radius-sm;
                                     background: down-touch.has-hover && i < root.rows.length - 1 ? Theme.glass-hover : Theme.glass-panel-strong;
-                                    opacity: i < root.rows.length - 1 ? 1.0 : 0.3;
                                     animate background { duration: Theme.duration-fast; easing: ease-out; }
                                     Text {
                                         text: "▼";
                                         font-size: 12px;
-                                        color: Theme.text-secondary;
+                                        color: i < root.rows.length - 1 ? Theme.text-secondary : Theme.closed-dim;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }

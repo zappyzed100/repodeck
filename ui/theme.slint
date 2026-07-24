@@ -41,6 +41,10 @@ export global Theme {
     out property <color> glass-panel: rgba(22, 22, 27, 1.0);
     out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
     out property <color> glass-panel-strong: rgba(0, 0, 0, 0.90);
+    // 全ウィンドウが閉じているセットの減光色。`opacity` を使うとその要素が
+    // オフスクリーンのテクスチャ経由で合成され、スクロール位置が半端なときに
+    // 文字が再サンプリングされてボケるため、減光は色で表現する。
+    out property <color> closed-dim: rgba(120, 122, 130, 1.0);
     out property <color> glass-hover: rgba(255, 255, 255, 0.09);
     out property <color> glass-selected: rgba(10, 132, 255, 0.24);
 

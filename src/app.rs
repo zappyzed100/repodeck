@@ -3528,6 +3528,17 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
         &filter_text,
     );
 
+    // どのセットが今開いているかを、切替と同じ解決ロジックで数える。全部閉じている
+    // セットはクイックスイッチャーで色を落として示す。
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &state.window_bindings,
+        None,
+    );
+
     let aggregates = agent_status_service::aggregate_all(&config.worksets, &state.agent_runs);
     if config.settings.sort_mode != SortMode::Manual {
         ordered.sort_by_key(|w| {
@@ -3580,6 +3591,17 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
                 color: hex_to_color(&workset.color),
                 is_current: Some(workset.id) == current_workset_id,
                 is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
+                windows_total: i32::try_from(workset.windows.len()).unwrap_or(0),
+                windows_open: i32::try_from(
+                    workset
+                        .windows
+                        .iter()
+                        .filter(|w| {
+                            matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
+                        })
+                        .count(),
+                )
+                .unwrap_or(0),
                 agent_status_color: hex_to_color(state_color(agent_state)),
                 agent_symbol: agent_symbol.into(),
                 agent_status_label: agent_status_label.into(),
