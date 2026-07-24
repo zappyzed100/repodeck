@@ -52,10 +52,15 @@ pub fn map_event_to_workset(worksets: &[Workset], event_cwd: &Path) -> Option<Uu
     worksets
         .iter()
         .find(|w| {
-            event_cwd.starts_with(workset_service::resolve_match_path(
-                &w.repository_path,
-                w.repository_kind,
-            ))
+            let match_path =
+                workset_service::resolve_match_path(&w.repository_path, w.repository_kind);
+            // `Path::starts_with("")` は常に true なので、`repository_path` が
+            // 空のセット（ブラウザやデスクトップアプリだけを束ねた、リポジトリ
+            // を持たないセット）を弾かないと、そのセットが *あらゆる* cwd の
+            // イベントを総取りしてしまう。登録順で最初に現れた空パスのセットに
+            // 無関係なエージェントの実行状態が表示される
+            // （ユーザー報告 2026-07-24）。空パスは「照合先を持たない」の意。
+            !match_path.as_os_str().is_empty() && event_cwd.starts_with(&match_path)
         })
         .map(|w| w.id)
 }
@@ -271,6 +276,22 @@ mod tests {
         let repo = PathBuf::from(r"D:\repos\a");
         let worksets = [workset_at(&repo)];
         assert_eq!(map_event_to_workset(&worksets, &repo), Some(worksets[0].id));
+    }
+
+    #[test]
+    fn a_workset_without_a_repository_path_never_matches_an_event() {
+        // リポジトリを持たないセット（ブラウザだけのセット等）は照合先が無い。
+        // 空パスを許すと `starts_with("")` が全部 true になり、無関係な
+        // エージェントの実行状態がそのセットに出てしまう。
+        let mut browser_only = workset_at(&PathBuf::from(r"D:\repos\a"));
+        browser_only.repository_path = PathBuf::new();
+        browser_only.repository_kind = RepositoryKind::Directory;
+        let worksets = [browser_only];
+
+        assert_eq!(
+            map_event_to_workset(&worksets, &PathBuf::from(r"C:\code\unrelated")),
+            None
+        );
     }
 
     #[test]
