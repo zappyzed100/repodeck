@@ -5227,15 +5227,37 @@ fn handle_agent_ui_event(event: AgentUiEvent) {
     };
 
     {
-        let config = ctx.config.borrow();
         let mut unmatched = ctx.unmatched_agent_events.borrow_mut();
-        if let Err(err) = agent_status_service::apply_event(
-            &ctx.data_dir,
-            &config.worksets,
-            &mut unmatched,
-            normalized,
-        ) {
-            tracing::warn!(error = %err, "failed to persist Codex agent status update");
+        let outcome = {
+            let config = ctx.config.borrow();
+            agent_status_service::apply_event(
+                &ctx.data_dir,
+                &config.worksets,
+                &mut unmatched,
+                normalized.clone(),
+            )
+        };
+        match outcome {
+            // どのセットにも一致しなかった。表示中のセットが ChatGPT アプリ入り
+            // (=「Codex を回すセット」) でまだ repository_path が空なら、この
+            // 実行フォルダをそのセットへ自動で紐づけ、同じイベントを適用し直す。
+            Ok(None) => {
+                if adopt_cwd_into_active_agent_set(&ctx, &normalized.cwd) {
+                    let config = ctx.config.borrow();
+                    if let Err(err) = agent_status_service::apply_event(
+                        &ctx.data_dir,
+                        &config.worksets,
+                        &mut unmatched,
+                        normalized,
+                    ) {
+                        tracing::warn!(error = %err, "failed to persist Codex agent status update after auto-link");
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to persist Codex agent status update");
+            }
         }
     }
 
@@ -5243,6 +5265,54 @@ fn handle_agent_ui_event(event: AgentUiEvent) {
     if let Some(switcher) = ctx.quick_switcher.upgrade() {
         refresh_quick_switcher_rows(&switcher, &ctx.config.borrow(), &ctx.data_dir);
     }
+}
+
+/// どのセットにも一致しなかった Codex 実行の作業フォルダを、いま表示中の
+/// 「ChatGPT アプリ入りセット」へ自動で紐づける。紐づけたら `true`。
+///
+/// 発火条件を厳しくして誤爆を防ぐ: (1) 現在の表示セットが存在し、(2) その
+/// セットに ChatGPT/Codex デスクトップアプリが含まれ、(3) まだ
+/// `repository_path` が空 —— の3つがそろったときだけ。普通のリポジトリ
+/// セットや、無関係なセットを開いているときは何も起きない。
+///
+/// 紐づけ先はイベントの cwd の git ルート(あれば)。以後その配下の実行は
+/// 通常どおりこのセットに一致する。
+fn adopt_cwd_into_active_agent_set(ctx: &CrossThreadUiContext, cwd: &str) -> bool {
+    if cwd.is_empty() {
+        return false;
+    }
+    let Some(current_id) = runtime_store::load(&ctx.data_dir).current_workset_id else {
+        return false;
+    };
+
+    let mut config = ctx.config.borrow_mut();
+    let Some(workset) = config.worksets.iter_mut().find(|w| w.id == current_id) else {
+        return false;
+    };
+    if !workset.repository_path.as_os_str().is_empty()
+        || !workset_service::contains_chatgpt_codex_app(workset)
+    {
+        return false;
+    }
+
+    let cwd_path = PathBuf::from(cwd);
+    let repo = workset_service::find_git_root(&cwd_path).unwrap_or(cwd_path);
+    workset.repository_path = repo.clone();
+    workset.repository_kind = crate::domain::workset::RepositoryKind::Directory;
+    let set_name = workset.name.clone();
+    drop(config);
+
+    if let Err(err) = config_store::save(&ctx.data_dir, &ctx.config.borrow()) {
+        tracing::warn!(error = %err, "failed to persist the auto-linked Codex working directory");
+        return false;
+    }
+    tracing::info!(
+        target: "agents",
+        set = %set_name,
+        repo = %repo.display(),
+        "auto-linked a Codex working directory to the active ChatGPT set"
+    );
+    true
 }
 
 /// Recomputes the tray icon color/tooltip from every registered workset's

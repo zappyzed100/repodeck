@@ -78,6 +78,30 @@ fn package_family_name(package_dir: &str) -> Option<String> {
     Some(format!("{name}_{publisher_id}"))
 }
 
+/// Package family name of the OpenAI ChatGPT / Codex desktop app. Its install
+/// path carries a version and changes on every update, but the family name
+/// (publisher id after the double underscore) is stable, so this is the
+/// reliable way to recognize the app regardless of the pinned exe path.
+const CHATGPT_CODEX_FAMILY: &str = "OpenAI.Codex";
+
+/// Whether an executable is the OpenAI ChatGPT / Codex desktop app.
+///
+/// The app ships as a Store package (`…\WindowsApps\OpenAI.Codex_<ver>_x64__…
+/// \app\ChatGPT.exe`), so both signals are accepted: the stable process name
+/// `ChatGPT.exe`, and — as a stronger cross-check when the exe path is known —
+/// the `OpenAI.Codex` package family. RepoDeck treats a workset that contains
+/// this app as one where the user runs Codex, so an otherwise-unmatched agent
+/// event's cwd can be auto-linked to it (see `app.rs`'s adoption path).
+pub fn is_chatgpt_codex_app(executable: &Path, process_name: &str) -> bool {
+    if process_name.eq_ignore_ascii_case("ChatGPT.exe") {
+        return true;
+    }
+    store_app_aumid(executable)
+        .and_then(|aumid| aumid.split_once('!').map(|(family, _)| family.to_string()))
+        .and_then(|family| family.rsplit_once('_').map(|(name, _)| name.to_string()))
+        .is_some_and(|name| name.eq_ignore_ascii_case(CHATGPT_CODEX_FAMILY))
+}
+
 /// Whether a folder read from a VS Code process's command line plausibly belongs
 /// to the window being registered.
 ///
@@ -456,6 +480,29 @@ mod tests {
             r"C:\Program Files\WindowsApps\OpenAI.Codex_99.0.0.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
         );
         assert_eq!(store_app_aumid(updated), store_app_aumid(exe));
+    }
+
+    #[test]
+    fn recognizes_the_chatgpt_codex_app_by_process_name_and_by_package() {
+        // 更新でパスが変わってもプロセス名は不変。
+        assert!(is_chatgpt_codex_app(Path::new(""), "ChatGPT.exe"));
+        assert!(is_chatgpt_codex_app(Path::new(""), "chatgpt.exe"));
+        // exe パスだけからでも OpenAI.Codex パッケージなら判定できる。
+        assert!(is_chatgpt_codex_app(
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_99.0.0.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ),
+            "someother.exe"
+        ));
+        // 無関係なアプリは弾く。
+        assert!(!is_chatgpt_codex_app(
+            Path::new(r"C:\VS\Code.exe"),
+            "code.exe"
+        ));
+        assert!(!is_chatgpt_codex_app(
+            Path::new(r"C:\Program Files\BraveSoftware\brave.exe"),
+            "brave.exe"
+        ));
     }
 
     #[test]

@@ -105,6 +105,23 @@ pub fn resolve_match_path(repository_path: &Path, repository_kind: RepositoryKin
     repository_path.to_path_buf()
 }
 
+/// Whether a workset contains the OpenAI ChatGPT / Codex desktop app.
+///
+/// This is RepoDeck's marker for 「このセットでは Codex を回す」: such a set
+/// groups the ChatGPT app with the browser (and no VS Code repo), so it has no
+/// `repository_path` to correlate agent events against. `app.rs` uses this to
+/// auto-adopt an otherwise-unmatched Codex event's cwd into the active set the
+/// first time one arrives, so the set starts reflecting the run's status
+/// without the user typing a path.
+pub fn contains_chatgpt_codex_app(workset: &Workset) -> bool {
+    workset.windows.iter().any(|w| {
+        crate::application::launch_service::is_chatgpt_codex_app(
+            &w.matcher.executable_path,
+            &w.matcher.process_name,
+        )
+    })
+}
+
 /// Whether `candidate_path` is already registered under an existing workset
 /// (PLAN.md §3.6: "同一正規パスの重複登録は禁止"). Both sides are compared as
 /// given; callers should pass already-canonicalized paths.
@@ -412,6 +429,55 @@ mod tests {
         std::fs::create_dir(repo_root.join(".git")).unwrap();
 
         assert_eq!(find_git_root(&nested), Some(repo_root));
+    }
+
+    fn workset_with_process(process_name: &str) -> Workset {
+        use crate::domain::placement::{NormalizedRect, PixelRect};
+        let mut ws = build_workset(
+            "s".into(),
+            "#fff".to_string(),
+            PathBuf::new(),
+            RepositoryKind::Directory,
+            0,
+            Vec::new(),
+        );
+        ws.windows.push(ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: WindowMatcher {
+                executable_path: PathBuf::from(r"C:\app.exe"),
+                process_name: process_name.to_string(),
+                window_class: "X".to_string(),
+                registered_title: "t".to_string(),
+                title_contains: None,
+                title_regex: None,
+            },
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 800, 600),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+            minimize_when_parked: false,
+        });
+        ws
+    }
+
+    #[test]
+    fn contains_chatgpt_codex_app_detects_the_app_by_process_name() {
+        assert!(contains_chatgpt_codex_app(&workset_with_process(
+            "ChatGPT.exe"
+        )));
+        assert!(!contains_chatgpt_codex_app(&workset_with_process(
+            "brave.exe"
+        )));
     }
 
     #[test]
