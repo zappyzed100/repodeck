@@ -79,6 +79,18 @@ pub fn apply_event(
 
     let event_cwd = PathBuf::from(&event.cwd);
     let Some(workset_id) = map_event_to_workset(worksets, &event_cwd) else {
+        // どのセットにも結びつかないイベントは無音で捨てられていた。
+        // 「実装中なのにバッジが出ない/消えた」を追うには、少なくとも
+        // 「イベントは来たが cwd がどのセットにも一致しなかった」ことが
+        // 見えている必要がある(セットの repository_path 設定漏れの典型)。
+        tracing::info!(
+            target: "agents",
+            source = %event.source,
+            event = ?event.event,
+            cwd = %event.cwd,
+            session = %short_id(&event.session_id),
+            "agent event did not match any workset (cwd not under any registered set)"
+        );
         unmatched.push(UnmatchedAgentEvent {
             cwd: event_cwd,
             event: event.event,
@@ -143,8 +155,36 @@ pub fn apply_event(
         }
     }
 
+    // 適用後のこの run の状態を残す。バッジは run.state と confirmed から
+    // 決まるので、この2つが分かればバッジの挙動を後追いできる。
+    let outcome = find_run_mut(&mut state.agent_runs, &event.session_id, &event.turn_id)
+        .map(|run| (run.state, run.confirmed));
+    match outcome {
+        Some((run_state, confirmed)) => tracing::info!(
+            target: "agents",
+            source = %event.source,
+            event = ?event.event,
+            session = %short_id(&event.session_id),
+            run_state = ?run_state,
+            confirmed,
+            "agent event applied"
+        ),
+        None => tracing::info!(
+            target: "agents",
+            source = %event.source,
+            event = ?event.event,
+            session = %short_id(&event.session_id),
+            "agent event matched a workset but changed no run (e.g. a stray PostToolUse)"
+        ),
+    }
+
     runtime_store::save(data_dir, &state)?;
     Ok(Some(workset_id))
+}
+
+/// ログを読みやすくするための session id の短縮 (先頭8文字)。
+fn short_id(session_id: &str) -> &str {
+    session_id.get(..8).unwrap_or(session_id)
 }
 
 /// PLAN.md §3.3's "選択後" / "ready確認処理": marks every unconfirmed
