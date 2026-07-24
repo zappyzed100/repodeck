@@ -1482,6 +1482,13 @@ fn build_launch_app_window(
     if kind == LaunchKind::Generic && !input.is_empty() {
         spec.args = input.split_whitespace().map(str::to_string).collect();
     }
+    // 起動候補に登録された既定引数を先頭に付ける。これがブラウザの
+    // `--user-data-dir=...` を通す経路で、用途ごとに独立した Brave を
+    // 「Brave - 開発」のような名前で登録して使えるようになる。
+    let registered = launch_service::split_registered_args(&app.args);
+    if !registered.is_empty() {
+        spec.args = [registered, std::mem::take(&mut spec.args)].concat();
+    }
     // The registered AUMID is the shell's own, so it beats the one
     // `build_launch_spec` guesses from the install path (which assumes the
     // application id is `App` — true for ChatGPT, not for Claude or Teams).
@@ -1614,16 +1621,17 @@ fn apply_app_selection(manager: &WorksetManager, app: Option<&crate::domain::wor
                 true,
             ),
             LaunchKind::Browser => ("ブラウザー", "URL", "例: https://example.com", false),
-            LaunchKind::Generic => ("アプリ", "引数（任意）", "例: --flag", false),
+            LaunchKind::Generic => ("アプリ", "追加の引数（任意）", "例: --flag", false),
         };
     manager.set_app_kind_label(kind_label.into());
     manager.set_app_input_label(input_label.into());
     manager.set_app_input_placeholder(placeholder.into());
     manager.set_app_input_visible(true);
     manager.set_app_input_is_path(is_path);
-    // Seed with the app's registered arguments so a wrapper shortcut's flags
-    // keep working.
-    manager.set_app_input_text(app.args.clone().into());
+    // 起動候補に登録された既定引数は起動時に自動で付くので、ここへは入れない。
+    // 入れると Generic では二重に付き、VS Code / ブラウザーではフォルダー・URL 欄に
+    // 引数が混ざってしまう（ブラウザーなら `https://--user-data-dir=...` になる）。
+    manager.set_app_input_text(slint::SharedString::new());
 }
 
 /// Distinct workset colors offered at registration. A workset's color is its
@@ -1990,6 +1998,9 @@ struct Launched {
     id: uuid::Uuid,
     exe: PathBuf,
     class: String,
+    /// ブラウザを用途別に分ける `--user-data-dir=...`（あれば）。同時に複数の
+    /// プロファイルを起動しても取り違えないよう、コマンドラインで特定する。
+    identity: Option<String>,
 }
 
 /// 結びついた管理ウィンドウと、その相手の HWND・実際に観測したクラス。
@@ -2039,6 +2050,7 @@ fn launch_missing_for_switch(
                         id: w.id,
                         exe: spec.program.clone(),
                         class: w.matcher.window_class.clone(),
+                        identity: launch_service::browser_identity_arg(&spec.args).cloned(),
                     });
                 }
                 Err(err) => {
@@ -2112,13 +2124,21 @@ fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
     let mut newly_bound: Vec<BoundWindow> = Vec::new();
 
     pending.dead.retain(|launched| {
-        let Some(w) = launch_service::find_launched_window(
-            &after,
-            &pending.before,
-            &pending.claimed,
-            &launched.exe,
-            &launched.class,
-        ) else {
+        // 用途別ブラウザ（`--user-data-dir`）は、同時に複数起動しても取り違えない
+        // よう、まずコマンドラインで特定する。該当しなければ従来どおり
+        // 「新しく現れた同じ実行ファイルの窓」で拾う。
+        let by_identity = launched.identity.as_deref().and_then(|identity| {
+            find_window_by_command_line(&after, &pending.before, &pending.claimed, identity)
+        });
+        let Some(w) = by_identity.or_else(|| {
+            launch_service::find_launched_window(
+                &after,
+                &pending.before,
+                &pending.claimed,
+                &launched.exe,
+                &launched.class,
+            )
+        }) else {
             return true; // まだ現れていない。次のポーリングで見る。
         };
         tracing::info!(target: "launch", managed = %launched.id, hwnd = w.hwnd, class = %w.window_class, "switch: bound relaunched window to its set");
@@ -2128,6 +2148,7 @@ fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
                 id: launched.id,
                 exe: launched.exe.clone(),
                 class: launched.class.clone(),
+                identity: launched.identity.clone(),
             },
             hwnd: w.hwnd,
             observed_class: w.window_class.clone(),
@@ -2138,6 +2159,31 @@ fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
     let bound_any = !newly_bound.is_empty();
     pending.bound.append(&mut newly_bound);
     bound_any
+}
+
+/// 新しく現れたウィンドウのうち、プロセスのコマンドラインに `identity`（用途別
+/// ブラウザの `--user-data-dir=...`）を含むものを探す。Chromium 系はデータ領域が
+/// 違えば独立プロセスになるので、これで「どのブラウザの窓か」を確実に決められる。
+fn find_window_by_command_line<'a>(
+    after: &'a [TopLevelWindow],
+    before: &std::collections::HashSet<isize>,
+    claimed: &std::collections::HashSet<isize>,
+    identity: &str,
+) -> Option<&'a TopLevelWindow> {
+    let needle = identity
+        .trim_start_matches("--user-data-dir=")
+        .trim_matches('"')
+        .to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    after
+        .iter()
+        .filter(|w| !before.contains(&w.hwnd) && !claimed.contains(&w.hwnd))
+        .find(|w| {
+            crate::windowing::process_info::read_process_command_line(w.process_id)
+                .is_some_and(|cmd| cmd.to_lowercase().contains(&needle))
+        })
 }
 
 /// バインド済みのうち、その後ウィンドウが消えたものを `dead` へ戻す。戻したもの
@@ -2161,6 +2207,7 @@ fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
             id: b.launched.id,
             exe: b.launched.exe.clone(),
             class: b.launched.class.clone(),
+            identity: b.launched.identity.clone(),
         });
         vanished = true;
         false

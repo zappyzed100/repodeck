@@ -166,6 +166,26 @@ fn tokenize_command_line(command_line: &str) -> Vec<String> {
     tokens
 }
 
+/// 起動候補に登録された既定引数（スタートメニューのショートカット由来、または
+/// 手入力）をトークンへ分解する。引用符を尊重するので、空白を含むパスが1つの
+/// 引数として保たれる（`--user-data-dir="D:\Brave Data\開発"` など）。
+pub fn split_registered_args(raw: &str) -> Vec<String> {
+    tokenize_command_line(raw)
+}
+
+/// ブラウザのウィンドウを「そのアプリの他の窓」と区別できる引数か。
+///
+/// Chromium 系は `--user-data-dir` を変えると**別プロセスの独立したブラウザ**に
+/// なるので、ウィンドウのプロセスのコマンドラインから確実に判別できる。用途ごとに
+/// データ領域を分けておけば、Brave のウィンドウ1つ1つを別物として扱える。
+///
+/// `--profile-directory` は同じ `--user-data-dir` の既存プロセスが窓を開くため、
+/// 窓の持ち主プロセスのコマンドラインには現れないことがある。判別には使わない。
+pub fn browser_identity_arg(args: &[String]) -> Option<&String> {
+    args.iter()
+        .find(|a| a.starts_with("--user-data-dir"))
+}
+
 /// From a VS Code process command line, the folder/workspace path it was opened
 /// on: the first positional argument (skipping the executable and any `--flags`,
 /// and `foo://` URIs). `None` if it was launched with no path (a bare window).
@@ -692,6 +712,39 @@ mod tests {
         assert!(!closes_only_by_kill(Path::new(r"C:\VS\Code.exe")));
         assert!(!closes_only_by_kill(Path::new(r"C:\brave\brave.exe")));
         assert!(!closes_only_by_kill(Path::new("")));
+    }
+
+    #[test]
+    fn registered_args_are_split_respecting_quotes() {
+        assert_eq!(
+            split_registered_args(r#"--user-data-dir="D:\Brave Data\開発""#),
+            vec![r"--user-data-dir=D:\Brave Data\開発".to_string()]
+        );
+        assert_eq!(
+            split_registered_args("--incognito --new-window"),
+            vec!["--incognito".to_string(), "--new-window".to_string()]
+        );
+        assert!(split_registered_args("").is_empty());
+    }
+
+    #[test]
+    fn only_user_data_dir_identifies_a_browser_window() {
+        // `--user-data-dir` は独立プロセスになるのでコマンドラインで特定できる。
+        let args = vec![
+            r"--user-data-dir=D:\BraveData\dev".to_string(),
+            "--new-window".to_string(),
+        ];
+        assert_eq!(
+            browser_identity_arg(&args).map(String::as_str),
+            Some(r"--user-data-dir=D:\BraveData\dev")
+        );
+        // `--profile-directory` は既存プロセスが窓を開くため判別に使えない。
+        let profile_only = vec![
+            "--profile-directory=Profile 1".to_string(),
+            "--new-window".to_string(),
+        ];
+        assert_eq!(browser_identity_arg(&profile_only), None);
+        assert_eq!(browser_identity_arg(&["--new-window".to_string()]), None);
     }
 
     #[test]

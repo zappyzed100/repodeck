@@ -247,6 +247,40 @@ pub fn resolve_all_matches(
 /// `WindowsForms10.Window.8.app.0.21b46d2_r3_ad1` のように実行ごとに変わりうる。
 /// 一致を要求すると、そうしたウィンドウは永久にバインドを保持できない。HWND の
 /// 使い回しに対しては実行ファイルの一致で十分に守れている。
+/// 起動引数そのものでウィンドウを特定する。ブラウザを `--user-data-dir` で用途別に
+/// 分けている場合だけ働く（Chromium 系はデータ領域が違えば独立プロセスになるので、
+/// そのプロセスのコマンドラインに引数が残る）。
+///
+/// タイトルもクラスも同じで見分けようのないブラウザを、確実に「この窓だ」と
+/// 特定できる唯一の手掛かり。該当しないウィンドウでは何もしない（コマンドライン
+/// 読み出しはプロセスを開くので、必要なときだけ行う）。
+fn find_by_launch_identity(
+    window: &ManagedWindow,
+    live_windows: &[TopLevelWindow],
+    bound: &HashSet<isize>,
+) -> Option<isize> {
+    let spec = window.launch_spec.as_ref()?;
+    let identity = crate::application::launch_service::browser_identity_arg(&spec.args)?;
+    let needle = identity.trim_start_matches("--user-data-dir=").trim_matches('"');
+    if needle.is_empty() {
+        return None;
+    }
+
+    live_windows
+        .iter()
+        .filter(|w| !bound.contains(&w.hwnd))
+        .filter(|w| {
+            w.executable_path
+                .as_deref()
+                .is_some_and(|p| matcher::same_executable(p, &window.matcher.executable_path))
+        })
+        .find(|w| {
+            crate::windowing::process_info::read_process_command_line(w.process_id)
+                .is_some_and(|cmd| cmd.to_lowercase().contains(&needle.to_lowercase()))
+        })
+        .map(|w| w.hwnd)
+}
+
 fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
     live.executable_path
         .as_deref()
@@ -302,6 +336,15 @@ pub fn resolve_all_matches_with_bindings(
                     // Brave ウィンドウを勝手に取り込み、セットは開いているように
                     // 見え、開き直すが「対象なし」と言う。
                     None => {
+                        // ブラウザを用途ごとに `--user-data-dir` で分けている場合、
+                        // その窓は独立プロセスなのでコマンドラインで確実に特定できる。
+                        // タイトルでは見分けられないブラウザでも、これなら正しい窓を
+                        // 取り戻せる。
+                        if let Some(hwnd) = find_by_launch_identity(window, live_windows, &bound) {
+                            bound.insert(hwnd);
+                            results.insert(window.id, MatchDecision::AutoRebind { hwnd });
+                            continue;
+                        }
                         let decision =
                             matcher::resolve_best_match(&window.matcher, live_windows, &bound);
                         let decision = match &decision {
