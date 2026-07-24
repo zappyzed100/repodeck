@@ -1128,6 +1128,7 @@ fn match_status_label(decision: Option<&MatchDecision>) -> (String, bool) {
 /// A set is *declared* rather than captured — the apps need not be running (or
 /// even installed on this desktop) at registration time — so the placement is
 /// chosen here instead of read off a live window.
+#[derive(Clone)]
 struct PendingApp {
     app: crate::domain::workset::LaunchApp,
     /// Folder/workspace for VS Code, URL for a browser, arguments otherwise.
@@ -1162,6 +1163,9 @@ struct WorksetManagerState {
     parking_selected_sub: i32,
     /// The apps making up the set being registered, in the order they were added.
     pending_apps: Vec<PendingApp>,
+    /// 追加済みの行を編集中なら、その `pending_apps` の位置。`None` なら、
+    /// アプリのフォームは新しい行を作るためのもの。
+    editing_pending_index: Option<usize>,
     /// When set, the registration view is changing this existing set rather
     /// than creating a new one, and 更新 replaces it in place (keeping its id,
     /// created_at, sort_order and hotkey).
@@ -1180,6 +1184,7 @@ impl WorksetManagerState {
             empty_undo_snapshot: UndoSnapshot::default(),
             parking_selected_sub: -1,
             pending_apps: Vec::new(),
+            editing_pending_index: None,
             editing_workset_id: None,
         }
     }
@@ -1254,8 +1259,13 @@ fn push_app_catalog(manager: &WorksetManager) {
 
 /// Pushes `config.launch_apps` into both places it is shown: the registry's
 /// 登録済み list (UI 1) and the attach picker in the registration view (UI 2).
-/// Clears the picker's selection, since the indices it addresses just moved.
-fn refresh_launch_apps(manager: &WorksetManager, config: &AppConfig) {
+/// Clears the picker's selection, since the indices it addresses just moved —
+/// and with it any 追加済みの行 being edited, whose 更新 needs that selection.
+fn refresh_launch_apps(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &mut WorksetManagerState,
+) {
     let names: Vec<slint::SharedString> = config
         .launch_apps
         .iter()
@@ -1274,8 +1284,7 @@ fn refresh_launch_apps(manager: &WorksetManager, config: &AppConfig) {
         .collect();
     manager.set_registered_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
 
-    manager.set_app_selected_index(-1);
-    apply_app_selection(manager, None);
+    clear_pending_app_form(manager, state);
 }
 
 /// The 分割 options offered by the 画面 picker, in the order the combo lists them.
@@ -1439,6 +1448,60 @@ fn refresh_pending_apps(manager: &WorksetManager, state: &WorksetManagerState) {
         .map(|pending| pending_app_label(pending).into())
         .collect();
     manager.set_pending_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+/// アプリのフォームを空に戻し、行の編集中状態も解除する。追加・更新のあとと、
+/// 登録画面を開き直したときに呼ぶ。
+fn clear_pending_app_form(manager: &WorksetManager, state: &mut WorksetManagerState) {
+    state.editing_pending_index = None;
+    manager.set_pending_edit_index(-1);
+    manager.set_app_selected_index(-1);
+    apply_app_selection(manager, None);
+}
+
+/// 追加済みの行をアプリのフォームへ読み戻す。「編集」はこれで、行を消して入れ直す
+/// 代わりに同じフォームをそのまま使い回す。
+///
+/// 戻り値は、その行のアプリを起動候補の一覧から選び直せたか。選び直せないのは、
+/// 起動候補から消されたアプリ（または実行中の窓から作られた代替）のときで、
+/// 「更新」を押す前にアプリを選び直してもらう必要がある。
+fn load_pending_app_into_form(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    pending: &PendingApp,
+) -> bool {
+    // 同じ起動候補を選び直す。id が一致しないときは実行ファイルで拾う。
+    let catalog_index = config
+        .launch_apps
+        .iter()
+        .position(|app| app.id == pending.app.id)
+        .or_else(|| {
+            config.launch_apps.iter().position(|app| {
+                crate::windowing::matcher::same_executable(&app.program, &pending.app.program)
+            })
+        })
+        .and_then(|i| i32::try_from(i).ok());
+    manager.set_app_selected_index(catalog_index.unwrap_or(-1));
+    // 入力欄の種類（フォルダー / URL / 引数）はアプリで決まる。行が持つアプリで
+    // 欄を組み立ててから、保存済みの値を入れ直す。
+    apply_app_selection(manager, Some(&pending.app));
+    manager.set_app_input_text(pending.input.clone().into());
+    manager.set_app_args_text(pending.extra_args.clone().into());
+
+    manager.set_placement_monitor_index(i32::try_from(pending.monitor_index).unwrap_or(0));
+    manager.set_placement_split_index(
+        PLACEMENT_SPLITS
+            .iter()
+            .position(|(split, _)| *split == pending.split)
+            .and_then(|i| i32::try_from(i).ok())
+            .unwrap_or(0),
+    );
+    // セル一覧は分割に属するので、分割を入れたあとで作り直す。位置は先頭に戻される
+    // ので、そのあとに書き戻す。
+    refresh_placement_cells(manager);
+    manager.set_placement_cell_index(i32::try_from(pending.cell_index).unwrap_or(0));
+
+    catalog_index.is_some()
 }
 
 /// The registered launch app at `index` in `config.launch_apps`, if any.
@@ -2473,10 +2536,11 @@ fn wire_workset_manager(
     // Load the Start Menu catalogue once, now, so the registry's picker is
     // populated the first time it is opened.
     spawn_app_catalog_load(manager.as_weak());
-    refresh_launch_apps(manager, &config.borrow());
+    refresh_launch_apps(manager, &config.borrow(), &mut state.borrow_mut());
 
     let m = manager.as_weak();
     let c = config.clone();
+    let s = state.clone();
     manager.on_open_app_registry(move || {
         let Some(manager) = m.upgrade() else { return };
         manager.set_registry_search("".into());
@@ -2485,7 +2549,7 @@ fn wire_workset_manager(
         manager.set_registry_args("".into());
         manager.set_registry_aumid("".into());
         push_app_catalog(&manager);
-        refresh_launch_apps(&manager, &c.borrow());
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
         manager.set_managing_apps(true);
         manager.set_status_text(
             "アプリの名称とパスを入力するか、スタートメニューから選んでください。".into(),
@@ -2553,6 +2617,7 @@ fn wire_workset_manager(
 
     let m = manager.as_weak();
     let c = config.clone();
+    let s = state.clone();
     let dir = data_dir.clone();
     manager.on_registry_save_requested(move || {
         let Some(manager) = m.upgrade() else { return };
@@ -2604,7 +2669,7 @@ fn wire_workset_manager(
             return;
         }
 
-        refresh_launch_apps(&manager, &c.borrow());
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
         manager.set_registry_catalog_index(-1);
         manager.set_registry_name("".into());
         manager.set_registry_path("".into());
@@ -2625,6 +2690,7 @@ fn wire_workset_manager(
 
     let m = manager.as_weak();
     let c = config.clone();
+    let s = state.clone();
     let dir = data_dir.clone();
     manager.on_registry_delete_requested(move |index| {
         let Some(manager) = m.upgrade() else { return };
@@ -2648,7 +2714,7 @@ fn wire_workset_manager(
             return;
         }
 
-        refresh_launch_apps(&manager, &c.borrow());
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
         manager.set_status_text(
             format!(
                 "「{}」を起動候補から削除しました（登録済みセットはそのままです）。",
@@ -2726,7 +2792,12 @@ fn wire_workset_manager(
         // applied when 登録 is pressed.
         let mut state = s.borrow_mut();
         let name = app.name.clone();
-        state.pending_apps.push(PendingApp {
+        // 編集中の行があれば、追加ではなくその行を書き換える。「退避せず最小化」は
+        // このフォームにない設定なので、行が持っている値を引き継ぐ。
+        let editing = state
+            .editing_pending_index
+            .filter(|index| *index < state.pending_apps.len());
+        let entry = PendingApp {
             app,
             input,
             extra_args,
@@ -2734,16 +2805,67 @@ fn wire_workset_manager(
             split,
             cell_index,
             // 既定は退避。登録後に詳細のチェックボックスで最小化へ切り替える。
-            minimize_when_parked: false,
-        });
+            minimize_when_parked: editing
+                .is_some_and(|index| state.pending_apps[index].minimize_when_parked),
+        };
+        match editing {
+            Some(index) => state.pending_apps[index] = entry,
+            None => state.pending_apps.push(entry),
+        }
         refresh_pending_apps(&manager, &state);
+        clear_pending_app_form(&manager, &mut state);
         drop(state);
 
-        manager.set_app_selected_index(-1);
-        apply_app_selection(&manager, None);
         manager.set_status_text(
-            format!("「{name}」を追加しました。「登録」でセットに保存されます。").into(),
+            match editing {
+                Some(_) => format!("「{name}」を更新しました。「更新」でセットに保存されます。"),
+                None => format!("「{name}」を追加しました。「登録」でセットに保存されます。"),
+            }
+            .into(),
         );
+        manager.set_status_is_warning(false);
+    });
+
+    // 追加済みの行の「編集」: その行をフォームへ読み戻し、以降は「この内容で更新」が
+    // 同じ行を書き換える。
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_pending_app_edit_requested(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let Some(pending) = state.pending_apps.get(index).cloned() else {
+            return;
+        };
+        let found = load_pending_app_into_form(&manager, &c.borrow(), &pending);
+        state.editing_pending_index = Some(index);
+        manager.set_pending_edit_index(i32::try_from(index).unwrap_or(-1));
+        drop(state);
+
+        if found {
+            manager.set_status_text(format!("「{}」を編集しています。", pending.app.name).into());
+            manager.set_status_is_warning(false);
+        } else {
+            manager.set_status_text(
+                format!(
+                    "「{}」は起動候補にありません。アプリを選び直してください。",
+                    pending.app.name
+                )
+                .into(),
+            );
+            manager.set_status_is_warning(true);
+        }
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_pending_app_edit_cancelled(move || {
+        let Some(manager) = m.upgrade() else { return };
+        clear_pending_app_form(&manager, &mut s.borrow_mut());
+        manager.set_status_text("編集をやめました。".into());
         manager.set_status_is_warning(false);
     });
 
@@ -2759,6 +2881,16 @@ fn wire_workset_manager(
             return;
         }
         state.pending_apps.remove(index);
+        // 編集中の行が消えたらフォームも空に戻す。手前の行が消えたときは、同じ行を
+        // 指し続けるように番号をずらす。
+        match state.editing_pending_index {
+            Some(editing) if editing == index => clear_pending_app_form(&manager, &mut state),
+            Some(editing) if editing > index => {
+                state.editing_pending_index = Some(editing - 1);
+                manager.set_pending_edit_index(i32::try_from(editing - 1).unwrap_or(-1));
+            }
+            _ => {}
+        }
         refresh_pending_apps(&manager, &state);
     });
 
@@ -2925,7 +3057,7 @@ fn wire_workset_manager(
 
         state.monitors = monitor::enumerate_monitors().unwrap_or_default();
         refresh_pending_apps(&manager, &state);
-        refresh_launch_apps(&manager, &config);
+        refresh_launch_apps(&manager, &config, &mut state);
         refresh_placement_monitors(&manager, &config, &state);
         manager.set_placement_split_index(0);
         refresh_placement_cells(&manager);
@@ -2966,7 +3098,7 @@ fn wire_workset_manager(
         // as they are *now*, not as they were when the manager opened.
         state.monitors = monitor::enumerate_monitors().unwrap_or_default();
         refresh_pending_apps(&manager, &state);
-        refresh_launch_apps(&manager, &config);
+        refresh_launch_apps(&manager, &config, &mut state);
         refresh_placement_monitors(&manager, &config, &state);
         manager.set_placement_split_index(0);
         refresh_placement_cells(&manager);
@@ -3350,6 +3482,7 @@ fn wire_workset_manager(
             state.pending_apps.clear();
             state.editing_workset_id = None;
             refresh_pending_apps(&manager, &state);
+            clear_pending_app_form(&manager, &mut state);
         }
         manager.set_registration_editing(false);
         manager.set_registering(false);
@@ -3496,6 +3629,7 @@ fn wire_workset_manager(
                 state.pending_apps.clear();
                 let was_editing = state.editing_workset_id.take().is_some();
                 refresh_pending_apps(&manager, &state);
+                clear_pending_app_form(&manager, &mut state);
                 manager.set_registering(false);
                 manager.set_registration_editing(false);
                 manager.set_status_text(

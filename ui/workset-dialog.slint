@@ -135,6 +135,8 @@ export component WorksetManager inherits Window {
     /// ウィンドウごとの起動引数。アプリ選択時に登録済みの既定引数が入る。
     in-out property <string> app-args-text: "";
     in property <[string]> pending-apps: [];
+    /// 上のフォームで編集中の `pending-apps` の行。-1 なら新規追加。
+    in property <int> pending-edit-index: -1;
     callback app-selected(index: int);
     // VS Code takes either a folder or a `.code-workspace` file. They get a
     // button each: one picker that guessed which you meant (file dialog first,
@@ -144,6 +146,10 @@ export component WorksetManager inherits Window {
     callback app-pick-workspace-requested();
     callback add-app-confirmed();
     callback pending-app-removed(index: int);
+    /// 追加済みの行をフォームへ読み戻して編集する。
+    callback pending-app-edit-requested(index: int);
+    /// 編集をやめてフォームを空に戻す（行はそのまま）。
+    callback pending-app-edit-cancelled();
 
     // 起動時の画面表示: which main monitor the app opens on, how that monitor is
     // split, and which cell of that split it takes. Cell order is reading order
@@ -584,8 +590,13 @@ export component WorksetManager inherits Window {
                         current-index <=> root.placement-cell-index;
                         enabled: root.placement-cells.length > 1;
                     }
+                    // 編集中は同じフォームがその行を書き換える（追加ではなく更新）。
+                    if root.pending-edit-index >= 0: GlassButton {
+                        text: "変更をやめる";
+                        clicked => { root.pending-app-edit-cancelled(); }
+                    }
                     GlassButton {
-                        text: "追加";
+                        text: root.pending-edit-index >= 0 ? "この内容で更新" : "追加";
                         primary: true;
                         enabled: root.app-selected-index >= 0;
                         clicked => { root.add-app-confirmed(); }
@@ -598,16 +609,25 @@ export component WorksetManager inherits Window {
                     min-height: 90px;
                     VerticalLayout {
                         spacing: 2px;
+                        // 行の高さは `GlassButton` の 36px に合わせる。26px だった
+                        // ときは、ボタンが行からはみ出して上下の行と重なり、隣の行の
+                        // ボタンを押してしまう当たり判定になっていた。
                         for entry[i] in root.pending-apps: HorizontalLayout {
                             spacing: Theme.space-xs;
-                            height: 26px;
+                            height: 36px;
                             Text {
-                                text: entry;
+                                // 編集中の行は色を変えて、上のフォームがどの行を
+                                // 書き換えるところなのかを示す。
+                                text: root.pending-edit-index == i ? "編集中: " + entry : entry;
                                 font-size: 11px;
-                                color: Theme.text-secondary;
+                                color: root.pending-edit-index == i ? Theme.accent : Theme.text-secondary;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
+                            }
+                            GlassButton {
+                                text: "編集";
+                                clicked => { root.pending-app-edit-requested(i); }
                             }
                             GlassButton {
                                 text: "削除";
