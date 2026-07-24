@@ -89,6 +89,8 @@ pub(crate) mod fake {
         fail_next_batch_move: RefCell<bool>,
         fail_per_window_fallback_for: RefCell<Vec<isize>>,
         foreground_history: RefCell<Vec<isize>>,
+        /// 全画面変換キーを送った相手。切替のたびに撃ち直していないかを検証する。
+        fullscreen_key_targets: RefCell<Vec<isize>>,
     }
 
     impl FakeWindowOps {
@@ -123,6 +125,11 @@ pub(crate) mod fake {
 
         pub(crate) fn foreground_history(&self) -> Vec<isize> {
             self.foreground_history.borrow().clone()
+        }
+
+        /// 全画面変換キーを送った相手の履歴。
+        pub(crate) fn fullscreen_key_targets(&self) -> Vec<isize> {
+            self.fullscreen_key_targets.borrow().clone()
         }
     }
 
@@ -166,8 +173,9 @@ pub(crate) mod fake {
             }
         }
 
-        fn send_fullscreen_keys(&self, _hwnd: isize, _refocus: Option<isize>) {
-            // Key synthesis isn't modeled by the fake; nothing to assert.
+        fn send_fullscreen_keys(&self, hwnd: isize, _refocus: Option<isize>) {
+            // キー合成自体は再現しないが、誰に送ったかは記録する。
+            self.fullscreen_key_targets.borrow_mut().push(hwnd);
         }
 
         fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool) {

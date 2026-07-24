@@ -3579,6 +3579,12 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
             } else {
                 ("", "")
             };
+            // CI にかかった時間（実行中なら経過時間）。「PR後の CI が何分かかるか」
+            // を一覧で見られるようにする。
+            let ci_text = match gh.ci_minutes {
+                Some(minutes) if !ci_text.is_empty() => format!("{ci_text} {minutes}分"),
+                _ => ci_text.to_string(),
+            };
             QuickSwitcherRow {
                 workset_id: workset.id.to_string().into(),
                 name: workset.name.clone().into(),

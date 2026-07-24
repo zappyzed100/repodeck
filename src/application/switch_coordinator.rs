@@ -377,6 +377,12 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         }
 
         // Now park the outgoing set and every other non-target live set.
+        //
+        // 全画面変換（ブラウザへの F キー送信）は「今まさに退避された瞬間」だけに
+        // 限る。非対象のセットは毎回の切替で再配置されるが、既に退避済み＝すでに
+        // 全画面なので、撃ち直すと切り替えのたびに全画面トグルが走ってしまう。
+        // メインへ戻す側の解除は `target_was_fullscreen` が担当する。
+        let outgoing_id = current.map(|w| w.id);
         let mut fullscreen_hwnds: Vec<isize> = Vec::new();
         let worksets_with_windows: std::collections::HashSet<Uuid> =
             parking.iter().map(|(w, _)| w.id).collect();
@@ -403,7 +409,12 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 &mut runtime.auto_slot_assignments,
                 &worksets_with_windows,
             ) {
-                Ok(hwnds) => fullscreen_hwnds.extend(hwnds),
+                // 退避されたのが「直前まで使っていたセット」のときだけ全画面へ。
+                Ok(hwnds) => {
+                    if Some(w.id) == outgoing_id {
+                        fullscreen_hwnds.extend(hwnds);
+                    }
+                }
                 Err(reason) => return Err(self.rollback(journal, reason)),
             }
         }
@@ -1296,6 +1307,117 @@ mod tests {
         assert!(
             on_some_monitor(rect, monitors),
             "hwnd {hwnd} rect {rect:?} is not fully within any monitor"
+        );
+    }
+
+    #[test]
+    fn fullscreen_keys_are_sent_only_when_a_set_is_newly_parked() {
+        // 「退避された瞬間」だけ全画面変換する。既に退避済みのセットは毎回の切替で
+        // 再配置されるが、そこで撃ち直すと切り替えのたびに全画面トグルが走る。
+        let dir = tempdir().unwrap();
+        let main_rect = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let sub_id = Uuid::new_v4();
+        let mut a = workset(
+            0,
+            ParkingPolicy::SubScreen {
+                sub_screen_id: sub_id,
+            },
+            vec![managed_window(
+                "app-a",
+                0,
+                main_rect,
+                SavedShowState::Normal,
+                0,
+            )],
+        );
+        a.fullscreen_when_parked = true;
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window(
+                "app-b",
+                0,
+                main_rect,
+                SavedShowState::Normal,
+                0,
+            )],
+        );
+        let c = workset(
+            2,
+            ParkingPolicy::Auto,
+            vec![managed_window(
+                "app-c",
+                0,
+                main_rect,
+                SavedShowState::Normal,
+                0,
+            )],
+        );
+        let worksets = vec![a.clone(), b.clone(), c.clone()];
+
+        let live_windows = vec![
+            live_window(1, "app-a"),
+            live_window(2, "app-b"),
+            live_window(3, "app-c"),
+        ];
+        let main = monitor("MAIN", 0);
+        let side = monitor("SIDE", 1920);
+        let live_monitors = vec![main.clone(), side.clone()];
+        let sub_screens = vec![crate::domain::config::SubScreen {
+            id: sub_id,
+            name: "sub".to_string(),
+            monitor_ids: vec!["SIDE".to_string()],
+            split: AutoSplit::One,
+            cell_index: 0,
+            fullscreen: false,
+        }];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+
+        let fake = FakeWindowOps::new();
+        for hwnd in [1isize, 2, 3] {
+            fake.seed_window(
+                hwnd,
+                PixelRect::new(100, 100, 400, 300),
+                SavedShowState::Normal,
+            );
+        }
+        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+
+        let switch_to = |target: Uuid| {
+            coordinator
+                .switch_to(SwitchRequest {
+                    worksets: &worksets,
+                    fixed_slots: &[],
+                    sub_screens: &sub_screens,
+                    saved_monitors: &[],
+                    main_monitor_ids: &main_monitor_ids,
+                    live_monitors: &live_monitors,
+                    live_windows: &live_windows,
+                    target_workset_id: target,
+                })
+                .expect("switch")
+        };
+
+        // A へ入って、そこから B へ抜ける＝A が退避された瞬間なのでキーが飛ぶ。
+        switch_to(a.id);
+        switch_to(b.id);
+        let after_parking_a = coordinator.window_ops.fullscreen_key_targets();
+        assert!(
+            after_parking_a.contains(&1),
+            "the set being parked should get the full-screen keys"
+        );
+
+        // B → C。A は既に退避済みで再配置されるだけなので、撃ち直さない。
+        switch_to(c.id);
+        assert_eq!(
+            coordinator.window_ops.fullscreen_key_targets(),
+            after_parking_a,
+            "an already-parked set must not be re-sent the full-screen keys"
         );
     }
 

@@ -71,6 +71,9 @@ pub struct GhStatus {
     pub current_branch_pr: Option<PrRef>,
     /// Latest CI conclusion for `branch`.
     pub ci: CiState,
+    /// 直近の CI 実行にかかった時間（分）。実行中なら経過時間。取得できなければ
+    /// `None`。「PR後の CI がどれくらいかかるのか」を一覧で見るための値。
+    pub ci_minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +88,27 @@ struct GhPr {
 struct GhRun {
     status: String,
     conclusion: Option<String>,
+    /// 実行開始時刻（RFC3339）。所要時間の算出に使う。
+    #[serde(rename = "startedAt", default)]
+    started_at: Option<String>,
+    /// 最終更新時刻。完了済みの run では終了時刻とみなせる。
+    #[serde(rename = "updatedAt", default)]
+    updated_at: Option<String>,
+}
+
+/// CI の所要時間（分）。完了済みなら「かかった時間」、実行中なら「経過時間」。
+/// 時刻が読めない・取得できない場合は `None`。
+fn ci_minutes(run: &GhRun) -> Option<u32> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let started = OffsetDateTime::parse(run.started_at.as_deref()?, &Rfc3339).ok()?;
+    let end = if run.status == "completed" {
+        OffsetDateTime::parse(run.updated_at.as_deref()?, &Rfc3339).ok()?
+    } else {
+        OffsetDateTime::now_utc()
+    };
+    u32::try_from((end - started).whole_minutes().max(0)).ok()
 }
 
 /// Fetches open-PR and CI status for the repo at `dir`. `branch` is the current
@@ -117,30 +141,43 @@ pub fn fetch(dir: &Path, branch: Option<&str>) -> GhStatus {
         })
     });
 
+    let (ci_state, ci_minutes) = fetch_ci(dir, branch);
+
     GhStatus {
         gh_available: true,
         open_pr_count: prs.len().try_into().unwrap_or(u32::MAX),
         current_branch_pr,
-        ci: fetch_ci(dir, branch),
+        ci: ci_state,
+        ci_minutes,
     }
 }
 
 /// Latest CI conclusion for `branch` (or the repo's default if `branch` is
 /// `None`), via `gh run list`.
-fn fetch_ci(dir: &Path, branch: Option<&str>) -> CiState {
-    let mut args = vec!["run", "list", "--limit", "1", "--json", "status,conclusion"];
+fn fetch_ci(dir: &Path, branch: Option<&str>) -> (CiState, Option<u32>) {
+    let mut args = vec![
+        "run",
+        "list",
+        "--limit",
+        "1",
+        "--json",
+        "status,conclusion,startedAt,updatedAt",
+    ];
     if let Some(b) = branch {
         args.push("--branch");
         args.push(b);
     }
     let Some(json) = gh(dir, &args) else {
-        return CiState::None;
+        return (CiState::None, None);
     };
     let runs: Vec<GhRun> = serde_json::from_str(json.trim()).unwrap_or_default();
     let Some(run) = runs.first() else {
-        return CiState::None;
+        return (CiState::None, None);
     };
-    classify_ci(&run.status, run.conclusion.as_deref())
+    (
+        classify_ci(&run.status, run.conclusion.as_deref()),
+        ci_minutes(run),
+    )
 }
 
 /// Maps a `gh run` `(status, conclusion)` to a [`CiState`].
