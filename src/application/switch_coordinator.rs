@@ -121,6 +121,26 @@ impl<W: WindowOps> SwitchCoordinator<W> {
 
     /// PLAN.md §3.8, steps 1-12.
     pub fn switch_to(&self, request: SwitchRequest) -> Result<SwitchOutcome, SwitchError> {
+        self.switch_to_inner(request, false)
+    }
+
+    /// `switch_to`, except that a target which is *already* the current workset
+    /// gets its placement re-applied instead of only re-focused (§3.8 step 2's
+    /// no-op).
+    ///
+    /// クイックスイッチャーを呼んだのに切り替えずに終わったときの再配置に使う。
+    /// 対象セットはメイン画面へ置き直され、他のセットは退避し直されるので、窓が
+    /// ずれていても「呼んで閉じる」だけで整う。対象セットは退避されていないので、
+    /// 退避先セルの明け渡しと全画面解除は走らない。
+    pub fn switch_or_reapply(&self, request: SwitchRequest) -> Result<SwitchOutcome, SwitchError> {
+        self.switch_to_inner(request, true)
+    }
+
+    fn switch_to_inner(
+        &self,
+        request: SwitchRequest,
+        reapply_when_current: bool,
+    ) -> Result<SwitchOutcome, SwitchError> {
         if self.switching.swap(true, Ordering::Acquire) {
             return Err(SwitchError::AlreadyInProgress); // step 1
         }
@@ -149,8 +169,10 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             runtime.window_bindings.insert(id, hwnd);
         }
 
-        // Step 2: switching to the already-current workset is a no-op focus.
-        if runtime.current_workset_id == Some(target.id) {
+        // Step 2: switching to the already-current workset is a no-op focus —
+        // unless the caller asked for its placement to be re-applied.
+        let reapplying = runtime.current_workset_id == Some(target.id);
+        if reapplying && !reapply_when_current {
             let resolved = resolved_windows(target, &decisions, request.live_windows);
             let focused_hwnd = frontmost(&resolved).map(|w| w.hwnd);
             tracing::info!(
@@ -170,9 +192,16 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             });
         }
 
-        let current = runtime
-            .current_workset_id
-            .and_then(|id| request.worksets.iter().find(|w| w.id == id));
+        // 再適用では「出ていくセット」が存在しない。対象セットはメイン画面に居たまま
+        // 置き直されるだけなので、退避もしないし、退避先セルを明け渡させることも、
+        // 退避後の全画面化もしない。
+        let current = if reapplying {
+            None
+        } else {
+            runtime
+                .current_workset_id
+                .and_then(|id| request.worksets.iter().find(|w| w.id == id))
+        };
         let current_resolved = current
             .map(|w| resolved_windows(w, &decisions, request.live_windows))
             .unwrap_or_default();
@@ -218,6 +247,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             target: "switch",
             from = current.map(|w| w.name.as_str()).unwrap_or("(none)"),
             to = %target.name,
+            reapply = reapplying,
             current_windows = current_resolved.len(),
             target_windows = target_resolved.len(),
             live_windows = request.live_windows.len(),
@@ -304,18 +334,21 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // Was the target set parked in browser full-screen (F11/F)? That's not a
         // Win32 maximized state, so plain placement can't shrink it back — those
         // windows get the exit-keys sequence, which owns the whole restore.
-        let target_was_fullscreen = match &target.parking_policy {
-            ParkingPolicy::SubScreen { sub_screen_id } => {
-                let sole = sub_screen_sharer_count(request.worksets, *sub_screen_id) <= 1;
-                let sub_fs = request
-                    .sub_screens
-                    .iter()
-                    .find(|s| s.id == *sub_screen_id)
-                    .is_some_and(|s| s.fullscreen);
-                sole && (target.fullscreen_when_parked || sub_fs)
-            }
-            _ => target.fullscreen_when_parked,
-        };
+        // 再適用の対象セットは退避されていない＝全画面でもないので、解除キーを撃つと
+        // 逆に全画面へトグルしてしまう。
+        let target_was_fullscreen = !reapplying
+            && match &target.parking_policy {
+                ParkingPolicy::SubScreen { sub_screen_id } => {
+                    let sole = sub_screen_sharer_count(request.worksets, *sub_screen_id) <= 1;
+                    let sub_fs = request
+                        .sub_screens
+                        .iter()
+                        .find(|s| s.id == *sub_screen_id)
+                        .is_some_and(|s| s.fullscreen);
+                    sole && (target.fullscreen_when_parked || sub_fs)
+                }
+                _ => target.fullscreen_when_parked,
+            };
         // Restore each target window to its saved main rect and show state.
         // If two target windows' saved placements overlap — e.g. a main monitor
         // is gone and several fall back to the same one — tile the target windows
@@ -1786,6 +1819,159 @@ mod tests {
         let second_park_rect = coordinator.window_ops.rect_of(1).unwrap();
 
         assert_eq!(first_park_rect, second_park_rect);
+    }
+
+    /// メイン画面のセットA（窓1）と、退避されるセットB（窓2）。再適用のテスト3本が
+    /// 同じ土台を使う。`fullscreen` はセットAの「退避後に全画面表示」。
+    fn reapply_worksets(fullscreen: bool) -> Vec<Workset> {
+        let rect = NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.4,
+            height: 0.4,
+        };
+        let mut a = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-a", 0, rect, SavedShowState::Normal, 0)],
+        );
+        a.fullscreen_when_parked = fullscreen;
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-b", 0, rect, SavedShowState::Normal, 0)],
+        );
+        vec![a, b]
+    }
+
+    fn reapply_coordinator(dir: &std::path::Path) -> SwitchCoordinator<FakeWindowOps> {
+        let fake = FakeWindowOps::new();
+        fake.seed_window(1, PixelRect::new(0, 0, 400, 300), SavedShowState::Normal);
+        fake.seed_window(2, PixelRect::new(0, 0, 400, 300), SavedShowState::Normal);
+        SwitchCoordinator::new(fake, dir.to_path_buf())
+    }
+
+    /// `switch_or_reapply` が変える前提: 通常の `switch_to` は対象が現在セットなら窓に
+    /// 触らない（フォーカスのみ）ので、ずれた窓はずれたまま残る。
+    #[test]
+    fn switch_to_leaves_the_current_workset_where_it_drifted() {
+        let dir = tempdir().unwrap();
+        let worksets = reapply_worksets(false);
+        let live_windows = vec![live_window(1, "app-a"), live_window(2, "app-b")];
+        let live_monitors = vec![monitor("MAIN", 0), monitor("SIDE", 1920)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+        let coordinator = reapply_coordinator(dir.path());
+        let request = |target: Uuid| SwitchRequest {
+            worksets: &worksets,
+            fixed_slots: &[],
+            sub_screens: &[],
+            saved_monitors: &[],
+            main_monitor_ids: &main_monitor_ids,
+            live_monitors: &live_monitors,
+            live_windows: &live_windows,
+            target_workset_id: target,
+        };
+
+        coordinator.switch_to(request(worksets[0].id)).unwrap();
+        let placed = coordinator.window_ops.rect_of(1).unwrap();
+
+        let drifted = PixelRect::new(37, 41, 400, 300);
+        coordinator
+            .window_ops
+            .set_placement(1, drifted, false, false);
+        coordinator.switch_to(request(worksets[0].id)).unwrap();
+
+        assert_ne!(placed, drifted, "the drift must be an actual move");
+        assert_eq!(
+            coordinator.window_ops.rect_of(1).unwrap(),
+            drifted,
+            "switching to the already-current set stays a focus-only no-op"
+        );
+    }
+
+    /// クイックスイッチャーを呼んで切り替えずに終わったときの再配置。現在セットは
+    /// メインの保存位置へ戻り、他セットの窓は退避され直す。
+    #[test]
+    fn switch_or_reapply_puts_the_current_workset_back_and_reparks_the_others() {
+        let dir = tempdir().unwrap();
+        let worksets = reapply_worksets(false);
+        let live_windows = vec![live_window(1, "app-a"), live_window(2, "app-b")];
+        let live_monitors = vec![monitor("MAIN", 0), monitor("SIDE", 1920)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+        let coordinator = reapply_coordinator(dir.path());
+        let request = |target: Uuid| SwitchRequest {
+            worksets: &worksets,
+            fixed_slots: &[],
+            sub_screens: &[],
+            saved_monitors: &[],
+            main_monitor_ids: &main_monitor_ids,
+            live_monitors: &live_monitors,
+            live_windows: &live_windows,
+            target_workset_id: target,
+        };
+
+        coordinator.switch_to(request(worksets[0].id)).unwrap();
+        let placed = coordinator.window_ops.rect_of(1).unwrap();
+        let parked = coordinator.window_ops.rect_of(2).unwrap();
+
+        // 現在セットの窓と、退避済みの他セットの窓を両方ずらす。
+        coordinator
+            .window_ops
+            .set_placement(1, PixelRect::new(37, 41, 400, 300), false, false);
+        coordinator
+            .window_ops
+            .set_placement(2, PixelRect::new(11, 13, 400, 300), false, false);
+
+        coordinator
+            .switch_or_reapply(request(worksets[0].id))
+            .unwrap();
+
+        assert_eq!(
+            coordinator.window_ops.rect_of(1).unwrap(),
+            placed,
+            "the current set goes back onto its saved main rect"
+        );
+        assert_eq!(
+            coordinator.window_ops.rect_of(2).unwrap(),
+            parked,
+            "the other set is parked again, into the same cell a switch would use"
+        );
+    }
+
+    /// 現在セットが「退避後に全画面表示」でも、再適用では全画面解除を要求しない。
+    /// 再適用の対象は退避されていない＝全画面でもないので、解除キーを撃つと逆に
+    /// 全画面へ入ってしまう。
+    #[test]
+    fn switch_or_reapply_does_not_exit_fullscreen_for_the_current_workset() {
+        let dir = tempdir().unwrap();
+        let worksets = reapply_worksets(true);
+        let live_windows = vec![live_window(1, "app-a"), live_window(2, "app-b")];
+        let live_monitors = vec![monitor("MAIN", 0), monitor("SIDE", 1920)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+        let coordinator = reapply_coordinator(dir.path());
+        let request = |target: Uuid| SwitchRequest {
+            worksets: &worksets,
+            fixed_slots: &[],
+            sub_screens: &[],
+            saved_monitors: &[],
+            main_monitor_ids: &main_monitor_ids,
+            live_monitors: &live_monitors,
+            live_windows: &live_windows,
+            target_workset_id: target,
+        };
+
+        coordinator.switch_to(request(worksets[0].id)).unwrap();
+        let before = coordinator.window_ops.exit_fullscreen_targets();
+
+        coordinator
+            .switch_or_reapply(request(worksets[0].id))
+            .unwrap();
+
+        assert_eq!(
+            coordinator.window_ops.exit_fullscreen_targets(),
+            before,
+            "a re-applied set was never parked, so it must not be asked to exit fullscreen"
+        );
     }
 
     #[test]

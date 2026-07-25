@@ -3965,6 +3965,7 @@ fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, d
     // sticks if it's the *last* thing touching the style bits.
     popup_window::exclude_from_taskbar_and_alt_tab(switcher.window());
     popup_window::force_foreground(switcher.window());
+    arm_switcher_reapply();
 }
 
 /// PLAN.md §3.3/§3.4: the hotkey and tray-icon left-click both *toggle*
@@ -3978,6 +3979,7 @@ fn toggle_quick_switcher(switcher: &QuickSwitcher, config: &AppConfig, data_dir:
         // release timer must not survive to commit an unconfirmed switch.
         cancel_cycle_timer();
         let _ = switcher.hide();
+        reapply_on_switcher_dismiss();
     } else {
         show_quick_switcher_at_cursor(switcher, config, data_dir);
     }
@@ -4268,6 +4270,8 @@ fn wire_quick_switcher(
         // A direct switch (Enter/click/number, or a hold-to-cycle commit)
         // ends any hold session; a stale release timer must not re-fire.
         cancel_cycle_timer();
+        // 切り替えたのだから、この後閉じても再適用はしない。
+        disarm_switcher_reapply();
         let Ok(target_workset_id) = uuid::Uuid::parse_str(&workset_id) else {
             return;
         };
@@ -4296,7 +4300,9 @@ fn wire_quick_switcher(
             let config = c.borrow();
             let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
 
-            match coord.switch_to(SwitchRequest {
+            // 選んだ先が今いるセットそのものだった（ホールドサイクルで一周して
+            // 戻ってきた等）ときも、フォーカスだけで終わらせず配置を当て直す。
+            match coord.switch_or_reapply(SwitchRequest {
                 worksets: &config.worksets,
                 fixed_slots: &config.fixed_slots,
                 sub_screens: &config.sub_screens,
@@ -4352,6 +4358,8 @@ fn wire_quick_switcher(
     let coord = coordinator.clone();
     switcher.on_recover_requested(move || {
         let Some(switcher) = s.upgrade() else { return };
+        // 回収した窓を、閉じた直後の再適用で退避し直してしまわないように。
+        disarm_switcher_reapply();
         let config = c.borrow();
         let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
         let live_windows =
@@ -4383,6 +4391,8 @@ fn wire_quick_switcher(
     let settings_for_open = settings_window;
     let c = config.clone();
     switcher.on_settings_requested(move || {
+        // 設定を開くのは「何もせず閉じた」ではない。
+        disarm_switcher_reapply();
         if let Some(switcher) = s.upgrade() {
             let _ = switcher.hide();
         }
@@ -4398,6 +4408,7 @@ fn wire_quick_switcher(
         if let Some(switcher) = s.upgrade() {
             let _ = switcher.hide();
         }
+        reapply_on_switcher_dismiss();
     });
 }
 
@@ -5233,6 +5244,7 @@ fn drive_cycle(ctx: &CrossThreadUiContext, forward: bool, watch_vks: Vec<i32>) {
 struct CrossThreadUiContext {
     config: Rc<RefCell<AppConfig>>,
     data_dir: PathBuf,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
     pending_hotkey_rollback: RefCell<Option<HotkeyConfig>>,
     settings_window: slint::Weak<AppWindow>,
     quick_switcher: slint::Weak<QuickSwitcher>,
@@ -5245,6 +5257,77 @@ struct CrossThreadUiContext {
 
 thread_local! {
     static UI_CONTEXT: RefCell<Option<Rc<CrossThreadUiContext>>> = const { RefCell::new(None) };
+
+    /// クイックスイッチャーを開いてから、まだ何もしていないか。表示で立て、切替や
+    /// 他の操作で下ろす。閉じるときに立ったままなら「呼んだのに切り替えずに終わった」
+    /// ので、現在セットの配置を再適用する。
+    static SWITCHER_REAPPLY_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// クイックスイッチャーを表示したので、「何もせずに終わった」判定を有効にする。
+fn arm_switcher_reapply() {
+    SWITCHER_REAPPLY_ARMED.with(|armed| armed.set(true));
+}
+
+/// 切替・メイン画面を空にする・回収・別ウィンドウを開く——何かしら実行されたので、
+/// この後閉じても再適用しない。再適用は「呼んだだけで終わった」ときのためのもので、
+/// 実行された操作をこの直後に上書きしてはいけない。
+fn disarm_switcher_reapply() {
+    SWITCHER_REAPPLY_ARMED.with(|armed| armed.set(false));
+}
+
+/// クイックスイッチャーを閉じたときに呼ぶ。何もせずに終わっていたなら、現在セットの
+/// 配置を再適用する（PLAN.md §3.3「呼んで切り替えずに終わったとき」）。
+///
+/// 印は取り出して下ろすので、Esc で閉じる → 非アクティブ化でも閉じるのように合図が
+/// 二重に来ても一度しか走らない。実際の再配置は、`WM_ACTIVATE` の中から窓を動かし
+/// 始めないようイベントループへ回す。
+fn reapply_on_switcher_dismiss() {
+    if !SWITCHER_REAPPLY_ARMED.with(|armed| armed.replace(false)) {
+        return;
+    }
+    let _ = slint::invoke_from_event_loop(reapply_current_placement);
+}
+
+/// 現在セットの配置をもう一度当てる。切替と同じ経路（ジャーナル・ロールバック込み）
+/// を通るが、対象が現在セットでも早期 return しない `switch_or_reapply` を使う。
+/// 閉じたアプリの起動はしない——これは「並びを整える」操作なので、開いていない窓を
+/// 開き直すのは行き過ぎ。
+fn reapply_current_placement() {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let Some(target_workset_id) = runtime_store::load(&ctx.data_dir).current_workset_id else {
+        return;
+    };
+
+    // 切替と同じく、保存済みの配置を使う直前にモニターの入れ替わりを見る。
+    reconcile_monitor_identity(&ctx.data_dir, &ctx.config, "reapply");
+
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let config = ctx.config.borrow();
+    match ctx.coordinator.switch_or_reapply(SwitchRequest {
+        worksets: &config.worksets,
+        fixed_slots: &config.fixed_slots,
+        sub_screens: &config.sub_screens,
+        saved_monitors: &config.monitors,
+        main_monitor_ids: &config.main_monitor_ids,
+        live_monitors: &live_monitors,
+        live_windows: &live_windows,
+        target_workset_id,
+    }) {
+        Ok(_) => tracing::info!(
+            target: "switch", workset = %target_workset_id,
+            "quick switcher closed without switching: re-applied the current placement"
+        ),
+        // 閉じた後なので出せるUIがない。ログだけ残す。
+        Err(err) => tracing::warn!(
+            target: "switch", error = %err,
+            "quick switcher closed without switching: re-apply failed"
+        ),
+    }
 }
 
 fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
@@ -6122,6 +6205,8 @@ pub fn run() -> Result<()> {
     let workset_manager_for_qs_empty = workset_manager.as_weak();
     let switcher_for_qs_empty = quick_switcher.as_weak();
     quick_switcher.on_empty_main_requested(move || {
+        // 空にした直後に再適用が走ると、退避したはずの窓を並べ直してしまう。
+        disarm_switcher_reapply();
         if let Some(switcher) = switcher_for_qs_empty.upgrade() {
             let _ = switcher.hide();
         }
@@ -6135,6 +6220,8 @@ pub fn run() -> Result<()> {
     let workset_manager_for_qs_manage = workset_manager.as_weak();
     let switcher_for_qs_manage = quick_switcher.as_weak();
     quick_switcher.on_manager_requested(move || {
+        // セット管理を開くのは「何もせず閉じた」ではない。
+        disarm_switcher_reapply();
         if let Some(switcher) = switcher_for_qs_manage.upgrade() {
             let _ = switcher.hide();
         }
@@ -6155,6 +6242,7 @@ pub fn run() -> Result<()> {
         *cell.borrow_mut() = Some(Rc::new(CrossThreadUiContext {
             config: config.clone(),
             data_dir: data_dir.clone(),
+            coordinator: coordinator.clone(),
             pending_hotkey_rollback: RefCell::new(None),
             settings_window: window.as_weak(),
             quick_switcher: quick_switcher.as_weak(),
@@ -6274,6 +6362,7 @@ pub fn run() -> Result<()> {
             if let Some(switcher) = s.upgrade() {
                 let _ = switcher.hide();
             }
+            reapply_on_switcher_dismiss();
         });
 
     // --- Tray wiring (PLAN.md §3.4) ---

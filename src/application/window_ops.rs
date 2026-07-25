@@ -91,6 +91,9 @@ pub(crate) mod fake {
         foreground_history: RefCell<Vec<isize>>,
         /// 全画面変換キーを送った相手。切替のたびに撃ち直していないかを検証する。
         fullscreen_key_targets: RefCell<Vec<isize>>,
+        /// 全画面解除を要求した相手。解除は配置と同じ結果になるので、rect だけでは
+        /// 「解除キーを撃ったか」が区別できない。
+        exit_fullscreen_targets: RefCell<Vec<isize>>,
     }
 
     impl FakeWindowOps {
@@ -130,6 +133,11 @@ pub(crate) mod fake {
         /// 全画面変換キーを送った相手の履歴。
         pub(crate) fn fullscreen_key_targets(&self) -> Vec<isize> {
             self.fullscreen_key_targets.borrow().clone()
+        }
+
+        /// 全画面解除を要求した相手の履歴。
+        pub(crate) fn exit_fullscreen_targets(&self) -> Vec<isize> {
+            self.exit_fullscreen_targets.borrow().clone()
         }
     }
 
@@ -181,6 +189,7 @@ pub(crate) mod fake {
         fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool) {
             // Modeled as an immediate placement so restore tests still observe
             // the final state; the key synthesis itself isn't modeled.
+            self.exit_fullscreen_targets.borrow_mut().push(hwnd);
             self.set_placement(hwnd, restore_rect, maximized, false);
         }
 
