@@ -2280,20 +2280,10 @@ fn find_window_by_command_line<'a>(
     claimed: &std::collections::HashSet<isize>,
     identity: &str,
 ) -> Option<&'a TopLevelWindow> {
-    let needle = identity
-        .trim_start_matches("--user-data-dir=")
-        .trim_matches('"')
-        .to_lowercase();
-    if needle.is_empty() {
-        return None;
-    }
     after
         .iter()
         .filter(|w| !before.contains(&w.hwnd) && !claimed.contains(&w.hwnd))
-        .find(|w| {
-            crate::windowing::process_info::read_process_command_line(w.process_id)
-                .is_some_and(|cmd| cmd.to_lowercase().contains(&needle))
-        })
+        .find(|w| window_matches_identity(w, identity))
 }
 
 /// バインド済みのうち、その後ウィンドウが消えたものを `dead` へ戻す。戻したもの
@@ -2325,6 +2315,132 @@ fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
     vanished
 }
 
+/// 起動しても新しい窓が現れなかったエントリを、既に動いているその窓へ結びつける。
+/// 結びつけたものがあれば `true`。
+///
+/// 単一インスタンスのアプリ——パッケージ版の ChatGPT/Codex のような——は、AUMID で
+/// 起動しても既存インスタンスが前に出るだけで新しい窓を作らない。すると「現れた窓と
+/// ペアリングする」経路が一度も走らず、宣言由来のエントリは `window_class` を学習
+/// できない。学習できないと得点が `AUTO_REBIND_THRESHOLD` に届かないので毎回
+/// 「閉じている」と誤判定されて起動を試み、また新しい窓は出ない——という循環に陥る
+/// （2026-07-26: ChatGPT セットが実際にこれで、実行ファイル一致50＋タイトル完全一致
+/// 20の70点、閾値に5点足りなかった）。
+///
+/// なので諦める前に、照合が弾いた窓をもう一度見る。ただし条件は厳しく取る:
+///
+/// - **起動前から在った窓だけ**（`before`）。起動途中の窓を先回りして掴まない
+/// - まだ誰にも結びついていない窓だけ
+/// - 用途別ブラウザ（`--user-data-dir`）は、そのプロファイルの窓だけ
+/// - タイトルに「そのアプリの他の窓ではなくこの窓だ」と言える根拠があるもの
+///   （`has_title_evidence`）。これが無いと、ユーザーが自分で開いただけの無関係な
+///   ブラウザ窓をセットが奪ってしまう
+/// - 該当が**ちょうど1つ**のときだけ。複数あるなら取り違えるので何もしない
+///
+/// 一度結びつけば `remember_learned_classes` がクラスを書き戻すので、次の切替から
+/// 通常の照合で一致する。つまりこの経路を通るのはセットにつき一度だけ。
+fn bind_already_running_windows(
+    pending: &mut PendingAcquire,
+    config: &AppConfig,
+    data_dir: &Path,
+) -> bool {
+    if pending.dead.is_empty() {
+        return false;
+    }
+    let live = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let runtime = runtime_store::load(data_dir);
+    // 他のエントリが握っている窓は対象外。ただし判定に使うのは「いまも存在する」
+    // エントリの紐づけだけ（消えたセットの残骸を真に受けると、現役の窓が握られて
+    // いるように見えて候補が消える）。
+    let known_ids: std::collections::HashSet<uuid::Uuid> = config
+        .worksets
+        .iter()
+        .flat_map(|w| w.windows.iter())
+        .map(|w| w.id)
+        .collect();
+    let awaiting: std::collections::HashSet<uuid::Uuid> =
+        pending.dead.iter().map(|d| d.id).collect();
+    let bound_elsewhere = launch_service::hwnds_bound_to_other_entries(
+        &runtime.window_bindings,
+        &known_ids,
+        &awaiting,
+    );
+    let windows = config
+        .worksets
+        .iter()
+        .find(|w| w.id == pending.workset_id)
+        .map(|w| w.windows.as_slice())
+        .unwrap_or_default();
+
+    let mut newly_bound: Vec<BoundWindow> = Vec::new();
+    let claimed = &mut pending.claimed;
+    let blank_browsers = &mut pending.blank_browsers;
+    let before = &pending.before;
+    pending.dead.retain(|launched| {
+        let Some(managed) = windows.iter().find(|w| w.id == launched.id) else {
+            return true;
+        };
+        let only = match launch_service::resolve_already_running_window(
+            &live,
+            before,
+            claimed,
+            &bound_elsewhere,
+            &managed.matcher,
+            &launched.exe,
+            |w| match launched.identity.as_deref() {
+                None => true,
+                Some(identity) => window_matches_identity(w, identity),
+            },
+        ) {
+            launch_service::AlreadyRunning::Only(w) => w,
+            launch_service::AlreadyRunning::Ambiguous(count) => {
+                tracing::info!(
+                    target: "launch", managed = %launched.id, candidates = count,
+                    "switch: the app is already running but has several unbound windows; not guessing"
+                );
+                return true;
+            }
+            launch_service::AlreadyRunning::NoCandidate => return true,
+        };
+        tracing::info!(
+            target: "launch", managed = %launched.id, hwnd = only.hwnd, class = %only.window_class,
+            "switch: bound an already-running window that the launch could not recreate"
+        );
+        claimed.insert(only.hwnd);
+        // 既に開いていた窓なので、アドレスバーにフォーカスが当たった起動直後の
+        // ブラウザ扱いで最小化してはいけない。
+        blank_browsers.remove(&launched.id);
+        newly_bound.push(BoundWindow {
+            launched: Launched {
+                id: launched.id,
+                exe: launched.exe.clone(),
+                class: launched.class.clone(),
+                identity: launched.identity.clone(),
+            },
+            hwnd: only.hwnd,
+            observed_class: only.window_class.clone(),
+        });
+        false
+    });
+
+    let bound_any = !newly_bound.is_empty();
+    pending.bound.append(&mut newly_bound);
+    bound_any
+}
+
+/// その窓のプロセスが `identity`（用途別ブラウザの `--user-data-dir=...`）で起動
+/// されたものか。
+fn window_matches_identity(window: &TopLevelWindow, identity: &str) -> bool {
+    let needle = identity
+        .trim_start_matches("--user-data-dir=")
+        .trim_matches('"')
+        .to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    crate::windowing::process_info::read_process_command_line(window.process_id)
+        .is_some_and(|cmd| cmd.to_lowercase().contains(&needle))
+}
+
 /// バインドの受付を終えて、結果を保存し、セットを配置してメイン画面へ移す。
 ///
 /// 起動待ちの間にユーザーが別のセットへ切り替えていたら、バインドの保存だけ行い
@@ -2333,12 +2449,16 @@ fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
 /// 押された初回だけ真で、そのときはまだ現在セットでなくても配置してよい（それが
 /// 押した人の意図なので）。
 fn finish_acquire(
-    pending: &PendingAcquire,
+    pending: &mut PendingAcquire,
     config: &Rc<RefCell<AppConfig>>,
     data_dir: &Path,
     coordinator: &SwitchCoordinator<Win32WindowOps>,
     force: bool,
 ) {
+    // 諦める前に、起動しても窓が増えなかったエントリを既存の窓へ結びつける。
+    // ここまで来ているのは待ち時間を使い切った（＝新しい窓は現れない）ときだけ。
+    bind_already_running_windows(pending, &config.borrow(), data_dir);
+
     for launched in &pending.dead {
         tracing::warn!(target: "launch", managed = %launched.id, program = %launched.exe.display(), class = %launched.class, "switch: relaunched app did not appear in time to bind");
     }
@@ -2435,7 +2555,7 @@ fn start_acquire_watch(
                 let mut watch = watch.borrow_mut();
                 watch.placed = true;
                 finish_acquire(
-                    &watch.pending,
+                    &mut watch.pending,
                     &config,
                     &data_dir,
                     &coordinator,

@@ -367,6 +367,116 @@ pub fn find_launched_window<'a>(
         .or_else(|| after.iter().find(|w| fresh(w) && same_name(w)))
 }
 
+/// 「いま別のエントリが握っている」窓の集合。[`resolve_already_running_window`] の
+/// `bound_elsewhere` に渡す。
+///
+/// `runtime.json` の `window_bindings` は消したセットのぶんも残り続ける（実機で190件
+/// 溜まっていた）。しかも HWND は OS が再利用するので、**もう存在しないエントリ**の
+/// 残骸が現役の窓を握っているように見える。実機の ChatGPT の窓は、消えた6つの
+/// managed id に握られた状態だった（2026-07-26）。`known_ids` に無い紐づけは残骸なので
+/// 無視する。`awaiting` は今から張り替えるエントリ自身で、こちらも除外しない。
+pub fn hwnds_bound_to_other_entries(
+    bindings: &std::collections::HashMap<uuid::Uuid, isize>,
+    known_ids: &HashSet<uuid::Uuid>,
+    awaiting: &HashSet<uuid::Uuid>,
+) -> HashSet<isize> {
+    bindings
+        .iter()
+        .filter(|(id, _)| known_ids.contains(*id) && !awaiting.contains(*id))
+        .map(|(_, hwnd)| *hwnd)
+        .collect()
+}
+
+/// [`resolve_already_running_window`] の結果。
+#[derive(Debug)]
+pub enum AlreadyRunning<'a> {
+    /// ちょうど1つに決まった。この窓が相手。
+    Only(&'a TopLevelWindow),
+    /// 条件を満たす窓が複数ある。取り違えると無関係な窓を奪うので決めない。
+    Ambiguous(usize),
+    /// 候補なし。
+    NoCandidate,
+}
+
+/// 起動しても新しい窓が現れなかったエントリの相手を、**起動前から在った**窓の中から
+/// 特定する。
+///
+/// 単一インスタンスのアプリ（パッケージ版 ChatGPT/Codex など）は、AUMID で起動しても
+/// 既存インスタンスが前に出るだけで窓を増やさない。[`find_launched_window`] は
+/// 「新しく現れた窓」しか見ないので永久に空振りし、宣言由来のエントリはウィンドウ
+/// クラスを学習できず、照合の得点が閾値に届かないまま「閉じている」と誤判定され続ける。
+///
+/// 条件は厳しく取る。ここで拾うのは照合が一度弾いた窓なので、緩めると無関係な窓を
+/// セットが奪う:
+///
+/// - `before` に在った窓だけ。起動途中の窓を先回りして掴まない
+/// - `claimed` / `bound_elsewhere` の窓は除く
+/// - `identity_ok`（用途別ブラウザの `--user-data-dir` 判定）を通るものだけ
+/// - `matcher` に対しタイトルの根拠を持つものだけ。実行ファイルとクラスは「その
+///   アプリの窓」しか言っておらず、それだけで拾うとユーザーが自分で開いた同じ
+///   アプリの窓に飛びつく
+/// - 以上を満たす窓がちょうど1つのときだけ確定する
+///
+/// 実行ファイルはまずフルパスで、それが0件ならファイル名で比べる（`find_launched_window`
+/// と同じ理由——ストアアプリのパスは更新でバージョンごと変わる）。フルパス一致が
+/// あるならそちらだけを見るので、名前一致の別窓が居ても曖昧にはならない。
+pub fn resolve_already_running_window<'a>(
+    live: &'a [TopLevelWindow],
+    before: &HashSet<isize>,
+    claimed: &HashSet<isize>,
+    bound_elsewhere: &HashSet<isize>,
+    matcher: &crate::domain::workset::WindowMatcher,
+    exe: &Path,
+    identity_ok: impl Fn(&TopLevelWindow) -> bool,
+) -> AlreadyRunning<'a> {
+    let file_name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    };
+    let eligible: Vec<&TopLevelWindow> = live
+        .iter()
+        .filter(|w| {
+            before.contains(&w.hwnd)
+                && !claimed.contains(&w.hwnd)
+                && !bound_elsewhere.contains(&w.hwnd)
+                && crate::windowing::matcher::has_title_evidence(matcher, w)
+                && identity_ok(w)
+        })
+        .collect();
+
+    let exact: Vec<&TopLevelWindow> = eligible
+        .iter()
+        .copied()
+        .filter(|w| {
+            w.executable_path
+                .as_deref()
+                .is_some_and(|p| crate::windowing::matcher::same_executable(p, exe))
+        })
+        .collect();
+    let candidates = if exact.is_empty() {
+        eligible
+            .iter()
+            .copied()
+            .filter(|w| {
+                file_name(exe).is_some_and(|wanted| {
+                    w.executable_path
+                        .as_deref()
+                        .and_then(file_name)
+                        .is_some_and(|got| got == wanted)
+                })
+            })
+            .collect()
+    } else {
+        exact
+    };
+
+    match candidates[..] {
+        [only] => AlreadyRunning::Only(only),
+        [] => AlreadyRunning::NoCandidate,
+        _ => AlreadyRunning::Ambiguous(candidates.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -661,6 +771,192 @@ mod tests {
             "",
         );
         assert_eq!(found.map(|w| w.hwnd), Some(7));
+    }
+
+    /// ChatGPT セットの実物（2026-07-26）: 宣言由来なのでクラスは空、針も無し、
+    /// タイトルだけが完全一致する。単一インスタンスのパッケージアプリなので起動
+    /// しても窓は増えず、その既存窓を拾えないと永久にバインドできない。
+    fn declared_matcher(exe: &str, title: &str) -> crate::domain::workset::WindowMatcher {
+        crate::domain::workset::WindowMatcher {
+            executable_path: PathBuf::from(exe),
+            process_name: "ChatGPT.exe".to_string(),
+            window_class: String::new(),
+            registered_title: title.to_string(),
+            title_contains: None,
+            title_regex: None,
+        }
+    }
+
+    fn titled(hwnd: isize, exe: &str, title: &str) -> TopLevelWindow {
+        TopLevelWindow {
+            title: title.to_string(),
+            ..window(hwnd, exe, "Chrome_WidgetWin_1")
+        }
+    }
+
+    #[test]
+    fn already_running_window_is_resolved_when_the_launch_could_not_recreate_it() {
+        let exe = r"C:\WindowsApps\OpenAI.Codex_1.0\app\ChatGPT.exe";
+        let live = vec![titled(11, exe, "ChatGPT")];
+        let before: HashSet<isize> = [11].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(exe, "ChatGPT"),
+            Path::new(exe),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 11));
+    }
+
+    #[test]
+    fn a_store_app_that_updated_its_install_path_still_resolves_by_file_name() {
+        let registered = r"C:\WindowsApps\OpenAI.Codex_1.0\app\ChatGPT.exe";
+        let updated = r"C:\WindowsApps\OpenAI.Codex_2.0\app\ChatGPT.exe";
+        let live = vec![titled(11, updated, "ChatGPT")];
+        let before: HashSet<isize> = [11].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(registered, "ChatGPT"),
+            Path::new(registered),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 11));
+    }
+
+    #[test]
+    fn a_window_that_appeared_after_the_launch_is_not_taken() {
+        let exe = r"C:\x\ChatGPT.exe";
+        let live = vec![titled(11, exe, "ChatGPT")];
+        // 起動前のスナップショットに居ない ＝ いま起動してきた窓。そちらは
+        // `find_launched_window` の担当なので、ここでは拾わない。
+        let found = resolve_already_running_window(
+            &live,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(exe, "ChatGPT"),
+            Path::new(exe),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::NoCandidate));
+    }
+
+    #[test]
+    fn a_window_without_title_evidence_is_not_taken() {
+        // ユーザーが自分で開いただけの同じアプリの窓。実行ファイルは一致するが、
+        // 「この窓だ」と言える根拠がないので奪わない。
+        let exe = r"C:\x\brave.exe";
+        let live = vec![titled(11, exe, "配信者の経済効果 - Brave")];
+        let before: HashSet<isize> = [11].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(exe, "Brave"),
+            Path::new(exe),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::NoCandidate));
+    }
+
+    #[test]
+    fn two_matching_windows_are_left_alone_rather_than_guessed() {
+        let exe = r"C:\x\ChatGPT.exe";
+        let live = vec![titled(11, exe, "ChatGPT"), titled(12, exe, "ChatGPT")];
+        let before: HashSet<isize> = [11, 12].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(exe, "ChatGPT"),
+            Path::new(exe),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Ambiguous(2)));
+    }
+
+    /// 実機で踏んだやつ（2026-07-26）: `runtime.json` に消えたセットの紐づけが190件
+    /// 残っていて、ChatGPT の窓が存在しない6つの managed id に握られていた。残骸を
+    /// 真に受けると候補が消え、この修正そのものが空振りする。
+    #[test]
+    fn bindings_of_entries_that_no_longer_exist_do_not_hold_a_window() {
+        let live_entry = uuid::Uuid::new_v4();
+        let deleted_entry = uuid::Uuid::new_v4();
+        let awaiting_entry = uuid::Uuid::new_v4();
+        let bindings: std::collections::HashMap<uuid::Uuid, isize> =
+            [(live_entry, 11), (deleted_entry, 12), (awaiting_entry, 13)]
+                .into_iter()
+                .collect();
+        let known: HashSet<uuid::Uuid> = [live_entry, awaiting_entry].into_iter().collect();
+        let awaiting: HashSet<uuid::Uuid> = [awaiting_entry].into_iter().collect();
+
+        let held = hwnds_bound_to_other_entries(&bindings, &known, &awaiting);
+
+        assert!(held.contains(&11), "a live entry really holds its window");
+        assert!(
+            !held.contains(&12),
+            "a deleted entry's leftover binding must not hold a window hostage"
+        );
+        assert!(
+            !held.contains(&13),
+            "the entry we are about to re-bind must not block itself"
+        );
+    }
+
+    #[test]
+    fn a_window_bound_to_another_entry_is_excluded_leaving_one_answer() {
+        let exe = r"C:\x\ChatGPT.exe";
+        let live = vec![titled(11, exe, "ChatGPT"), titled(12, exe, "ChatGPT")];
+        let before: HashSet<isize> = [11, 12].into_iter().collect();
+        let bound_elsewhere: HashSet<isize> = [11].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &bound_elsewhere,
+            &declared_matcher(exe, "ChatGPT"),
+            Path::new(exe),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 12));
+    }
+
+    #[test]
+    fn a_profile_browser_only_takes_its_own_profiles_window() {
+        let exe = r"C:\x\brave.exe";
+        let live = vec![titled(11, exe, "Brave"), titled(12, exe, "Brave")];
+        let before: HashSet<isize> = [11, 12].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(exe, "Brave"),
+            Path::new(exe),
+            |w| w.hwnd == 12,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 12));
     }
 
     #[test]

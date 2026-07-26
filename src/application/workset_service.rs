@@ -412,6 +412,35 @@ pub fn bindings_from_decisions(decisions: &HashMap<Uuid, MatchDecision>) -> Hash
         .collect()
 }
 
+/// 紐づけ表から、**もう存在しない登録**のぶんを落とす。落とした件数を返す。
+///
+/// `runtime.json` の `window_bindings` は書き足す一方だった。現役のエントリは自分の
+/// 項目を上書きするだけなので増えない——増えるのは、セットやウィンドウを削除しても
+/// その `managed_window_id` の項目が残り続けるからで、これが唯一の漏れ口。実機では
+/// 190件（現役の窓は22個）まで溜まっていた（2026-07-26）。
+///
+/// 残骸が害になるのは HWND を OS が再利用するからで、「現役の窓はもう別のエントリが
+/// 握っている」と主張してくる。実機の ChatGPT の窓は、存在しない6つの id に握られた
+/// 状態になり、セットが永久にバインドできなくなっていた。
+///
+/// **窓が既に消えている紐づけは落とさない。** あれは残骸ではなく情報を持っている:
+/// [`resolve_all_matches_with_bindings`] は「紐づけがあるのに窓が無い＝このエントリは
+/// 閉じられた」と読み、再発見に
+/// [`matcher::has_title_evidence`] の厳しい条件を課す。項目そのものを消すと、その
+/// 条件のない素の照合へ落ちてしまい、「閉じた Brave が無関係な別の Brave 窓を取り込む」
+/// 挙動が戻ってくる。生きている HWND が再利用されていた場合は `binding_still_valid`
+/// が弾くので、現役エントリの側はこれで足りている。
+pub fn prune_window_bindings(bindings: &mut HashMap<Uuid, isize>, worksets: &[Workset]) -> usize {
+    let known: HashSet<Uuid> = worksets
+        .iter()
+        .flat_map(|w| w.windows.iter())
+        .map(|w| w.id)
+        .collect();
+    let before = bindings.len();
+    bindings.retain(|id, _| known.contains(id));
+    before - bindings.len()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -939,6 +968,45 @@ mod tests {
             0,
             windows,
         )
+    }
+
+    /// 実機で190件（現役の窓は22個）まで溜まっていた（2026-07-26）。残骸が現役の窓を
+    /// 握っているように見え、ChatGPT セットが永久にバインドできなくなっていた。
+    #[test]
+    fn bindings_of_deleted_registrations_are_pruned() {
+        let live_window = declared_window(r"C:\x\app.exe", "App");
+        let live_id = live_window.id;
+        let set = single_set(vec![live_window]);
+        let deleted_a = Uuid::new_v4();
+        let deleted_b = Uuid::new_v4();
+        let mut bindings: HashMap<Uuid, isize> =
+            [(live_id, 11), (deleted_a, 265198), (deleted_b, 265198)]
+                .into_iter()
+                .collect();
+
+        let pruned = prune_window_bindings(&mut bindings, std::slice::from_ref(&set));
+
+        assert_eq!(pruned, 2);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get(&live_id), Some(&11));
+    }
+
+    /// 窓が消えている紐づけは残骸ではない。あれがあると
+    /// `resolve_all_matches_with_bindings` は「閉じられたエントリ」と読んで、再発見に
+    /// `has_title_evidence` の厳しい条件を課す。消すと素の照合へ落ちて、閉じた
+    /// ブラウザが無関係な別の窓を取り込む挙動が戻る。
+    #[test]
+    fn a_binding_whose_window_is_gone_is_kept_because_it_still_carries_meaning() {
+        let managed = declared_window(r"C:\x\app.exe", "App");
+        let id = managed.id;
+        let set = single_set(vec![managed]);
+        // 999 はもう存在しない窓。それでも登録は生きている。
+        let mut bindings: HashMap<Uuid, isize> = [(id, 999)].into_iter().collect();
+
+        let pruned = prune_window_bindings(&mut bindings, std::slice::from_ref(&set));
+
+        assert_eq!(pruned, 0);
+        assert_eq!(bindings.get(&id), Some(&999));
     }
 
     #[test]
