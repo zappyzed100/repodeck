@@ -50,6 +50,9 @@ export component QuickSwitcher inherits Window {
     in property <[QuickSwitcherRow]> rows: [];
     in-out property <int> selected-index: 0;
     in-out property <string> filter-text: "";
+    // 起動していない（開いているウィンドウが1つも無い）セットを一覧から隠す
+    // トグル。状態はここが持ち、行の絞り込み自体は Rust 側で行う。
+    in-out property <bool> hide-closed: false;
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
     // True only while Windows' "Transparency effects" setting is on — see
@@ -60,6 +63,9 @@ export component QuickSwitcher inherits Window {
     // a real `TextInput` is used instead of manual key capture precisely so
     // composed input works.
     callback filter-changed(text: string);
+    /// 「起動中のみ」トグルの切替後に発火。Rust 側は hide-closed を読み直して
+    /// 行を作り直すだけでよい。
+    callback hide-closed-toggled();
     callback switch-requested(workset-id: string);
     /// Close every live window belonging to that set (its apps quit; the set
     /// itself stays registered and re-opens on the next switch).
@@ -157,6 +163,34 @@ export component QuickSwitcher inherits Window {
                                 return accept;
                             }
                             return reject;
+                        }
+                    }
+                }
+
+                // 「起動中のみ」: 起動していないセットを一覧から隠すトグル。
+                // ON のときはアクセント枠＋選択背景で押し込み状態を示す。
+                hide-closed-button := Rectangle {
+                    width: 104px;
+                    border-radius: Theme.radius-md;
+                    background: root.hide-closed
+                        ? Theme.glass-selected
+                        : (hide-closed-touch.pressed || hide-closed-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft);
+                    border-width: 1px;
+                    border-color: root.hide-closed ? Theme.accent : Theme.hairline;
+                    animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
+
+                    Text {
+                        text: "起動中のみ";
+                        color: root.hide-closed ? Theme.text-primary : Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    hide-closed-touch := TouchArea {
+                        clicked => {
+                            root.hide-closed = !root.hide-closed;
+                            root.hide-closed-toggled();
                         }
                     }
                 }

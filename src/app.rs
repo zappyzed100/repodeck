@@ -3800,6 +3800,17 @@ fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, dat
         None,
     );
 
+    // 「起動中のみ」トグル: 開いているウィンドウが1つも無いセット（ウィンドウ
+    // 未登録のセットも含む）を一覧から外す。
+    if switcher.get_hide_closed() {
+        ordered.retain(|workset| {
+            workset
+                .windows
+                .iter()
+                .any(|w| matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. })))
+        });
+    }
+
     let aggregates = agent_status_service::aggregate_all(&config.worksets, &state.agent_runs);
     if config.settings.sort_mode != SortMode::Manual {
         ordered.sort_by_key(|w| {
@@ -4316,6 +4327,16 @@ fn wire_quick_switcher(
         let Some(switcher) = s.upgrade() else { return };
         // `filter-text` is two-way bound to the TextInput, so it already holds
         // the new value (including IME-composed text); just re-filter.
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    // 「起動中のみ」トグル: 状態は UI 側の hide-closed が持つので、行を作り
+    // 直すだけでよい。
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_hide_closed_toggled(move || {
+        let Some(switcher) = s.upgrade() else { return };
         refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
     });
 
