@@ -13,57 +13,13 @@
 use std::time::Duration;
 
 use crate::domain::placement::PixelRect;
+use crate::windowing::placement;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, SetFocus, VIRTUAL_KEY,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
 };
 
 const VK_F: u16 = 0x46;
-
-/// Forces `hwnd` to the foreground, bypassing Windows' foreground-lock (which
-/// otherwise makes `SetForegroundWindow` merely flash the taskbar when another
-/// app is active). It temporarily attaches our thread's input queue to both the
-/// current foreground window's thread and the target's, so the calls are treated
-/// as coming from the active input context — the standard AttachThreadInput
-/// trick. Required so the synthetic `F11`/`F` actually reach the browser
-/// (問題1 案C, 2026-07-23).
-fn force_foreground(hwnd: HWND) {
-    // SAFETY: all handles/ids are validated (nonzero, not self) before each
-    // call, and every successful `AttachThreadInput(.., true)` is paired with a
-    // matching detach.
-    unsafe {
-        let cur = GetCurrentThreadId();
-        let fg = GetForegroundWindow();
-        let fg_thread = if fg.0.is_null() {
-            0
-        } else {
-            GetWindowThreadProcessId(fg, None)
-        };
-        let tgt_thread = GetWindowThreadProcessId(hwnd, None);
-
-        let att_fg =
-            fg_thread != 0 && fg_thread != cur && AttachThreadInput(cur, fg_thread, true).as_bool();
-        let att_tgt = tgt_thread != 0
-            && tgt_thread != cur
-            && tgt_thread != fg_thread
-            && AttachThreadInput(cur, tgt_thread, true).as_bool();
-
-        let _ = SetForegroundWindow(hwnd);
-        let _ = BringWindowToTop(hwnd);
-        let _ = SetFocus(Some(hwnd));
-
-        if att_tgt {
-            let _ = AttachThreadInput(cur, tgt_thread, false);
-        }
-        if att_fg {
-            let _ = AttachThreadInput(cur, fg_thread, false);
-        }
-    }
-}
 
 /// Presses and releases a single virtual key via the system input stream, which
 /// delivers it to whatever window currently has keyboard focus.
@@ -115,17 +71,17 @@ pub fn send_fullscreen_keys(hwnd: HWND, refocus: Option<HWND>) {
         // Let the switch settle (parking move, target focus) before we grab
         // focus for the key-send.
         std::thread::sleep(Duration::from_millis(250));
-        force_foreground(hwnd);
+        placement::set_foreground_best_effort(hwnd);
         std::thread::sleep(Duration::from_millis(90));
         tap(VK_F); // YouTube video-element full-screen (F11 avoided — see module docs)
 
         if let Some(refocus_raw) = refocus_raw {
             std::thread::sleep(Duration::from_millis(120));
             let refocus = HWND(refocus_raw as *mut _);
-            // SAFETY: `refocus` is a live handle; best-effort foreground.
-            unsafe {
-                let _ = SetForegroundWindow(refocus);
-            }
+            // 素の `SetForegroundWindow` だと、直前に `F` を送るために強奪した別プロセス
+            // （退避した動画窓）がフォアグラウンドを握ったまま戻せない。切り替え先へ
+            // 確実に戻すため、切り替え本体と同じフォアグラウンドロック回避を通す。
+            placement::set_foreground_best_effort(refocus);
         }
     });
 }
@@ -145,7 +101,7 @@ pub fn send_exit_fullscreen_keys(hwnd: HWND, restore_rect: PixelRect, maximized:
     std::thread::spawn(move || {
         let hwnd = HWND(raw as *mut _);
         std::thread::sleep(Duration::from_millis(250));
-        force_foreground(hwnd);
+        placement::set_foreground_best_effort(hwnd);
         std::thread::sleep(Duration::from_millis(90));
         tap(VK_F); // toggle the YouTube video full-screen back off
         // Give the browser time to actually leave full-screen before placing;

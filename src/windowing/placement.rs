@@ -3,13 +3,16 @@
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowPlacement, GetWindowRect,
-    GetWindowThreadProcessId, HDWP, HWND_TOP, PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WINDOWPLACEMENT, WM_CLOSE,
+    BeginDeferWindowPos, BringWindowToTop, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow,
+    GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, HDWP, HWND_TOP, PostMessageW,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowPos, ShowWindow, WINDOWPLACEMENT, WM_CLOSE,
 };
 
 use crate::domain::placement::{PixelRect, SavedShowState};
@@ -337,13 +340,55 @@ pub fn set_z_order_after(hwnd: HWND, insert_after: Option<HWND>) {
     };
 }
 
-/// Best-effort foreground focus (PLAN.md §3.8 step 8, §4.5: "フォーカスは
-/// `SetForegroundWindow`のベストエフォートとする"). Win32 may refuse this
-/// request depending on foreground-lock rules; there is nothing actionable
-/// to do with a failure here.
+/// 指定ウィンドウを強制的にフォアグラウンドへ出す（PLAN.md §3.8 step 8, §4.5）。
+///
+/// 素の `SetForegroundWindow` は、別プロセス（ChatGPT や Brave など）がフォア
+/// グラウンドを握っていると拒否され、タスクバーを光らせるだけで窓は前面に
+/// 出ない。切り替えでは移動も Z 順も `SWP_NOACTIVATE` でアクティベートを伴わず、
+/// 前面化はこの1回だけが頼みの綱なので、単発で弾かれるとターゲット窓はメインに
+/// 正しく置かれ Z 順も整ったまま他アプリの窓の下に埋まり、二度目の選択が必要に
+/// なっていた（実機 2026-07-31: ChatGPT がメインに居るとき VSCode が上に出ない）。
+///
+/// `AttachThreadInput` で自スレッドの入力キューを「現在のフォアグラウンド窓の
+/// スレッド」と「対象窓のスレッド」へ一時的に接続し、この呼び出しがアクティブな
+/// 入力文脈から来たものとして扱わせる——`key_input` で実績のある標準の手法。
 pub fn set_foreground_best_effort(hwnd: HWND) {
-    // SAFETY: `hwnd` is a live handle.
-    let _ = unsafe { SetForegroundWindow(hwnd) };
+    force_foreground(hwnd);
+}
+
+/// `set_foreground_best_effort` の本体。`key_input` からも再利用するため分離。
+///
+/// SAFETY: 全ハンドル/スレッドID は各呼び出し前に非0・非自己を検証し、成功した
+/// `AttachThreadInput(.., true)` はすべて対応する detach と対になる。
+pub fn force_foreground(hwnd: HWND) {
+    unsafe {
+        let cur = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        let fg_thread = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let tgt_thread = GetWindowThreadProcessId(hwnd, None);
+
+        let att_fg =
+            fg_thread != 0 && fg_thread != cur && AttachThreadInput(cur, fg_thread, true).as_bool();
+        let att_tgt = tgt_thread != 0
+            && tgt_thread != cur
+            && tgt_thread != fg_thread
+            && AttachThreadInput(cur, tgt_thread, true).as_bool();
+
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetFocus(Some(hwnd));
+
+        if att_tgt {
+            let _ = AttachThreadInput(cur, tgt_thread, false);
+        }
+        if att_fg {
+            let _ = AttachThreadInput(cur, fg_thread, false);
+        }
+    }
 }
 
 /// A single `BeginDeferWindowPos`/`DeferWindowPos*`/`EndDeferWindowPos` batch
