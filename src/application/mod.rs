@@ -3,6 +3,7 @@ pub mod crash_recovery;
 pub mod display_recovery_service;
 pub mod gh_status_service;
 pub mod git_status_service;
+pub mod integrity_service;
 pub mod launch_service;
 pub mod layout_service;
 pub mod main_placement;

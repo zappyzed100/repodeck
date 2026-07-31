@@ -16,13 +16,14 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDNO, IDYES, MB_ICONWARNING, MB_YESNO, MB_YESNOCANCEL, MessageBoxW,
+    IDNO, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MessageBoxW,
 };
 use windows::core::HSTRING;
 
 use crate::application::agent_status_service;
 use crate::application::crash_recovery::{self, JournalRecoveryChoice};
 use crate::application::display_recovery_service::{self, RecoveryDecision};
+use crate::application::integrity_service;
 use crate::application::launch_service;
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
 use crate::application::monitor_identity::{self, LiveMonitor};
@@ -5191,6 +5192,66 @@ fn confirm_recover_all() -> bool {
     result == IDYES
 }
 
+/// トレイの「紐づけを点検して修復」の結果を出す。手動で押した以上、何も
+/// 起きなかったことも含めて必ず返事をする。
+///
+/// 直せない異常（互いに区別できない登録）は、放っておくと「切り替えるたびに
+/// アプリが起動し直される」という形でしか現れず、原因が設定にあることに気づけ
+/// ない。ここで名指しする。
+fn show_integrity_result(report: &integrity_service::IntegrityReport) {
+    let mut lines = Vec::new();
+
+    if report.dropped_bindings() > 0 {
+        lines.push(format!(
+            "正当化できない紐づけを {} 件外しました。次の切り替えで正しいウィンドウへ付け直します。",
+            report.dropped_bindings()
+        ));
+    }
+    if report.pruned_stale() > 0 {
+        lines.push(format!(
+            "削除済みの登録が残していた紐づけを {} 件掃除しました。",
+            report.pruned_stale()
+        ));
+    }
+
+    let unrepairable: Vec<String> = report
+        .unrepairable()
+        .filter_map(|anomaly| match anomaly {
+            integrity_service::Anomaly::IndistinguishableRegistrations {
+                executable,
+                worksets,
+                ..
+            } => {
+                let name = std::path::Path::new(executable)
+                    .file_name()
+                    .map_or_else(|| executable.clone(), |n| n.to_string_lossy().into_owned());
+                Some(format!("  {} — {}", name, worksets.join(", ")))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if !unrepairable.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "次の登録は互いに見分けがつきません(実行ファイルとウィンドウクラスしか手掛かりが無い)。\n\
+             セット管理でウィンドウの「タイトルに含む」を設定すると解消します:"
+                .to_string(),
+        );
+        lines.extend(unrepairable);
+    }
+
+    if lines.is_empty() {
+        lines.push("紐づけに異常はありませんでした。".to_string());
+    }
+
+    let text = HSTRING::from(lines.join("\n"));
+    let caption = HSTRING::from("RepoDeck — 紐づけの点検");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    unsafe { MessageBoxW(None, &text, &caption, MB_OK | MB_ICONINFORMATION) };
+}
+
 /// PLAN.md §10.3 steps 3-4: a leftover `switch-journal.json` at startup means
 /// the previous switch never finished. A single `MB_YESNOCANCEL` dialog maps
 /// onto the spec's three named choices — Yes/No/Cancel button labels are
@@ -5931,6 +5992,45 @@ fn live_device_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 紐づけ表を点検し、正当化できない紐づけを捨てて保存する。
+///
+/// 起動時に自動で1回、トレイの「紐づけを点検して修復」からいつでも手動で走る。
+/// 捨てるだけで付け直しはしない——次の切り替えの解決が、根拠のある窓へ付け直すか、
+/// 見つからなければセット自身のアプリを起動し直す。
+///
+/// 実機（2026-07-29）はこれが無かったために、OS 再起動直後に確定した誤バインドが
+/// `runtime.json` に焼き付いたまま戻らなくなった。`repodeck` セットが「02_求解・
+/// 高速化」の窓を、`エンジン` セットが「repodeck」の窓を握り、1枚の Brave を
+/// 4セットが同時に握っていた。
+fn run_integrity_check(
+    data_dir: &Path,
+    config: &Rc<RefCell<AppConfig>>,
+    reason: &str,
+) -> integrity_service::IntegrityReport {
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut runtime = runtime_store::load(data_dir);
+
+    let report = {
+        let cfg = config.borrow();
+        integrity_service::check_and_repair(
+            &cfg.worksets,
+            &live_windows,
+            &mut runtime.window_bindings,
+        )
+    };
+
+    integrity_service::log_report(&report, reason);
+
+    if report.repair.touched_anything()
+        && let Err(err) = runtime_store::save(data_dir, &runtime)
+    {
+        tracing::warn!(error = %err, reason, "failed to persist the repaired window bindings");
+    }
+
+    report
+}
+
 /// Runs the [`display_reset`] side effect once and logs its outcome. Shared by the
 /// manual tray trigger ("モニターを再検出") and the automatic resume path.
 fn run_display_reset(reason: &str) {
@@ -6043,8 +6143,12 @@ fn reconcile_monitor_identity(data_dir: &Path, config: &Rc<RefCell<AppConfig>>, 
 
     if !renames.is_empty() {
         let mut runtime = runtime_store::load(data_dir);
-        let rewritten =
-            monitor_identity::apply_remap(&mut cfg, &mut runtime.auto_slot_assignments, &renames);
+        let rewritten = monitor_identity::apply_remap(
+            &mut cfg,
+            &mut runtime.auto_slot_assignments,
+            &mut runtime.last_seen_monitor_fingerprint,
+            &renames,
+        );
         tracing::warn!(
             target: "monitors",
             reason,
@@ -6059,8 +6163,19 @@ fn reconcile_monitor_identity(data_dir: &Path, config: &Rc<RefCell<AppConfig>>, 
     }
 
     // 付け替えの有無にかかわらず、次回はハードウェア由来の同一性で
-    // 判定できるよう device_path を焼き直しておく。
-    config_changed |= monitor_identity::refresh_device_paths(&mut cfg, &live);
+    // 判定できるよう device_path を焼き直しておく。空欄を埋めるだけで、
+    // 食い違う行は上書きせず報告する（付け替えを断念した状態でここを素通し
+    // すると、旧名に別の物理モニターの path を焼き付けてしまう）。
+    let refreshed = monitor_identity::refresh_device_paths(&mut cfg, &live);
+    if !refreshed.conflicting.is_empty() {
+        tracing::warn!(
+            target: "monitors",
+            reason,
+            conflicting = ?refreshed.conflicting,
+            "保存済みの device_path と実機が食い違っている。名前と物理モニターの対応がねじれたままなので上書きしない"
+        );
+    }
+    config_changed |= refreshed.changed();
 
     if config_changed && let Err(err) = config_store::save(data_dir, &cfg) {
         tracing::warn!(error = %err, "failed to persist the monitor identity remap");
@@ -6205,6 +6320,11 @@ pub fn run() -> Result<()> {
         }
         let _ = runtime_store::save(&data_dir, &runtime);
     }
+
+    // 前回の実行が残した紐づけを、使い始める前に点検する。RepoDeck だけの再起動
+    // では紐づけは持ち越されるので、前回焼き付いた誤りもそのまま持ち越される。
+    // ここで捨てておけば、最初の切り替えから正しいウィンドウに付き直せる。
+    run_integrity_check(&data_dir, &config, "startup");
 
     // `window` is the repurposed settings surface (PLAN.md §13 Phase 7
     // checklist item 4) — see the doc comment on `AppWindow` in
@@ -6595,6 +6715,18 @@ pub fn run() -> Result<()> {
     tray.on_reconnect_monitors_requested(|| {
         tracing::info!("manual monitor re-detect requested from the tray menu");
         run_display_reset("manual tray trigger");
+    });
+
+    let config_for_integrity = config.clone();
+    let data_dir_for_integrity = data_dir.clone();
+    tray.on_check_integrity_requested(move || {
+        tracing::info!("manual integrity check requested from the tray menu");
+        let report = run_integrity_check(
+            &data_dir_for_integrity,
+            &config_for_integrity,
+            "manual tray trigger",
+        );
+        show_integrity_result(&report);
     });
 
     let window_for_settings = window.as_weak();

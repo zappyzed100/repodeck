@@ -125,23 +125,57 @@ fn title_score(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> i32 {
     score
 }
 
+/// この登録が「同じアプリの別窓」と自分の窓を見分けるための手掛かりを持っているか。
+///
+/// アプリ名そのものを入れた `title_contains`（登録アプリから宣言したセットは当初
+/// これを保存していた）は手掛かりではない。移行はせず、ここで無視する。
+pub fn has_discriminator(matcher: &WindowMatcher) -> bool {
+    matcher
+        .title_regex
+        .as_deref()
+        .is_some_and(|pattern| !pattern.is_empty())
+        || matcher
+            .title_contains
+            .as_deref()
+            .is_some_and(|needle| !needle.is_empty() && needle != matcher.registered_title)
+}
+
+/// [`has_discriminator`] の手掛かりが `candidate` に対して成り立つか。
+fn discriminator_matches(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> bool {
+    let contains_ok = matcher.title_contains.as_deref().is_some_and(|needle| {
+        !needle.is_empty() && needle != matcher.registered_title && candidate.title.contains(needle)
+    });
+    let regex_ok = matcher.title_regex.as_deref().is_some_and(|pattern| {
+        !pattern.is_empty()
+            && regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&candidate.title))
+    });
+    contains_ok || regex_ok
+}
+
 /// `candidate` が「そのアプリの他のウィンドウ」ではなく *この* ウィンドウだと
 /// 言える根拠を持つか。
 ///
 /// 実行ファイル＋クラスは「そのアプリの窓」としか言っていない（Brave のどの
-/// ウィンドウもどの Brave 登録にも一致する）。アプリ名そのものの
-/// `title_contains` も同様で、登録アプリから宣言したセットは当初これを保存して
-/// いた。移行はせず、ここで無視する。同一アプリの二窓を取り違えられない呼び出し
-/// 側が、本物の再発見とそっくりさんを見分けるために使う。
+/// ウィンドウもどの Brave 登録にも一致する）。同一アプリの二窓を取り違えられない
+/// 呼び出し側が、本物の再発見とそっくりさんを見分けるために使う。
+///
+/// 手掛かり（[`has_discriminator`]）を持つ登録は、**その手掛かりだけで**判断する。
+/// 登録時タイトルとの完全一致・類似は根拠に数えない。VS Code の登録はどれも
+/// `registered_title` が汎用の `"Visual Studio Code"` で、これは**起動直後の
+/// フォルダ未読込のウィンドウが一時的に名乗るタイトル**でもある。数えてしまうと、
+/// OS 再起動でセッション復元中の VS Code の窓が、どのセットの登録に対しても
+/// 「根拠あり」になり、最初に評価されたセットが無関係な窓を掴む（2026-07-29）。
 pub fn has_title_evidence(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> bool {
-    let discriminating = WindowMatcher {
-        title_contains: matcher
-            .title_contains
-            .clone()
-            .filter(|needle| *needle != matcher.registered_title),
+    if has_discriminator(matcher) {
+        return discriminator_matches(matcher, candidate);
+    }
+    // 手掛かりが無い登録は、登録時タイトルとの一致・類似だけが頼り。アプリ名
+    // そのものを入れた `title_contains` は根拠にしない（上記のとおり）。
+    let neutralized = WindowMatcher {
+        title_contains: None,
         ..matcher.clone()
     };
-    title_score(&discriminating, candidate) > 0
+    title_score(&neutralized, candidate) > 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,51 +189,93 @@ pub enum MatchDecision {
     Unresolved,
 }
 
+/// タイトルの根拠を1点も持たない候補を、それでも自動バインドしてよいか。
+///
+/// 実行ファイル(50)＋ウィンドウクラス(25)＝**75** は [`AUTO_REBIND_THRESHOLD`] に
+/// ちょうど届く。つまりタイトル由来の点がゼロでも自動バインドが成立してしまう。
+/// この 75 点が言っているのは「そのアプリの窓だ」だけで「*この*窓だ」ではないので、
+/// 同じ実行ファイルを名乗る登録が他にもあると、どの登録も同じ窓を自分のものだと
+/// 主張する（実機で Brave の登録14個が1枚の窓を奪い合った、2026-07-29）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitlelessMatch {
+    /// 許す。その実行ファイルを名乗る登録が他に無いので、取り違える相手が居ない。
+    Accept,
+    /// 拒む。同点になる登録が他にもある。根拠なしに掴ませてはいけない。
+    Reject,
+}
+
+struct Scored {
+    hwnd: isize,
+    score: i32,
+    has_exe_path: bool,
+    has_title_evidence: bool,
+    /// 先のセットが既に確保済み。選べないが、**居ないわけではない**。
+    claimed: bool,
+}
+
 /// Re-matches `matcher` against `candidates` (PLAN.md §5.5-§5.6).
 ///
 /// `bound_elsewhere` lists HWNDs already bound to a *different* registration
-/// (from an earlier candidate in the same re-bind pass) and excludes them
-/// entirely, per §5.5's "候補が別ワークセットへ既にバインド済み: 除外".
+/// (from an earlier candidate in the same re-bind pass); they can't be selected,
+/// per §5.5's "候補が別ワークセットへ既にバインド済み: 除外".
+///
+/// `titleless` は、タイトルの根拠を持つ候補が1つも無かったときの逃げ道を開けるか
+/// どうか。[`TitlelessMatch::Reject`] のときは [`MatchDecision::Unresolved`]
+/// ——「このセットの窓は開いていない」——を返す。`Ambiguous` ではなく `Unresolved`
+/// なのは意図的で、呼び出し側はこれを見て**そのセット自身のアプリを起動し直す**。
+/// 他セットの窓で妥協するより、正しい窓を開き直すほうが常に正しい。
 pub fn resolve_best_match(
     matcher: &WindowMatcher,
     candidates: &[TopLevelWindow],
     bound_elsewhere: &HashSet<isize>,
+    titleless: TitlelessMatch,
 ) -> MatchDecision {
-    let mut scored: Vec<(isize, i32, bool)> = candidates
+    // 得点は**全候補**ぶん出す。`bound_elsewhere` を先に振り落とすと、貪欲な
+    // 先勝ちで候補が1枚に減ったときに2位が消え、下の `margin` が `best_score`
+    // まで跳ね上がって、いちばん自信を持ってはいけない場面で自信を持つ。
+    let mut scored: Vec<Scored> = candidates
         .iter()
-        .filter(|candidate| !bound_elsewhere.contains(&candidate.hwnd))
-        .map(|candidate| {
-            (
-                candidate.hwnd,
-                score_candidate(matcher, candidate),
-                candidate.executable_path.is_some(),
-            )
+        .map(|candidate| Scored {
+            hwnd: candidate.hwnd,
+            score: score_candidate(matcher, candidate),
+            has_exe_path: candidate.executable_path.is_some(),
+            has_title_evidence: has_title_evidence(matcher, candidate),
+            claimed: bound_elsewhere.contains(&candidate.hwnd),
         })
         .collect();
 
-    scored.sort_by_key(|&(_, score, _)| std::cmp::Reverse(score));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.score));
 
-    let Some(&(best_hwnd, best_score, best_has_exe_path)) = scored.first() else {
+    let Some(best) = scored.iter().find(|s| !s.claimed) else {
         return MatchDecision::Unresolved;
     };
 
-    if best_score < AUTO_REBIND_THRESHOLD {
+    if best.score < AUTO_REBIND_THRESHOLD {
         return MatchDecision::Unresolved;
     }
 
-    let margin = scored.get(1).map_or(best_score, |&(_, second_score, _)| {
-        best_score - second_score
-    });
+    // 選ぼうとしている窓が「そのアプリの窓」としか言えない＝このセットの窓かどうか
+    // 分からない。他セットの窓を掴むより、開いていない扱いにして開き直させる。
+    if titleless == TitlelessMatch::Reject && !best.has_title_evidence {
+        return MatchDecision::Unresolved;
+    }
+
+    // 2位は**確保済みも数える**。より良い候補が他セットに取られているなら、
+    // 残り物を掴むのは「一番手が居なかった」ときの自動バインドとは違う。
+    let margin = scored
+        .iter()
+        .find(|s| s.hwnd != best.hwnd)
+        .map_or(best.score, |s| best.score - s.score);
 
     // §5.6: a candidate whose executable path couldn't be read is never
     // auto-rebound, even at high confidence — it falls back to asking the user.
-    if margin >= AUTO_REBIND_MARGIN && best_has_exe_path {
-        MatchDecision::AutoRebind { hwnd: best_hwnd }
+    if margin >= AUTO_REBIND_MARGIN && best.has_exe_path {
+        MatchDecision::AutoRebind { hwnd: best.hwnd }
     } else {
         let candidates = scored
-            .into_iter()
-            .filter(|&(_, score, _)| score >= AUTO_REBIND_THRESHOLD)
-            .map(|(hwnd, _, _)| hwnd)
+            .iter()
+            .filter(|s| !s.claimed && s.score >= AUTO_REBIND_THRESHOLD)
+            .map(|s| s.hwnd)
             .collect();
         MatchDecision::Ambiguous { candidates }
     }
@@ -253,7 +329,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_best_match(&m, &[c], &HashSet::new()),
+            resolve_best_match(&m, &[c], &HashSet::new(), TitlelessMatch::Accept),
             MatchDecision::AutoRebind { hwnd: 1 }
         );
     }
@@ -270,7 +346,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_best_match(&m, &[c], &HashSet::new()),
+            resolve_best_match(&m, &[c], &HashSet::new(), TitlelessMatch::Accept),
             MatchDecision::AutoRebind { hwnd: 1 }
         );
     }
@@ -291,7 +367,7 @@ mod tests {
             "main.rs - repodeck - Visual Studio Code",
         );
 
-        let decision = resolve_best_match(&m, &[c1, c2], &HashSet::new());
+        let decision = resolve_best_match(&m, &[c1, c2], &HashSet::new(), TitlelessMatch::Accept);
         assert_eq!(
             decision,
             MatchDecision::Ambiguous {
@@ -338,7 +414,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_best_match(&m, &[c], &HashSet::new()),
+            resolve_best_match(&m, &[c], &HashSet::new(), TitlelessMatch::Accept),
             MatchDecision::Unresolved
         );
     }
@@ -357,7 +433,7 @@ mod tests {
         bound.insert(1isize);
 
         assert_eq!(
-            resolve_best_match(&m, &[c], &bound),
+            resolve_best_match(&m, &[c], &bound, TitlelessMatch::Accept),
             MatchDecision::Unresolved
         );
     }
@@ -377,7 +453,7 @@ mod tests {
         // class(25) + contains(30) + exact title(20) = 75, well above threshold, single candidate.
 
         assert_eq!(
-            resolve_best_match(&m, &[c], &HashSet::new()),
+            resolve_best_match(&m, &[c], &HashSet::new(), TitlelessMatch::Accept),
             MatchDecision::Ambiguous {
                 candidates: vec![1]
             }
@@ -447,6 +523,108 @@ mod tests {
             "lib.rs - repodeck - Visual Studio Code",
         );
         assert!(has_title_evidence(&m, &same));
+    }
+
+    /// 実機（2026-07-29）: Brave の登録14個はどれも `registered_title="Brave"`、
+    /// 針も正規表現も無し。実行ファイル50＋クラス25＝ちょうど75で閾値に届くので、
+    /// 生き残った1枚の Brave をどの登録も自分のものだと主張していた。
+    #[test]
+    fn an_app_only_match_is_refused_when_other_registrations_look_identical() {
+        let m = WindowMatcher {
+            executable_path: PathBuf::from(r"C:\brave\brave.exe"),
+            process_name: "brave.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "Brave".to_string(),
+            title_contains: None,
+            title_regex: None,
+        };
+        let someone_elses = candidate(
+            1,
+            Some(r"C:\brave\brave.exe"),
+            "Chrome_WidgetWin_1",
+            "再生 | U-NEXT - Brave",
+        );
+        assert_eq!(score_candidate(&m, &someone_elses), 75);
+
+        assert_eq!(
+            resolve_best_match(
+                &m,
+                std::slice::from_ref(&someone_elses),
+                &HashSet::new(),
+                TitlelessMatch::Reject
+            ),
+            MatchDecision::Unresolved,
+            "根拠なしに他セットの窓を掴んではいけない"
+        );
+        assert_eq!(
+            resolve_best_match(
+                &m,
+                &[someone_elses],
+                &HashSet::new(),
+                TitlelessMatch::Accept
+            ),
+            MatchDecision::AutoRebind { hwnd: 1 },
+            "その実行ファイルの登録が1つだけなら取り違える相手が居ない"
+        );
+    }
+
+    /// 貪欲な先勝ちで候補が1枚に減ると、2位が消えて margin が best_score まで
+    /// 跳ね上がり、いちばん自信を持ってはいけない場面で自信を持っていた。
+    #[test]
+    fn the_leftover_candidate_is_not_confidently_bound_when_a_better_one_is_taken() {
+        let mut m = matcher();
+        m.title_contains = Some("repodeck".to_string());
+        let mine = candidate(
+            1,
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "repodeck",
+        );
+        let someone_elses = candidate(
+            2,
+            Some(r"C:\Program Files\Microsoft VS Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "02_求解・高速化 (ワークスペース)",
+        );
+
+        // 自分の窓が別セットに確保済み。残るのは無関係な窓1枚だけ。
+        let claimed: HashSet<isize> = [1].into_iter().collect();
+        assert_eq!(
+            resolve_best_match(&m, &[mine, someone_elses], &claimed, TitlelessMatch::Accept),
+            MatchDecision::Ambiguous {
+                candidates: vec![2]
+            },
+            "取られた一番手より低い残り物を、自信満々に掴んではいけない"
+        );
+    }
+
+    /// VS Code の登録はどれも `registered_title` が汎用の "Visual Studio Code"。
+    /// これは**フォルダ読込前のウィンドウが一時的に名乗るタイトル**でもあるので、
+    /// OS 再起動でセッション復元中の窓がどの登録にも「根拠あり」になっていた。
+    #[test]
+    fn the_generic_app_title_is_not_evidence_for_a_registration_that_has_a_needle() {
+        let m = WindowMatcher {
+            executable_path: PathBuf::from(r"C:\Code\Code.exe"),
+            process_name: "Code.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "Visual Studio Code".to_string(),
+            title_contains: Some("repodeck".to_string()),
+            title_regex: None,
+        };
+        let still_loading = candidate(
+            1,
+            Some(r"C:\Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+        );
+        let mine = candidate(
+            2,
+            Some(r"C:\Code\Code.exe"),
+            "Chrome_WidgetWin_1",
+            "repodeck",
+        );
+        assert!(!has_title_evidence(&m, &still_loading));
+        assert!(has_title_evidence(&m, &mine));
     }
 
     #[test]

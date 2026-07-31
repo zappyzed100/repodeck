@@ -154,6 +154,7 @@ fn rename(id: &mut String, renames: &RenameMap, changed: &mut usize) {
 pub fn apply_remap(
     config: &mut AppConfig,
     auto_slot_assignments: &mut HashMap<String, String>,
+    last_seen_monitor_fingerprint: &mut Option<String>,
     renames: &RenameMap,
 ) -> usize {
     let mut changed = 0;
@@ -192,25 +193,98 @@ pub fn apply_remap(
         }
     }
 
+    if let Some(fingerprint) = last_seen_monitor_fingerprint
+        && let Some(rewritten) = rename_fingerprint(fingerprint, renames)
+    {
+        *fingerprint = rewritten;
+        changed += 1;
+    }
+
     changed
+}
+
+/// `monitor_watch_service::compute_fingerprint` が作る
+/// `<device_name>:<x>,<y>,<w>,<h>` を `|` で連ねた文字列のデバイス名を付け替える。
+/// 何も変わらなければ `None`。
+///
+/// ここを忘れていたせいで、付け替えの直後は指紋だけが旧名のまま残っていた。
+/// 次に `WM_DISPLAYCHANGE` が来ると同値判定が必ず外れ、実際には何も変わって
+/// いないのに「トポロジが変わった」として画面外ウィンドウの掃除が走る
+/// （実機で確認、2026-07-29）。
+fn rename_fingerprint(fingerprint: &str, renames: &RenameMap) -> Option<String> {
+    let mut touched = false;
+    let mut parts: Vec<String> = fingerprint
+        .split('|')
+        .map(|part| {
+            let Some((name, rect)) = part.split_once(':') else {
+                return part.to_string();
+            };
+            match renames.get(name) {
+                Some(new) => {
+                    touched = true;
+                    format!("{new}:{rect}")
+                }
+                None => part.to_string(),
+            }
+        })
+        .collect();
+    if !touched {
+        return None;
+    }
+    // `compute_fingerprint` は並べ替えてから連結する。付け替えで順序が変わりうる
+    // ので、比較相手と同じ正規形に戻す。
+    parts.sort();
+    Some(parts.join("|"))
 }
 
 /// 現在のライブモニターから `device_path` を保存済みモニターへ焼き直す。
 ///
 /// これを書いておかないと次回の入れ替わりを bounds でしか判定できない。
 /// 何か変わったら `true`。
-pub fn refresh_device_paths(config: &mut AppConfig, live: &[LiveMonitor]) -> bool {
-    let mut changed = false;
+///
+/// **既に別の `device_path` が入っている行は上書きしない。** 対応付けは
+/// `stable_id == device_name` という「入れ替わっているかもしれない前提」で
+/// 取っているので、[`plan_remap`] が衝突や対応不能で計画を捨てた直後にここを
+/// 素通しすると、旧 `stable_id` に**別の物理モニター**の path を焼き付けて
+/// しまう。そうなると次回からはその捻れを `device_path` では検知できなくなり、
+/// 唯一の安定な同一性を自分で壊すことになる。食い違いは呼び出し側が警告する。
+pub fn refresh_device_paths(config: &mut AppConfig, live: &[LiveMonitor]) -> RefreshOutcome {
+    let mut outcome = RefreshOutcome::default();
     for monitor in &mut config.monitors {
         let Some(l) = live.iter().find(|l| l.device_name == monitor.stable_id) else {
             continue;
         };
-        if l.device_path.is_some() && monitor.device_path != l.device_path {
-            monitor.device_path = l.device_path.clone();
-            changed = true;
+        let Some(live_path) = l.device_path.as_deref() else {
+            continue;
+        };
+        match monitor.device_path.as_deref() {
+            Some(saved) if saved == live_path => {}
+            // 空欄への初回書き込みだけが安全。
+            None => {
+                monitor.device_path = Some(live_path.to_string());
+                outcome.filled += 1;
+            }
+            Some(_) => outcome.conflicting.push(monitor.stable_id.clone()),
         }
     }
-    changed
+    outcome
+}
+
+/// [`refresh_device_paths`] の結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    /// `device_path` が空だった行を埋めた件数。
+    pub filled: usize,
+    /// 保存済みの `device_path` と、同じ名前のライブモニターの path が食い違った
+    /// 行の `stable_id`。名前と物理モニターの対応がねじれている証拠なので、
+    /// 上書きせずそのまま残してある。
+    pub conflicting: Vec<String>,
+}
+
+impl RefreshOutcome {
+    pub fn changed(&self) -> bool {
+        self.filled > 0
+    }
 }
 
 #[cfg(test)]
@@ -402,10 +476,12 @@ mod tests {
         }];
         let mut slots = HashMap::from([("ws".to_string(), "A::2".to_string())]);
 
-        let renames = RenameMap::from([("A".to_string(), "B".to_string())]);
-        let changed = apply_remap(&mut config, &mut slots, &renames);
+        let mut fingerprint = Some("A:0,0,1920,1080|C:1920,0,1920,1080".to_string());
 
-        assert_eq!(changed, 6, "6か所すべてが書き換わること");
+        let renames = RenameMap::from([("A".to_string(), "B".to_string())]);
+        let changed = apply_remap(&mut config, &mut slots, &mut fingerprint, &renames);
+
+        assert_eq!(changed, 7, "7か所すべてが書き換わること");
         assert_eq!(config.monitors[0].stable_id, "B");
         assert_eq!(config.monitors[0].device_name, "B");
         assert_eq!(config.main_monitor_ids, vec!["B".to_string()]);
@@ -413,6 +489,28 @@ mod tests {
         assert_eq!(config.fixed_slots[0].monitor_id, "B");
         assert_eq!(config.worksets[0].windows[0].main_placement.monitor_id, "B");
         assert_eq!(slots.get("ws"), Some(&"B::2".to_string()));
+        assert_eq!(
+            fingerprint.as_deref(),
+            Some("B:0,0,1920,1080|C:1920,0,1920,1080"),
+            "指紋を置き去りにすると、次の WM_DISPLAYCHANGE で必ず誤検知する"
+        );
+    }
+
+    /// 付け替えで名前の辞書順が変わっても、`compute_fingerprint` と同じ
+    /// 並べ替え済みの形に戻さないと比較が一致しない。
+    #[test]
+    fn a_renamed_fingerprint_is_re_sorted_into_the_canonical_form() {
+        let mut config = AppConfig::new_empty();
+        let mut slots = HashMap::new();
+        let mut fingerprint = Some("A:0,0,100,100|B:100,0,100,100".to_string());
+        let renames = RenameMap::from([("A".to_string(), "Z".to_string())]);
+
+        apply_remap(&mut config, &mut slots, &mut fingerprint, &renames);
+
+        assert_eq!(
+            fingerprint.as_deref(),
+            Some("B:100,0,100,100|Z:0,0,100,100")
+        );
     }
 
     #[test]
@@ -421,8 +519,23 @@ mod tests {
         config.monitors = vec![saved("A", None, 0, 0)];
         let live = [live("A", Some("p1"), 0, 0)];
 
-        assert!(refresh_device_paths(&mut config, &live));
+        assert!(refresh_device_paths(&mut config, &live).changed());
         assert_eq!(config.monitors[0].device_path.as_deref(), Some("p1"));
-        assert!(!refresh_device_paths(&mut config, &live));
+        assert!(!refresh_device_paths(&mut config, &live).changed());
+    }
+
+    /// 付け替えを断念した直後にここを素通しすると、旧 `stable_id` に別の物理
+    /// モニターの path を焼き付け、以後その捻れを検知できなくなる。
+    #[test]
+    fn refresh_device_paths_never_overwrites_a_conflicting_path() {
+        let mut config = AppConfig::new_empty();
+        config.monitors = vec![saved("A", Some("p_old"), 0, 0)];
+        let live = [live("A", Some("p_new"), 0, 0)];
+
+        let outcome = refresh_device_paths(&mut config, &live);
+
+        assert_eq!(config.monitors[0].device_path.as_deref(), Some("p_old"));
+        assert!(!outcome.changed());
+        assert_eq!(outcome.conflicting, vec!["A".to_string()]);
     }
 }

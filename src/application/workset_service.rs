@@ -14,7 +14,7 @@ use crate::domain::workset::{
 };
 use crate::persistence::clock;
 use crate::windowing::enumerate::TopLevelWindow;
-use crate::windowing::matcher::{self, MatchDecision};
+use crate::windowing::matcher::{self, MatchDecision, TitlelessMatch};
 use crate::windowing::monitor::MonitorInfo;
 
 /// Searches `start` and its ancestors for a `.git` entry (PLAN.md §3.6:
@@ -301,9 +301,55 @@ fn find_by_launch_identity(
 }
 
 fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
-    live.executable_path
+    let same_app = live
+        .executable_path
         .as_deref()
-        .is_some_and(|p| matcher::same_executable(p, &matcher.executable_path))
+        .is_some_and(|p| matcher::same_executable(p, &matcher.executable_path));
+    if !same_app {
+        return false;
+    }
+
+    // 実行ファイルだけでは「そのアプリの窓」しか言えない。登録が自分の窓を
+    // 見分ける手掛かり（`title_contains` / `title_regex`）を持っているなら、
+    // それが今も成り立っていることまで確かめる。
+    //
+    // ここを実行ファイルだけで通していたせいで、一度ついた誤りが二度と直らな
+    // かった。実機では `repodeck` セットの VS Code 登録が「02_求解・高速化」の
+    // 窓を握り、正しい `repodeck` の窓が後から現れても乗り換えなかった
+    // （2026-07-29）。手掛かりを持たない登録は今までどおり実行ファイルだけで
+    // 判断する——それ以上の材料が無く、要求すると永久にバインドを保持できない。
+    !matcher::has_discriminator(matcher) || matcher::has_title_evidence(matcher, live)
+}
+
+/// 実行ファイルごとの登録数。同じ実行ファイルを名乗る登録が2つ以上あると、
+/// 実行ファイル＋クラスの75点だけでは互いを見分けられない。
+fn registrations_per_executable(worksets: &[Workset]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for window in worksets.iter().flat_map(|w| w.windows.iter()) {
+        let key = window
+            .matcher
+            .executable_path
+            .as_os_str()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+}
+
+/// タイトルの根拠が無い候補を、この登録に限って自動バインドしてよいか。
+fn titleless_policy(counts: &HashMap<String, usize>, window: &ManagedWindow) -> TitlelessMatch {
+    let key = window
+        .matcher
+        .executable_path
+        .as_os_str()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if counts.get(&key).copied().unwrap_or(0) > 1 {
+        TitlelessMatch::Reject
+    } else {
+        TitlelessMatch::Accept
+    }
 }
 
 /// Like [`resolve_all_matches`], but first tries each managed window's tracked
@@ -327,6 +373,7 @@ pub fn resolve_all_matches_with_bindings(
 ) -> HashMap<Uuid, MatchDecision> {
     let mut bound: HashSet<isize> = HashSet::new();
     let mut results = HashMap::new();
+    let per_exe = registrations_per_executable(worksets);
 
     // The priority workset first, then the rest in their original order.
     let ordered = priority_workset_id
@@ -364,19 +411,15 @@ pub fn resolve_all_matches_with_bindings(
                             results.insert(window.id, MatchDecision::AutoRebind { hwnd });
                             continue;
                         }
-                        let decision =
-                            matcher::resolve_best_match(&window.matcher, live_windows, &bound);
-                        let decision = match &decision {
-                            MatchDecision::AutoRebind { hwnd }
-                                if !live_windows.iter().any(|w| {
-                                    w.hwnd == *hwnd
-                                        && matcher::has_title_evidence(&window.matcher, w)
-                                }) =>
-                            {
-                                MatchDecision::Unresolved
-                            }
-                            _ => decision,
-                        };
+                        // バインドが指す窓が消えている＝閉じられた。再発見は許すが
+                        // 「同じアプリの別窓」で妥協させてはいけないので、登録数に
+                        // 関わらずタイトルの根拠を要求する。
+                        let decision = matcher::resolve_best_match(
+                            &window.matcher,
+                            live_windows,
+                            &bound,
+                            TitlelessMatch::Reject,
+                        );
                         if let MatchDecision::AutoRebind { hwnd } = &decision {
                             bound.insert(*hwnd);
                         }
@@ -389,7 +432,12 @@ pub fn resolve_all_matches_with_bindings(
                 }
             }
 
-            let decision = matcher::resolve_best_match(&window.matcher, live_windows, &bound);
+            let decision = matcher::resolve_best_match(
+                &window.matcher,
+                live_windows,
+                &bound,
+                titleless_policy(&per_exe, window),
+            );
             if let MatchDecision::AutoRebind { hwnd } = &decision {
                 bound.insert(*hwnd);
             }

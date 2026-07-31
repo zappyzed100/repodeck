@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use uuid::Uuid;
 
+use crate::application::integrity_service;
 use crate::application::main_placement::resolve_main_restore;
 use crate::application::parking_allocator::{
     AllocationInput, ParkAssignment, ParkingSlotId, allocate_parking,
@@ -155,6 +156,25 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         };
 
         let mut runtime = runtime_store::load(&self.data_dir);
+
+        // 解決の**前に**検出器を回し、反応したら修正器で誤った紐づけを外す。
+        //
+        // 誤バインドが生まれるのはまさにこの切り替えの最中（先勝ちで候補が1枚に
+        // 減った瞬間）なので、起動時に1回だけでは間に合わない。検出器は Win32 を
+        // 呼ばない純粋関数で、既に列挙済みのウィンドウとメモリ上の紐づけ表しか
+        // 見ないため、毎回回しても実質タダ。
+        //
+        // 解決の前に置くのが肝心で、後ろに置くと「今回の切り替えは誤った紐づけの
+        // まま実行され、次回からやっと直る」ことになる。
+        let integrity = integrity_service::check_and_repair(
+            request.worksets,
+            request.live_windows,
+            &mut runtime.window_bindings,
+        );
+        if integrity.detected_anything() {
+            integrity_service::log_report(&integrity, "switch");
+        }
+
         // Step 3: resolve, preferring each window's tracked session HWND binding
         // over volatile title/URL matching, then learn/refresh those bindings.
         let decisions = workset_service::resolve_all_matches_with_bindings(
@@ -167,17 +187,6 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         );
         for (id, hwnd) in workset_service::bindings_from_decisions(&decisions) {
             runtime.window_bindings.insert(id, hwnd);
-        }
-        // 紐づけ表の掃除。切替のたびに現在の登録が手元にある——ここが一番自然な掃除
-        // どころ。解決に使ったあとで掃除するので、この切替の判断には影響しない。
-        let pruned =
-            workset_service::prune_window_bindings(&mut runtime.window_bindings, request.worksets);
-        if pruned > 0 {
-            tracing::info!(
-                target: "switch", pruned,
-                remaining = runtime.window_bindings.len(),
-                "switch: dropped window bindings whose registration no longer exists"
-            );
         }
 
         // Step 2: switching to the already-current workset is a no-op focus —

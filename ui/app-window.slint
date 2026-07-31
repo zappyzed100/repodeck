@@ -462,6 +462,11 @@ export component TrayIcon inherits SystemTrayIcon {
             activated => { root.reconnect-monitors-requested(); }
         }
 
+        MenuItem {
+            title: "紐づけを点検して修復";
+            activated => { root.check-integrity-requested(); }
+        }
+
         MenuSeparator { }
 
         MenuItem {
@@ -489,6 +494,7 @@ export component TrayIcon inherits SystemTrayIcon {
     callback empty-main-screen-requested();
     callback recover-all-requested();
     callback reconnect-monitors-requested();
+    callback check-integrity-requested();
     callback settings-requested();
     callback open-log-folder-requested();
     callback quit-requested();
