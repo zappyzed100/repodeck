@@ -189,6 +189,33 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             runtime.window_bindings.insert(id, hwnd);
         }
 
+        // 診断: 対象セットの窓が AutoRebind に届かず「動かされない」窓があれば、
+        // 何も言わずに通り過ぎると「切替に失敗した」ように見える。Chrome/Brave の
+        // ような exe/クラスが全窓同じアプリは、`--user-data-dir` やタイトルの針が
+        // 無いと Ambiguous になり、対象窓として動かない（2026-08-02）。
+        for managed in &target.windows {
+            match decisions.get(&managed.id) {
+                Some(MatchDecision::AutoRebind { .. }) => {}
+                Some(MatchDecision::Ambiguous { candidates }) => {
+                    tracing::warn!(
+                        target: "switch", to = %target.name, window = %managed.id,
+                        candidates = candidates.len(), title = %managed.matcher.registered_title,
+                        "switch: target window is AMBIGUOUS and will NOT be moved \
+                         (give it a --user-data-dir or a title needle so RepoDeck can pick it out)"
+                    );
+                }
+                Some(MatchDecision::Unresolved) | None => {
+                    // 閉じている・起動中（launch_missing_for_switch が今まさに起動中）
+                    // の窓は Unresolved になるのが正常なので、警告ではなく debug。
+                    tracing::debug!(
+                        target: "switch", to = %target.name, window = %managed.id,
+                        title = %managed.matcher.registered_title,
+                        "switch: target window is UNRESOLVED (not found among live windows)"
+                    );
+                }
+            }
+        }
+
         // Step 2: switching to the already-current workset is a no-op focus —
         // unless the caller asked for its placement to be re-applied.
         let reapplying = runtime.current_workset_id == Some(target.id);
@@ -232,12 +259,23 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         // layout always matches the current balanced allocation. Otherwise a set
         // parked by an earlier switch keeps a stale cell and overlaps the freshly
         // parked ones at the wrong size (2026-07-23).
+        //
+        // 対象セットにも登録されている窓（共有ウィンドウ）はここから外す。対象として
+        // メイン画面へ復元された後に、退避側の登録経由でもう一度退避先へ移動されると
+        // 「アクティブセットに追従」しない——退避側の方が後に走るので退避先へ上書き
+        // される（2026-08-02）。
+        let target_hwnds: std::collections::HashSet<isize> =
+            target_resolved.iter().map(|r| r.hwnd).collect();
         let mut parking: Vec<(&Workset, Vec<ResolvedWindow>)> = request
             .worksets
             .iter()
             .filter(|w| w.id != target.id)
             .filter_map(|w| {
                 let resolved = resolved_windows(w, &decisions, request.live_windows);
+                let resolved: Vec<_> = resolved
+                    .into_iter()
+                    .filter(|r| !target_hwnds.contains(&r.hwnd))
+                    .collect();
                 (!resolved.is_empty()).then_some((w, resolved))
             })
             .collect();
@@ -422,7 +460,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             );
             if target_was_fullscreen {
                 self.window_ops
-                    .exit_fullscreen(resolved.hwnd, outcome.rect, maximized);
+                    .exit_fullscreen(resolved.hwnd, outcome.rect, maximized, false);
             } else {
                 self.window_ops
                     .set_placement(resolved.hwnd, outcome.rect, maximized, false);
@@ -473,12 +511,16 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         }
         self.park_auto_windows(&auto_windows, &request);
 
-        // Step 7: restore Z-order (ascending `z_order`, frontmost last).
+        // Step 7: raise the target set's windows above every parked window, in
+        // ascending `z_order` so the frontmost ends up on top. Parking moves
+        // windows with `SWP_NOZORDER` (placement never changes Z), so without
+        // this a parked window that was higher in Z before the switch stays
+        // above the target's non-frontmost windows and buries them on the main
+        // screen (2026-08-02).
         let mut z_ordered: Vec<&ResolvedWindow> = target_resolved.iter().collect();
         z_ordered.sort_by_key(|w| w.managed.z_order);
-        for pair in z_ordered.windows(2) {
-            self.window_ops
-                .set_z_order_after(pair[1].hwnd, Some(pair[0].hwnd));
+        for resolved in &z_ordered {
+            self.window_ops.set_z_order_after(resolved.hwnd, None);
         }
 
         // Step 8: best-effort focus the topmost window.
@@ -538,6 +580,28 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         runtime.current_workset_id = None;
         runtime_store::save(&self.data_dir, &runtime)?;
         Ok(report)
+    }
+
+    /// 退避先セルへ窓を1枚置く。窓が「モニタ全域を覆っている」＝ブラウザ全画面
+    /// （F11/動画全画面。Win32 の最大化とは別物で、最大化窓は show state が
+    /// `Maximized` なのでここには来ない）のときは、`set_placement` では縮められない
+    /// ため、先に全画面解除キーを送ってから配置する——対象セットの復元と同経路。
+    /// ベストエフォート・非同期で、失敗しても切替は壊さない（2026-08-02）。
+    fn place_parked_window(&self, request: &SwitchRequest, hwnd: isize, rect: PixelRect) {
+        let fullscreen = self
+            .window_ops
+            .get_show_state(hwnd)
+            .is_ok_and(|s| s == SavedShowState::Normal)
+            && is_monitor_filling(hwnd, request.live_windows, request.live_monitors);
+        if fullscreen {
+            tracing::info!(
+                target: "switch", hwnd, cell = ?rect,
+                "switch: parked window is browser-fullscreen — exit full-screen then place"
+            );
+            self.window_ops.exit_fullscreen(hwnd, rect, false, true);
+        } else {
+            self.window_ops.set_placement(hwnd, rect, false, true);
+        }
     }
 
     /// PLAN.md §4.3/§4.4: decides and applies where `workset` parks.
@@ -686,7 +750,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             );
             // `fill`: `rect` is the desired visible cell, expanded by the
             // window's invisible DWM border so it fills flush (no gutter).
-            self.window_ops.set_placement(*hwnd, *rect, false, true);
+            self.place_parked_window(request, *hwnd, *rect);
         }
 
         // "退避後に全画面表示": the browser's own full-screen keys are sent after
@@ -860,7 +924,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
                 target: "parking", hwnd, cell = ?cell, windows = hwnds.len(),
                 "auto-park: place window into cell"
             );
-            self.window_ops.set_placement(hwnd, cell, false, true);
+            self.place_parked_window(request, hwnd, cell);
         }
         for hwnd in overflow {
             tracing::info!(target: "parking", hwnd, "auto-park: no room, minimizing");
@@ -878,7 +942,7 @@ impl<W: WindowOps> SwitchCoordinator<W> {
         let hwnds: Vec<isize> = evictees.iter().map(|w| w.hwnd).collect();
         let (placements, overflow) = distribute_parking_capped(&screens, &hwnds);
         for (hwnd, cell) in placements {
-            self.window_ops.set_placement(hwnd, cell, false, true);
+            self.place_parked_window(request, hwnd, cell);
         }
         for hwnd in overflow {
             self.window_ops.minimize(hwnd);
@@ -931,6 +995,28 @@ impl<W: WindowOps> SwitchCoordinator<W> {
             }
         }
     }
+}
+
+/// `hwnd` が「そのモニタ全域を覆っている」か（ブラウザ全画面のシグナル）。
+/// 列挙時の `GetWindowRect`（フレーム矩形）を各モニタの `bounds_px` と比べ、
+/// 最大 2px/4px の誤差を許す。**最大化窓はここでは全画面扱いしない**——最大化は
+/// `show state == Maximized` であり、呼び出し側（`place_parked_window`）が先に
+/// それで除外する。ブラウザの F11/動画全画面は Win32 の最大化ではなく
+/// `Normal` のままモニタ全域を覆うので、この関数だけが拾える（2026-08-02）。
+fn is_monitor_filling(
+    hwnd: isize,
+    live_windows: &[TopLevelWindow],
+    live_monitors: &[MonitorInfo],
+) -> bool {
+    let Some(w) = live_windows.iter().find(|w| w.hwnd == hwnd) else {
+        return false;
+    };
+    live_monitors.iter().any(|m| {
+        (w.rect_px.x - m.bounds_px.x).abs() <= 2
+            && (w.rect_px.y - m.bounds_px.y).abs() <= 2
+            && (w.rect_px.width - m.bounds_px.width).abs() <= 4
+            && (w.rect_px.height - m.bounds_px.height).abs() <= 4
+    })
 }
 
 fn resolved_windows<'a>(
@@ -1261,7 +1347,7 @@ mod tests {
 
     use super::*;
     use crate::application::window_ops::fake::FakeWindowOps;
-    use crate::domain::monitor::AutoSplit;
+    use crate::domain::monitor::{AutoSplit, SavedMonitor};
     use crate::domain::placement::{NormalizedRect, PixelRect, SavedPlacement};
     use crate::domain::workset::{ParkingPolicy, RepositoryKind, WindowMatcher};
 
@@ -1992,6 +2078,277 @@ mod tests {
             before,
             "a re-applied set was never parked, so it must not be asked to exit fullscreen"
         );
+    }
+
+    fn saved_monitor_for(monitor: &MonitorInfo, auto_split: AutoSplit) -> SavedMonitor {
+        SavedMonitor {
+            stable_id: monitor.device_name.clone(),
+            device_name: monitor.device_name.clone(),
+            device_path: None,
+            friendly_name: None,
+            bounds_px: monitor.bounds_px,
+            work_area_px: monitor.work_area_px,
+            dpi_x: monitor.dpi_x,
+            dpi_y: monitor.dpi_y,
+            auto_split: Some(auto_split),
+            excluded: false,
+        }
+    }
+
+    /// 対象セットの窓は「z_order 最大の1枚」だけではなく**全部**を最前面へ
+    /// 持ち上げる。退避は `SWP_NOZORDER` で Z 順を変えないので、退避窓のほうが
+    /// もともと上に居ると、対象の非前面窓が退避窓の下に埋まったままになる
+    /// （2026-08-02）。
+    #[test]
+    fn switch_raises_every_target_window_above_parked_ones() {
+        let dir = tempdir().unwrap();
+        let rect = NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
+        let a = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![
+                managed_window("app-a1", 0, rect, SavedShowState::Normal, 0),
+                managed_window("app-a2", 0, rect, SavedShowState::Normal, 5),
+            ],
+        );
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-b", 0, rect, SavedShowState::Normal, 0)],
+        );
+        let worksets = vec![a.clone(), b.clone()];
+        let live_windows = vec![
+            live_window(1, "app-a1"),
+            live_window(2, "app-a2"),
+            live_window(3, "app-b"),
+        ];
+        let main = monitor("MAIN", 0);
+        let side = monitor("SIDE", 1920);
+        let live_monitors = vec![main.clone(), side.clone()];
+        let saved_monitors = vec![saved_monitor_for(&side, AutoSplit::One)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+
+        let fake = FakeWindowOps::new();
+        for hwnd in [1isize, 2, 3] {
+            fake.seed_window(
+                hwnd,
+                PixelRect::new(100, 100, 400, 300),
+                SavedShowState::Normal,
+            );
+        }
+        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+
+        coordinator
+            .switch_to(SwitchRequest {
+                worksets: &worksets,
+                fixed_slots: &[],
+                sub_screens: &[],
+                saved_monitors: &saved_monitors,
+                main_monitor_ids: &main_monitor_ids,
+                live_monitors: &live_monitors,
+                live_windows: &live_windows,
+                target_workset_id: a.id,
+            })
+            .expect("switch to A");
+
+        // 対象（A）の2枚が z_order 昇順で「最前面へ持ち上げ」（insert_after = None）
+        // られる。退避窓（B）は持ち上げ対象にならない。
+        assert_eq!(
+            coordinator.window_ops.z_order_history(),
+            vec![(1, None), (2, None)],
+            "every target window must be raised to the top, frontmost last"
+        );
+    }
+
+    /// 同じ窓を複数のセットに登録したとき、窓はアクティブセットに追従する
+    /// （README）。退避側の登録経由で退避先へ二重配置されないことを確認する。
+    /// 退避のフィルタは防衛的（照合が既に二重確保を防いでいる）が、不変条件
+    /// 「メインへ復元した窓は決して再退避されない」を文書化する（2026-08-02）。
+    #[test]
+    fn a_shared_window_follows_the_active_workset() {
+        let dir = tempdir().unwrap();
+        let rect = NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
+        // shared（hwnd 1）を両方のセットに登録する。
+        let shared_a = managed_window("shared", 0, rect, SavedShowState::Normal, 0);
+        let mut shared_b = shared_a.clone();
+        shared_b.id = Uuid::new_v4();
+        let a = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![
+                shared_a,
+                managed_window("app-a", 0, rect, SavedShowState::Normal, 1),
+            ],
+        );
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![
+                shared_b,
+                managed_window("app-b", 0, rect, SavedShowState::Normal, 1),
+            ],
+        );
+        let worksets = vec![a.clone(), b.clone()];
+        let live_windows = vec![
+            live_window(1, "shared"),
+            live_window(2, "app-a"),
+            live_window(3, "app-b"),
+        ];
+        let main = monitor("MAIN", 0);
+        let side = monitor("SIDE", 1920);
+        let live_monitors = vec![main.clone(), side.clone()];
+        let saved_monitors = vec![saved_monitor_for(&side, AutoSplit::One)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+
+        let fake = FakeWindowOps::new();
+        for hwnd in [1isize, 2, 3] {
+            fake.seed_window(
+                hwnd,
+                PixelRect::new(100, 100, 400, 300),
+                SavedShowState::Normal,
+            );
+        }
+        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+
+        let switch_to = |target: Uuid| {
+            coordinator
+                .switch_to(SwitchRequest {
+                    worksets: &worksets,
+                    fixed_slots: &[],
+                    sub_screens: &[],
+                    saved_monitors: &saved_monitors,
+                    main_monitor_ids: &main_monitor_ids,
+                    live_monitors: &live_monitors,
+                    live_windows: &live_windows,
+                    target_workset_id: target,
+                })
+                .expect("switch")
+        };
+
+        switch_to(a.id);
+        let after_a = coordinator.window_ops.rect_of(1).unwrap();
+        assert!(
+            on_some_monitor(after_a, &[main.work_area_px]),
+            "shared window must stay on main while A is active: {after_a:?}"
+        );
+
+        switch_to(b.id);
+        let after_b = coordinator.window_ops.rect_of(1).unwrap();
+        assert!(
+            on_some_monitor(after_b, &[main.work_area_px]),
+            "shared window must follow the active set B onto main: {after_b:?}"
+        );
+    }
+
+    /// 退避対象の窓が「モニタ全域を覆う」＝ブラウザ全画面のとき、`set_placement`
+    /// では縮められないので全画面解除キーを送ってから置く（対象セットの復元と
+    /// 同経路）。通常サイズの窓には送らない（2026-08-02）。
+    #[test]
+    fn a_browser_fullscreen_window_is_exited_when_parked() {
+        let dir = tempdir().unwrap();
+        let rect = NormalizedRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.2,
+            height: 0.2,
+        };
+        let a = workset(
+            0,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-a", 0, rect, SavedShowState::Normal, 0)],
+        );
+        let b = workset(
+            1,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-b", 0, rect, SavedShowState::Normal, 0)],
+        );
+        let c = workset(
+            2,
+            ParkingPolicy::Auto,
+            vec![managed_window("app-c", 0, rect, SavedShowState::Normal, 0)],
+        );
+        let worksets = vec![a.clone(), b.clone(), c.clone()];
+
+        let main = monitor("MAIN", 0);
+        let side = monitor("SIDE", 1920);
+        let live_monitors = vec![main.clone(), side.clone()];
+        let saved_monitors = vec![saved_monitor_for(&side, AutoSplit::One)];
+        let main_monitor_ids = vec!["MAIN".to_string()];
+        // A の窓（1）は SIDE 全域を覆う＝ブラウザ全画面。C の窓（3）は通常サイズ。
+        let full = TopLevelWindow {
+            rect_px: side.bounds_px,
+            ..live_window(1, "app-a")
+        };
+        let live_windows = vec![full, live_window(2, "app-b"), live_window(3, "app-c")];
+
+        let fake = FakeWindowOps::new();
+        for hwnd in [1isize, 2, 3] {
+            fake.seed_window(
+                hwnd,
+                PixelRect::new(100, 100, 400, 300),
+                SavedShowState::Normal,
+            );
+        }
+        let coordinator = SwitchCoordinator::new(fake, dir.path().to_path_buf());
+
+        coordinator
+            .switch_to(SwitchRequest {
+                worksets: &worksets,
+                fixed_slots: &[],
+                sub_screens: &[],
+                saved_monitors: &saved_monitors,
+                main_monitor_ids: &main_monitor_ids,
+                live_monitors: &live_monitors,
+                live_windows: &live_windows,
+                target_workset_id: b.id,
+            })
+            .expect("switch to B");
+
+        let exited = coordinator.window_ops.exit_fullscreen_targets();
+        assert!(
+            exited.contains(&1),
+            "the fullscreen window must be asked to exit full-screen before parking: {exited:?}"
+        );
+        assert!(
+            !exited.contains(&3),
+            "a normal-size window must not be asked to exit full-screen: {exited:?}"
+        );
+    }
+
+    #[test]
+    fn is_monitor_filling_recognizes_a_fullscreen_rect_but_not_a_regular_one() {
+        let full = TopLevelWindow {
+            rect_px: PixelRect::new(1920, 0, 1920, 1080),
+            ..live_window(1, "app")
+        };
+        let regular = TopLevelWindow {
+            rect_px: PixelRect::new(2000, 100, 800, 600),
+            ..live_window(2, "app")
+        };
+        let monitors = [monitor("SIDE", 1920)];
+
+        assert!(is_monitor_filling(
+            1,
+            std::slice::from_ref(&full),
+            &monitors
+        ));
+        assert!(!is_monitor_filling(
+            2,
+            std::slice::from_ref(&regular),
+            &monitors
+        ));
+        // 存在しない hwnd は全画面扱いしない。
+        assert!(!is_monitor_filling(99, &[full], &monitors));
     }
 
     #[test]

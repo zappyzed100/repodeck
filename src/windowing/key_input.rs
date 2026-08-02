@@ -87,16 +87,23 @@ pub fn send_fullscreen_keys(hwnd: HWND, refocus: Option<HWND>) {
 }
 
 /// Exits a YouTube video full-screen (the reverse of [`send_fullscreen_keys`]:
-/// `F` again) and then places the window at its main-screen position
-/// (`restore_rect`, maximized there if `maximized`). Used when a
-/// full-screen-parked window is switched back to the main screen: a video
-/// full-screen is not a Win32 maximized state, so `SW_RESTORE` cannot undo it —
-/// the window would otherwise keep its (larger) parking-monitor size. Runs on a
-/// detached thread: focus, toggle full-screen off, then apply the target
-/// placement once the browser has returned to a normal window. The placement is
-/// re-asserted (see `placement::set_placement`) because the browser restores its
-/// own remembered bounds when leaving full-screen, racing this resize.
-pub fn send_exit_fullscreen_keys(hwnd: HWND, restore_rect: PixelRect, maximized: bool) {
+/// `F` again) and then places the window at `restore_rect` (maximized there if
+/// `maximized`). Used when a full-screen-parked window is switched back to the
+/// main screen: a video full-screen is not a Win32 maximized state, so `SW_RESTORE`
+/// cannot undo it — the window would otherwise keep its (larger) parking-monitor
+/// size. `fill` is passed through to `placement::set_placement`: `true` expands
+/// `restore_rect` by the window's invisible DWM margins (a parking cell), `false`
+/// uses it as a frame rect (a saved main placement). Runs on a detached thread:
+/// focus, toggle full-screen off, then apply the target placement once the
+/// browser has returned to a normal window. The placement is re-asserted (see
+/// `placement::set_placement`) because the browser restores its own remembered
+/// bounds when leaving full-screen, racing this resize.
+pub fn send_exit_fullscreen_keys(
+    hwnd: HWND,
+    restore_rect: PixelRect,
+    maximized: bool,
+    fill: bool,
+) {
     let raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let hwnd = HWND(raw as *mut _);
@@ -108,8 +115,8 @@ pub fn send_exit_fullscreen_keys(hwnd: HWND, restore_rect: PixelRect, maximized:
         // `set_placement`'s own re-assert loop then outlasts the browser's
         // asynchronous restore of its remembered bounds.
         std::thread::sleep(Duration::from_millis(500));
-        // Now that it's a normal window again, place it on the main screen
-        // (restore to the saved main frame rect, not a fill cell).
-        crate::windowing::placement::set_placement(hwnd, restore_rect, maximized, false);
+        // Now that it's a normal window again, place it (a parking cell when
+        // `fill`, a saved main frame rect otherwise).
+        crate::windowing::placement::set_placement(hwnd, restore_rect, maximized, fill);
     });
 }

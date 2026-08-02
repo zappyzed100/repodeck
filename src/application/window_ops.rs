@@ -32,9 +32,12 @@ pub trait WindowOps {
     /// Exits a browser full-screen (reverse keys) and places `hwnd` at
     /// `restore_rect` (maximized there if `maximized`), for a full-screen-parked
     /// window returning to the main screen (`SW_RESTORE` can't undo a page/video
-    /// full-screen). Best-effort and asynchronous — see
-    /// `windowing::key_input::send_exit_fullscreen_keys`.
-    fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool);
+    /// full-screen). `fill` has the same meaning as in [`WindowOps::set_placement`]:
+    /// `true` treats `restore_rect` as the desired *visible* area and expands it
+    /// by the window's invisible DWM margins (parking cells); `false` uses the
+    /// frame rect as-is (restoring a saved main placement). Best-effort and
+    /// asynchronous — see `windowing::key_input::send_exit_fullscreen_keys`.
+    fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool, fill: bool);
 
     /// Atomic batch move (PLAN.md §4.5). Implementations fall back to
     /// per-window moves if the atomic path fails, per §4.5's documented
@@ -94,6 +97,9 @@ pub(crate) mod fake {
         /// 全画面解除を要求した相手。解除は配置と同じ結果になるので、rect だけでは
         /// 「解除キーを撃ったか」が区別できない。
         exit_fullscreen_targets: RefCell<Vec<isize>>,
+        /// `set_z_order_after` の呼び出し履歴 `(hwnd, insert_after)`。
+        /// `insert_after == None` は「最前面（HWND_TOP）へ持ち上げた」ことを示す。
+        z_order_history: RefCell<Vec<(isize, Option<isize>)>>,
     }
 
     impl FakeWindowOps {
@@ -138,6 +144,11 @@ pub(crate) mod fake {
         /// 全画面解除を要求した相手の履歴。
         pub(crate) fn exit_fullscreen_targets(&self) -> Vec<isize> {
             self.exit_fullscreen_targets.borrow().clone()
+        }
+
+        /// `set_z_order_after` の呼び出し履歴。
+        pub(crate) fn z_order_history(&self) -> Vec<(isize, Option<isize>)> {
+            self.z_order_history.borrow().clone()
         }
     }
 
@@ -186,11 +197,17 @@ pub(crate) mod fake {
             self.fullscreen_key_targets.borrow_mut().push(hwnd);
         }
 
-        fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool) {
+        fn exit_fullscreen(
+            &self,
+            hwnd: isize,
+            restore_rect: PixelRect,
+            maximized: bool,
+            fill: bool,
+        ) {
             // Modeled as an immediate placement so restore tests still observe
             // the final state; the key synthesis itself isn't modeled.
             self.exit_fullscreen_targets.borrow_mut().push(hwnd);
-            self.set_placement(hwnd, restore_rect, maximized, false);
+            self.set_placement(hwnd, restore_rect, maximized, fill);
         }
 
         fn minimize(&self, hwnd: isize) {
@@ -231,8 +248,11 @@ pub(crate) mod fake {
             Ok(())
         }
 
-        fn set_z_order_after(&self, _hwnd: isize, _insert_after: Option<isize>) {
-            // Z-order isn't modeled by the fake; nothing to assert against yet.
+        fn set_z_order_after(&self, hwnd: isize, insert_after: Option<isize>) {
+            // Z-order isn't visually modeled by the fake, but the *sequence* is
+            // recorded so tests can assert which windows were raised to the top
+            // (`None`) and in what order.
+            self.z_order_history.borrow_mut().push((hwnd, insert_after));
         }
 
         fn set_foreground(&self, hwnd: isize) {
