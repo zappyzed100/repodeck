@@ -10,7 +10,10 @@ use std::process::Command;
 
 use crate::domain::workset::{LaunchKind, LaunchSpec};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SecurityImpersonation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary,
+};
 use windows::Win32::System::Threading::{
     CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithTokenW, OpenProcess,
     OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
@@ -140,15 +143,39 @@ fn interactive_shell_token() -> io::Result<HANDLE> {
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
             .map_err(|err| io::Error::other(format!("OpenProcess failed: {err}")))?
     };
-    let mut token = HANDLE::default();
-    let result = unsafe {
-        OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token)
+    let mut source_token = HANDLE::default();
+    let open_token = unsafe {
+        OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut source_token)
             .map_err(|err| io::Error::other(format!("OpenProcessToken failed: {err}")))
     };
     unsafe {
         let _ = CloseHandle(process);
     }
-    result.map(|()| token)
+    open_token?;
+
+    // CreateProcessWithTokenW is more reliable with a duplicated primary
+    // token than with the handle returned directly from Explorer, especially
+    // when the caller is an elevated process with a filtered admin token.
+    let mut primary_token = HANDLE::default();
+    let duplicate = unsafe {
+        DuplicateTokenEx(
+            source_token,
+            TOKEN_ASSIGN_PRIMARY
+                | TOKEN_DUPLICATE
+                | TOKEN_QUERY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_token,
+        )
+        .map_err(|err| io::Error::other(format!("DuplicateTokenEx failed: {err}")))
+    };
+    unsafe {
+        let _ = CloseHandle(source_token);
+    }
+    duplicate.map(|()| primary_token)
 }
 
 /// Builds a mutable Windows command line from the executable and its args.
