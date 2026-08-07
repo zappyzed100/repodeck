@@ -98,12 +98,7 @@ pub fn send_fullscreen_keys(hwnd: HWND, refocus: Option<HWND>) {
 /// browser has returned to a normal window. The placement is re-asserted (see
 /// `placement::set_placement`) because the browser restores its own remembered
 /// bounds when leaving full-screen, racing this resize.
-pub fn send_exit_fullscreen_keys(
-    hwnd: HWND,
-    restore_rect: PixelRect,
-    maximized: bool,
-    fill: bool,
-) {
+pub fn send_exit_fullscreen_keys(hwnd: HWND, restore_rect: PixelRect, maximized: bool, fill: bool) {
     let raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let hwnd = HWND(raw as *mut _);

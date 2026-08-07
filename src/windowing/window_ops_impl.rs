@@ -42,7 +42,12 @@ impl WindowOps for Win32WindowOps {
     }
 
     fn exit_fullscreen(&self, hwnd: isize, restore_rect: PixelRect, maximized: bool, fill: bool) {
-        crate::windowing::key_input::send_exit_fullscreen_keys(hwnd_of(hwnd), restore_rect, maximized, fill);
+        crate::windowing::key_input::send_exit_fullscreen_keys(
+            hwnd_of(hwnd),
+            restore_rect,
+            maximized,
+            fill,
+        );
     }
 
     fn minimize(&self, hwnd: isize) {
