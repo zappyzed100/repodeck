@@ -13,9 +13,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $repoRoot
 try {
     Write-Host "Building release binaries..."
-    cargo build --release
+    & (Join-Path $repoRoot "scripts\build.ps1") -SkipShortcut
     if ($LASTEXITCODE -ne 0) {
-        throw "cargo build --release failed with exit code $LASTEXITCODE"
+        throw "scripts\build.ps1 failed with exit code $LASTEXITCODE"
     }
 
     $cargoToml = Get-Content (Join-Path $repoRoot "Cargo.toml") -Raw

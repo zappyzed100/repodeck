@@ -92,9 +92,9 @@ jobs:
       # リリースビルドは巨大依存の再コンパイルで重い。PR では fmt/clippy/test で
       # 正しさを担保できるので走らせず、master への push 時（成果物が要る時）だけ
       # 実行する。これで PR の CI は dev プロファイル（キャッシュ温）だけになり速い。
-      - name: cargo build --release
+      - name: canonical release build
         if: github.event_name == 'push'
-        run: cargo build --release
+        run: pwsh -NoProfile -File .\build.ps1 -SkipShortcut
 
       - name: Upload release binaries
         if: github.event_name == 'push'

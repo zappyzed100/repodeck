@@ -241,8 +241,14 @@ RepoDeck はエージェントを起動したり接続したりしません。�
 ```powershell
 cargo test            # 単体テスト
 cargo clippy --all-targets --all-features -- -D warnings
-.\scripts\build.ps1   # リリースビルド + スタートメニューのショートカット更新
+.\build.ps1           # 唯一のローカルビルド入口
+# 内部実装を直接呼ぶ場合: .\scripts\build.ps1
 ```
+
+ローカルの RepoDeck は必ずリポジトリ直下の `build.ps1` からビルドします。
+ビルド成果物は常に `target\release\repodeck.exe` に置かれ、スタートメニューの
+`RepoDeck.lnk` も同じ exe を指すように更新されます。`dist\` は配布 zip 専用です。
+ビルド後に起動する場合は `pwsh -NoProfile -File .\build.ps1 -Run` を使います。
 
 - 構成: `src/domain`(純粋なモデル) / `src/application`(ロジック、Win32非依存で
   テスト可能) / `src/windowing`(Win32) / `ui`(Slint)
