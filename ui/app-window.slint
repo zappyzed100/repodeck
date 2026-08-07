@@ -1,19 +1,94 @@
-import { GlassButton, Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
 import { LayoutStudio } from "layout-studio.slint";
 export { LayoutStudio }
 import { WorksetManager } from "workset-dialog.slint";
 export { WorksetManager }
+import { QuickSwitcher } from "quick-switcher.slint";
+export { QuickSwitcher }
 
+component SectionLabel inherits Text {
+    font-family: Theme.font-text;
+    font-size: 12px;
+    font-weight: 600;
+    color: Theme.text-secondary;
+    letter-spacing: 0.3px;
+}
+
+// Repurposed from a plain "RepoDeck is running" placeholder into the
+// settings surface (PLAN.md §13 Phase 7 checklist item 4, "ホットキー設定
+// UI"): once the tray's left-click and the second-instance signal both show
+// the Quick Switcher instead, this window had nothing left pointing at it.
 export component AppWindow inherits Window {
-    title: "RepoDeck";
+    title: "RepoDeck — 設定";
     icon: @image-url("../assets/repodeck-icon.svg");
     preferred-width: 420px;
-    preferred-height: 300px;
+    preferred-height: 860px;
     background: transparent;
     default-font-family: Theme.font-text;
 
+    // 現在のホットキーの読み取り専用表示 ("Ctrl+Alt+W" など)。保存済み
+    // 設定からRust側が組み立てて渡す。
+    in property <string> hotkey-display: "";
+    // キャプチャモード。「キーを入力して登録」ボタンで開始し、Escなら
+    // Slint側が、登録成功ならRust側がfalseへ戻す。無効な入力 (修飾キー
+    // なしの通常キーなど) のときはRust側が警告表示だけしてtrueのまま
+    // 維持し、続けて入力し直せる。
+    in-out property <bool> hotkey-capturing: false;
+    in property <string> hotkey-status-text: "";
+    in property <bool> hotkey-status-is-warning: false;
+
+    // 押しっぱなし切替（Alt+Tab方式）のサイクルキー。メインホットキーの
+    // 修飾キーと組み合わせて使う。表示ラベルと、キャプチャ対象
+    // (0=なし / 1=次 / 2=前) をRust側が管理する。
+    in property <string> cycle-next-display: "";
+    in property <string> cycle-prev-display: "";
+    in-out property <int> cycle-capturing: 0;
+    callback cycle-capture-started(which: int);
+    callback cycle-captured(which: int, key-text: string);
+
+    // Codex連携 (PLAN.md §6.5, Phase 8).
+    in property <bool> codex-hook-exe-found: false;
+    in property <string> codex-hook-snippet: "";
+    in property <string> codex-status-text: "";
+    in property <bool> codex-status-is-warning: false;
+    in property <bool> codex-send-test-event-enabled: false;
+
+    // バージョン情報 (Phase 9).
+    in property <string> app-version: "";
+
+    // 起動設定 (Phase 9).
+    in-out property <bool> start-with-windows: false;
+    in-out property <bool> restore-workset-on-start: false;
+    in property <string> autostart-status-text: "";
+    in property <bool> autostart-status-is-warning: false;
+
+    // キャプチャ開始 (Rust側は前回のステータス表示をクリアするだけ)。
+    callback hotkey-capture-started();
+    // キャプチャ中に修飾キー以外のキーが押された。押下時点で保持されて
+    // いた修飾キーとともにRust側で検証し、従来どおりの保存→登録→
+    // ロールバック経路 (PLAN.md §13 Phase 7 checklist item 4) に流す。
+    callback hotkey-captured(ctrl: bool, alt: bool, shift: bool, meta: bool, key-text: string);
     callback open-layout-studio-requested();
     callback open-workset-manager-requested();
+    callback codex-check-hook-exe-requested();
+    callback codex-copy-snippet-requested();
+    callback claude-copy-snippet-requested();
+    callback codex-open-config-folder-requested();
+    callback codex-send-test-event-requested();
+    callback open-third-party-notices-requested();
+    callback start-with-windows-toggled(bool);
+    callback restore-workset-on-start-toggled(bool);
+
+    // 修飾キー単独の押下 (Ctrl/Alt/Shift/Win いずれかのキー自体) か。
+    // キャプチャ中はこれらを無視して「修飾キー以外のキー」を待つ。
+    pure function is-modifier-key(text: string) -> bool {
+        return text == Key.Shift || text == Key.ShiftR
+            || text == Key.Control || text == Key.ControlR
+            || text == Key.Alt || text == Key.AltGr
+            || text == Key.Meta || text == Key.MetaR
+            || text == Key.CapsLock;
+    }
 
     Rectangle {
         // The glass card: everything visible sits on this opaque layer, so
@@ -23,10 +98,80 @@ export component AppWindow inherits Window {
         border-width: 1px;
         border-color: Theme.hairline-bright;
 
+        // ホットキーのキャプチャ用 (PLAN.md §13 Phase 7 checklist item 4,
+        // "ホットキー設定UI")。画面上には何も描画せず、キャプチャモード中
+        // だけフォーカスを持ってキーイベントを消費する。
+        hotkey-capture-scope := FocusScope {
+            x: 0;
+            y: 0;
+            width: 0;
+            height: 0;
+            enabled: root.hotkey-capturing;
+
+            // フォーカスが外れたまま「入力待ち…」で固まらないよう、
+            // フォーカス喪失はキャンセル扱いにする。
+            focus-changed-event => {
+                if (!self.has-focus && root.hotkey-capturing) {
+                    root.hotkey-capturing = false;
+                }
+            }
+
+            key-pressed(event) => {
+                if (!root.hotkey-capturing) {
+                    return reject;
+                }
+                if (event.text == Key.Escape) {
+                    root.hotkey-capturing = false;
+                    return accept;
+                }
+                if (root.is-modifier-key(event.text)) {
+                    // 修飾キーだけではまだ組み合わせが決まらない。
+                    return accept;
+                }
+                root.hotkey-captured(
+                    event.modifiers.control,
+                    event.modifiers.alt,
+                    event.modifiers.shift,
+                    event.modifiers.meta,
+                    event.text);
+                return accept;
+            }
+        }
+
+        // サイクルキーのキャプチャ。修飾キーは不要（メインホットキーの
+        // 修飾キーを継承する）ので、次に押された非修飾キーだけを記録する。
+        cycle-capture-scope := FocusScope {
+            x: 0;
+            y: 0;
+            width: 0;
+            height: 0;
+            enabled: root.cycle-capturing != 0;
+
+            focus-changed-event => {
+                if (!self.has-focus && root.cycle-capturing != 0) {
+                    root.cycle-capturing = 0;
+                }
+            }
+
+            key-pressed(event) => {
+                if (root.cycle-capturing == 0) {
+                    return reject;
+                }
+                if (event.text == Key.Escape) {
+                    root.cycle-capturing = 0;
+                    return accept;
+                }
+                if (root.is-modifier-key(event.text)) {
+                    return accept;
+                }
+                root.cycle-captured(root.cycle-capturing, event.text);
+                return accept;
+            }
+        }
+
         VerticalLayout {
             padding: Theme.space-lg;
             spacing: Theme.space-md;
-            alignment: center;
 
             HorizontalLayout {
                 alignment: center;
@@ -34,41 +179,100 @@ export component AppWindow inherits Window {
 
                 Image {
                     source: @image-url("../assets/repodeck-icon.svg");
-                    width: 40px;
-                    height: 40px;
+                    width: 32px;
+                    height: 32px;
                 }
 
-                VerticalLayout {
-                    alignment: center;
-                    Text {
-                        text: "RepoDeck";
-                        font-family: Theme.font-display;
-                        font-size: 26px;
-                        font-weight: 600;
-                        letter-spacing: -0.4px;
-                        color: Theme.text-primary;
-                    }
-                    Text {
-                        text: "常駐中";
-                        font-size: 12px;
-                        color: Theme.success;
+                Text {
+                    text: "RepoDeck 設定";
+                    font-family: Theme.font-display;
+                    font-size: 22px;
+                    font-weight: 600;
+                    letter-spacing: -0.3px;
+                    color: Theme.text-primary;
+                }
+            }
+
+            SectionLabel { text: "クイックスイッチャーのホットキー"; }
+
+            Text {
+                text: "現在のホットキー: " + root.hotkey-display;
+                font-size: 12px;
+                color: Theme.text-secondary;
+            }
+
+            GlassButton {
+                text: root.hotkey-capturing ? "入力待ち… (Escでキャンセル)" : "キーを入力して登録";
+                primary: true;
+                clicked => {
+                    if (!root.hotkey-capturing) {
+                        root.hotkey-capturing = true;
+                        hotkey-capture-scope.focus();
+                        root.hotkey-capture-started();
                     }
                 }
             }
 
-            Text {
-                text: "タスクトレイのアイコンからいつでも呼び出せます。";
-                font-size: 13px;
-                color: Theme.text-secondary;
-                horizontal-alignment: center;
+            if root.hotkey-status-text != "": Text {
+                text: root.hotkey-status-text;
+                font-size: 12px;
+                color: root.hotkey-status-is-warning ? Theme.danger : Theme.success;
                 wrap: word-wrap;
+            }
+
+            Text {
+                text: "押しっぱなし切替（Alt+Tab方式）: 上記の修飾キーを押したまま下のキーを叩くとセットを送り、修飾キーを離すと確定します。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                Text {
+                    text: "次のセット: " + root.cycle-next-display;
+                    font-size: 12px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                GlassButton {
+                    text: root.cycle-capturing == 1 ? "入力待ち…" : "キーを変更";
+                    clicked => {
+                        if (root.cycle-capturing == 0) {
+                            root.cycle-capturing = 1;
+                            cycle-capture-scope.focus();
+                            root.cycle-capture-started(1);
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                Text {
+                    text: "前のセット: " + root.cycle-prev-display;
+                    font-size: 12px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                GlassButton {
+                    text: root.cycle-capturing == 2 ? "入力待ち…" : "キーを変更";
+                    clicked => {
+                        if (root.cycle-capturing == 0) {
+                            root.cycle-capturing = 2;
+                            cycle-capture-scope.focus();
+                            root.cycle-capture-started(2);
+                        }
+                    }
+                }
             }
 
             Rectangle { height: Theme.space-sm; }
 
             GlassButton {
                 text: "レイアウトスタジオを開く";
-                primary: true;
                 clicked => { root.open-layout-studio-requested(); }
             }
 
@@ -76,18 +280,161 @@ export component AppWindow inherits Window {
                 text: "セット管理を開く";
                 clicked => { root.open-workset-manager-requested(); }
             }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "Codex連携"; }
+
+            Text {
+                text: root.codex-hook-exe-found ? "hook実行ファイル: 検出済み" : "hook実行ファイル: 未検出";
+                font-size: 12px;
+                color: root.codex-hook-exe-found ? Theme.text-secondary : Theme.danger;
+            }
+
+            GlassButton {
+                text: "hook実行ファイルを確認";
+                clicked => { root.codex-check-hook-exe-requested(); }
+            }
+
+            GlassButton {
+                text: "Codex用hooks.json断片をコピー";
+                clicked => { root.codex-copy-snippet-requested(); }
+            }
+
+            GlassButton {
+                text: "Claude Code用settings.json断片をコピー";
+                clicked => { root.claude-copy-snippet-requested(); }
+            }
+
+            if root.codex-hook-snippet != "": Rectangle {
+                height: 100px;
+                border-radius: Theme.radius-md;
+                background: Theme.glass-panel-soft;
+                border-width: 1px;
+                border-color: Theme.hairline;
+
+                ScrollView {
+                    Text {
+                        text: root.codex-hook-snippet;
+                        font-size: 10px;
+                        font-family: "Consolas";
+                        color: Theme.text-secondary;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GlassButton {
+                text: "Codex設定フォルダーを開く";
+                clicked => { root.codex-open-config-folder-requested(); }
+            }
+
+            GlassButton {
+                text: "テストイベントを送信";
+                enabled: root.codex-send-test-event-enabled;
+                clicked => { root.codex-send-test-event-requested(); }
+            }
+
+            if root.codex-status-text != "": Text {
+                text: root.codex-status-text;
+                font-size: 12px;
+                color: root.codex-status-is-warning ? Theme.danger : Theme.success;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "Codex: hooks.jsonへ貼り、CLIの /hooks でフックを信頼するまでイベントは届きません。Claude Code: ~/.claude/settings.json のhooksへ貼り、新しいセッションから有効になります（PreToolUseで選択待ちも検知）。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "起動設定"; }
+
+            HorizontalLayout {
+                spacing: 4px;
+                GlassCheckbox {
+                    checked: root.start-with-windows;
+                    toggled => {
+                        root.start-with-windows = !root.start-with-windows;
+                        root.start-with-windows-toggled(root.start-with-windows);
+                    }
+                }
+                Text {
+                    text: "Windows起動時にRepoDeckを自動起動する";
+                    vertical-alignment: center;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                GlassCheckbox {
+                    checked: root.restore-workset-on-start;
+                    toggled => {
+                        root.restore-workset-on-start = !root.restore-workset-on-start;
+                        root.restore-workset-on-start-toggled(root.restore-workset-on-start);
+                    }
+                }
+                Text {
+                    text: "起動時に前回のセットを復元する（アプリを起動して配置）";
+                    vertical-alignment: center;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+            }
+
+            if root.autostart-status-text != "": Text {
+                text: root.autostart-status-text;
+                font-size: 12px;
+                color: root.autostart-status-is-warning ? Theme.danger : Theme.success;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: Theme.space-sm; }
+
+            SectionLabel { text: "バージョン情報"; }
+
+            Text {
+                text: "RepoDeck " + root.app-version;
+                font-size: 12px;
+                color: Theme.text-secondary;
+            }
+
+            Text {
+                text: "UIは Slint (https://slint.rs) で構築されています。Slint Royalty-free Desktop Licenseの下で利用しており、Slint自体は再配布していません。";
+                font-size: 11px;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+
+            GlassButton {
+                text: "サードパーティ表示";
+                clicked => { root.open-third-party-notices-requested(); }
+            }
         }
     }
 }
 
 export component TrayIcon inherits SystemTrayIcon {
+    // `icon`/`tooltip` are inherited builtin properties of `SystemTrayIcon`,
+    // not properties declared on this component — Slint only generates
+    // Rust setters for properties declared at the component's own level, so
+    // runtime tray-icon-color updates (PLAN.md §6.7, Phase 8) alias them
+    // through component-level properties instead of setting `icon`/
+    // `tooltip` directly.
+    in-out property <image> icon-source <=> root.icon;
+    in-out property <string> tooltip-text <=> root.tooltip;
     icon: @image-url("../assets/repodeck-icon.svg");
     tooltip: "RepoDeck";
 
     Menu {
         MenuItem {
-            title: "RepoDeckを開く";
-            activated => { root.open-requested(); }
+            title: "クイックスイッチャーを開く";
+            activated => { root.quick-switcher-requested(); }
         }
 
         MenuItem {
@@ -96,8 +443,40 @@ export component TrayIcon inherits SystemTrayIcon {
         }
 
         MenuItem {
-            title: "セット管理を開く";
-            activated => { root.workset-manager-requested(); }
+            title: "セット管理";
+            activated => { root.register-workset-requested(); }
+        }
+
+        MenuItem {
+            title: "メイン画面を空にする";
+            activated => { root.empty-main-screen-requested(); }
+        }
+
+        MenuItem {
+            title: "全管理ウィンドウを回収";
+            activated => { root.recover-all-requested(); }
+        }
+
+        MenuItem {
+            title: "モニターを再検出";
+            activated => { root.reconnect-monitors-requested(); }
+        }
+
+        MenuItem {
+            title: "紐づけを点検して修復";
+            activated => { root.check-integrity-requested(); }
+        }
+
+        MenuSeparator { }
+
+        MenuItem {
+            title: "設定";
+            activated => { root.settings-requested(); }
+        }
+
+        MenuItem {
+            title: "ログフォルダーを開く";
+            activated => { root.open-log-folder-requested(); }
         }
 
         MenuSeparator { }
@@ -108,12 +487,21 @@ export component TrayIcon inherits SystemTrayIcon {
         }
     }
 
-    callback open-requested();
+    callback toggle-quick-switcher-requested();
+    callback quick-switcher-requested();
     callback layout-studio-requested();
-    callback workset-manager-requested();
+    callback register-workset-requested();
+    callback empty-main-screen-requested();
+    callback recover-all-requested();
+    callback reconnect-monitors-requested();
+    callback check-integrity-requested();
+    callback settings-requested();
+    callback open-log-folder-requested();
     callback quit-requested();
 
-    // Left-click on the icon (Windows) forwards to our own callback so the Rust
-    // side has a stable, always-generated binding to hook (`on_open_requested`).
-    clicked => { root.open-requested(); }
+    // Left-click on the tray icon toggles the Quick Switcher's visibility
+    // (PLAN.md §3.4); a menu click on "クイックスイッチャーを開く" always
+    // shows it (fresh position, never closes an already-open one) — those
+    // are deliberately different callbacks with different semantics.
+    clicked => { root.toggle-quick-switcher-requested(); }
 }

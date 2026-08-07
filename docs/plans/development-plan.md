@@ -15,6 +15,112 @@
 
 ---
 
+## MVP後のUX改修（2026-07-22）
+
+実機での初回スモークテストを受けた改修。以下は本文の該当仕様（§3.1・§3.3・§3.5・§4.4）より優先する。
+
+- **既定ホットキーを `Ctrl+Alt+W` に変更**（旧 `Ctrl+Alt+R`）。実機で `Ctrl+Alt+R` が他アプリに
+  恒常的に登録されており初回起動から衝突したため。`RegisterHotKey` の実測で空きを確認して選定。
+- **クイックスイッチャー**: ヘッダー右端に ✕ ボタン（マウスで閉じる）を追加。Windowsの
+  「透明度効果」（`HKCU\...\Themes\Personalize\EnableTransparency`）がオンの場合のみ
+  背景を半透明（`glass-base-translucent`）にする。オフ環境で半透明にすると背後の文字が
+  透けて読める問題（theme.slint の記録参照）があるため起動時にレジストリで判定する。
+- **レイアウトスタジオ**: 「メイン画面を選択」モードと「選択を適用」を廃止。モニタータイルを
+  クリックで選択し、右ペインの「メイン画面に登録する／外す」で直接切り替える。
+  自動分割の既定は「自動」（`SavedMonitor.auto_split: Option<AutoSplit>` の `None`。
+  `layout_service::resolve_auto_split` が作業領域から 4K級→4分割・横長WQHD級→2分割・
+  それ以外→1分割 を解決）。手動で 1/2/4 を選ぶこともできる。
+  「RepoDeckの操作対象にしない」（`SavedMonitor.excluded`）を追加：除外モニターは
+  退避枠の割当対象にならず（固定枠が除外モニターを指す場合は最小化扱い）、
+  メイン画面とは相互排他。
+- **ホットキーの自由登録**: 設定画面の修飾キーチェックボックス＋キー選択を
+  「キーを入力して登録」（押したキーの組み合わせをそのまま記録）方式に変更。
+  矢印・Space等も登録可能。修飾キーなしの単独登録はファンクションキーのみ許可。
+- **モニター自動再接続（スリープ復帰時）**: `RegisterSuspendResumeNotification`の
+  コールバック方式（`DEVICE_NOTIFY_CALLBACK`、ウィンドウ不要）でスリープ復帰を検知し、
+  保存済みトポロジ（`AppConfig.monitors`）と現在のモニターを比較して欠落があれば
+  `SetDisplayConfig(SDC_APPLY | SDC_TOPOLOGY_EXTEND)`でソフト的に再検出する
+  （`display_recovery_service`の純粋関数で判定、最大3回・3秒間隔のバウンド付き再試行）。
+  権限分岐: `ERROR_ACCESS_DENIED`/`ERROR_PRIVILEGE_NOT_HELD`時は昇格せず、取得済み構成に
+  復元して警告ログのみ（`asInvoker`を維持）。安全制約として、操作前に必ず現構成を取得し、
+  再適用後にモニター数が減少した場合は取得済み構成へ復元する。除外モニター（`excluded`）は
+  対象外。トレイに手動トリガー「モニターを再検出」も追加。既定ON、設定
+  `auto_display_recovery`で無効化可。**実装上の重要知見**: Slintのwinitバックエンドは
+  イベントループ内でしかネイティブHWNDを生成しないため、起動時の`WM_POWERBROADCAST`
+  ウィンドウsubclassは成立しない（ゆえにコールバックAPIを採用）。同じ理由でPhase 9の
+  `watch_display_changes`（画面外ウィンドウ最小化）も起動時のsubclassが機能していない
+  既知の潜在バグがある（本改修のスコープ外・別途要対応）。
+- **押しっぱなし切替（Alt+Tab風）**: メインホットキーと同じ修飾キー＋`↑`/`↓`を
+  追加のグローバルホットキーとして登録（`win32_hotkey` の `CYCLE_NEXT/PREV_HOTKEY_ID`、
+  修飾キーがある場合のみベストエフォート登録）。修飾キー押下中に`↑`/`↓`で
+  クイックスイッチャーの選択を移動し、`GetAsyncKeyState` を40ms間隔でポーリングする
+  `slint::Timer` が全修飾キーの解放を検知した瞬間に選択セットへ切替（`app.rs` の
+  `start_cycle_release_timer`/`commit_cycle_selection`）。Escape・クリック・
+  フォーカス喪失時はタイマーをキャンセルしてコミットしない。GPUドライバの
+  Ctrl+Alt+矢印等と衝突した場合はサイクル登録のみ失敗し、メインホットキーには影響しない。
+
+## セット登録・退避の拡張（2026-07-22 第2弾）
+
+- **クイックスイッチャーの閉じるボタン**: `✕`(U+2715)はSegoe UI Variable Textに無く豆腐化するため`×`(U+00D7)へ変更。
+- **レイアウトスタジオ**: 初期ウィンドウを1200×800（最小900×640）に拡大。モニタータイルに`clip: true`を付与し、
+  小さいタイルからラベルがはみ出して隣に被る問題を解消（投影計算自体は正しい）。
+- **セット登録画面**: 「候補を更新」ボタン追加。リポジトリは任意（未選択で空パス登録、一覧では「（リポジトリなし）」表示）。
+  「退避後に全画面表示にする」チェックボックス追加（`Workset.fullscreen_when_parked`。退避時に退避先モニターで最大化。
+  `switch_coordinator::park_workset`のShrinkToFit後に`maximize`）。
+- **「メイン画面を空にする」をレイアウトスタジオからセット登録画面へ移設**（モーダル・Undo含む）。トレイの
+  「メイン画面を空にする」はセット管理を開いて登録フロー＋モーダルを起動するよう変更。
+- **退避先固定（初期実装・後述のサブ画面方式に置換）**: 当初は登録画面で「自動／固定」＋モニター＋分割＋セルを
+  指定する`FixedParkingSlot`ベースのUIだったが、下記のサブ画面方式に作り替えた（`ParkingPolicy::Fixed`と
+  `FixedParkingSlot`はドメインに残置・レガシー）。
+
+## サブ画面（名前付き退避エリア）方式（2026-07-22 第3弾）
+
+「退避先＝1モニターの1セル」を、メイン画面と同じ粒度の**名前付きサブ画面**に一般化。「2画面使う」も
+1つのサブ画面に複数モニターを割り当てることで自然に表現できる。
+
+- **ドメイン**: `AppConfig.sub_screens: Vec<SubScreen>`（`SubScreen { id, name, monitor_ids }`、serde default）。
+  `ParkingPolicy::SubScreen { sub_screen_id }` を追加。`validate()`で参照先サブ画面の存在を検証
+  （`MissingSubScreen`）。
+- **レイアウトスタジオ**: モニター選択時にサブ画面へのチェックボックス割当＋名前入力での追加・削除を追加。
+  1モニターは メイン／いずれかのサブ画面／対象外／通常 のいずれか（相互排他）。タイルの役割表示に「サブ:名前」を追加。
+- **セット登録**: 退避先を「自動／〈サブ画面名〉」から選択（旧モニター＋セルピッカーは撤去）。
+- **切替コーディネーター**: `ParkingPolicy::SubScreen`は自動セル割当をバイパスし、サブ画面の生存モニターの
+  **作業領域の外接矩形**へ`plan_park_into_slot`で相対レイアウトを保って縮小配置（`place_workset_into_rect`に共通化）。
+  サブ画面のモニターが1枚も生きていなければ最小化。`fullscreen_when_parked`とも併用可。
+
+### 退避の優先順位ルール（確定仕様・2026-07-23 更新）
+
+ユーザー指示（複数回反復・最優先）。「メイン画面を空にする」および切替時の退避は、この順で決める：
+
+1. **サブ画面を指定されたセットの窓** → その指定サブ画面へ退避する。そのサブ画面は以後「使用中」。
+2. **サブ指定のない登録窓** → **使用中のサブ画面には入れない**（重ねない）。ただし
+   **空いているサブ画面（今どのセットの窓も入っていない）は一般退避先として使ってよい**
+   （「サブにウィンドウが入っているときは入れない」2026-07-23）。退避先（非メイン・非除外・
+   非使用中サブ）へ詰める。入り切らなければ 2分割 → 4分割（QHDは3×2の6分割まで）して
+   **入れられるだけ入れる**。
+3. どの退避先にも入り切らない窓を、**そのとき初めて最小化**する。未登録窓は最小化。
+
+**退避先の選び方＝退避後サイズの総和を最大化**（`distribute_parking`, 2026-07-23）:
+各画面は窓で完全に敷き詰まるため、総和は「1つ以上入った画面の面積の合計」に等しい。よって
+**面積の大きい空き画面から順に点灯**（新しい画面を点けるほうが、既に埋まった画面へ足すより総和が増える）、
+埋まった画面同士では**次のセルが最大になる画面（`面積/(枚数+1)` 最大）**へ入れる。
+
+**サブの「玉突き」退避**（`stale_sub_occupants` / `park_evictees`, 2026-07-23）:
+サブ画面をメインへ呼ぶ→メイン窓がそのサブへ飛ぶ、を繰り返すと、**前にサブへ入った別セットの窓が
+残ったまま**になる。切替時、退避先サブのセルに**そのセット以外の管理窓が残っていれば、先に一般退避先へ
+どかしてから**メイン窓をサブへ入れる。どかす窓も journal に記録し、ロールバックで復元される。
+
+→ 実装上のキモ: 自動割当（`parking_allocator::allocate_parking`）の対象からサブモニターを除外する
+   （`sub_screen_monitor_ids`）。ただし「メイン画面を空にする」経路（`compute_empty_main_destinations`）
+   では、**実際に窓が入った使用中サブのみ**除外し、空きサブは退避先に含める。
+
+**切替時の auto 割当も同モデルに統一**（2026-07-23 バグ修正）: 旧実装はモニタごとに `auto_split` で
+固定分割し読み順 First Fit で埋めていたため、**空きモニタがあるのに 1台の 1/4 セルに詰め込まれる**
+不具合があった。現在は `allocate_parking` も `distribute_parking` と同じく、① `auto_split` を
+**上限（One→1 / TwoColumns→2 / FourGrid→4 /「自動」→画面サイズ基準4or6）** として扱い、
+② 面積の大きい空きモニタから点灯、③ 各モニタを**実際の駐機台数で分割**する（1台なら全画面）。
+固定スロットを持つモニタは auto プールから除外。割当結果は `tracing` の `target: "parking"` に記録。
+
 ## 現在の実装状況（2026-07-20時点）
 
 - **Phase 1（プロジェクト基盤）: 完了・検証済み。** Cargoプロジェクト、`ui/app-window.slint`最小ウィンドウ、
@@ -114,7 +220,249 @@
   同じコードのままDWMがぼかし付きのAcrylic/Micaとして描画するはず（未検証）。
   この修正の過程で、Slintの`Cargo.toml`に`raw-window-handle-06` feature（Phase 1で
   「存在しない」と誤判定し外していたもの）を追加した。
-- **Phase 6以降（退避割当・切替Coordinator〜回復性・仕上げ）: 未着手。** 詳細は本ファイル §13 を参照。
+- **Phase 6（退避割当・切替Coordinator）: バックエンド完了・単体テスト検証済み。** 既存の
+  純粋な幾何計算（`domain::placement::{normalize, denormalize, bounding_rect, affine_map}`）と
+  永続化層（`journal_store`／`runtime_store`、いずれもPhase 2/3で実装済み）を土台に、
+  新規オーケストレーション層のみを追加した（スキーマ変更なし）。
+  - `application::parking_allocator`（§4.4／§3.7）: `ParkingSlotId`（`"{monitor_id}::{cell_index}"`
+    で`RuntimeState.auto_slot_assignments`にエンコード）、固定枠を独立に先処理（対象モニター
+    消失時は最小化）、非メインモニターを`monitor_resolution::sort_monitors_reading_order`で
+    読み順に並べ`layout_service::auto_split_cells`のセルを列挙、固定枠を除外した上で
+    `sort_order`順のワークセットに対し「前回割当を維持→残りをFirst Fit→溢れは最小化」を実装。
+  - `application::parking_placement`（§4.3）: `bounding_rect`/`affine_map`を組み合わせ、
+    8px内側余白・最小120×68pxを下回る場合はセット全体を最小化（部分的な退避＋最小化の
+    混在は作らない）。
+  - `application::main_placement`（§4.2）: `denormalize`を土台に、インデックス範囲外→
+    先頭メインモニターへのフォールバック、160×90px下限、画面外クランプ、
+    最大化／最小化の復元規則を実装。
+  - `application::window_ops::WindowOps`トレイト（§9.3の「applicationはdomainとtraitへ依存」
+    方針に対応）と、実装を`windowing::window_ops_impl::Win32WindowOps`
+    （既存`windowing::placement`への薄いラッパー）、テスト専用の`fake::FakeWindowOps`
+    （`EndDeferWindowPos`失敗・ウィンドウ消失を注入可能なインメモリ実装）の2系統に分離。
+    `windowing::placement`には`set_z_order_after`／`set_foreground_best_effort`を追加。
+  - `application::switch_coordinator::SwitchCoordinator<W: WindowOps>`: §3.8の12ステップ
+    （排他ロック→現在セットなら再フォーカスのみ→`workset_service::resolve_all_matches`で
+    再解決→ジャーナル保存→現在セット退避→対象セットのメイン復元→Z順復元→フォーカス→
+    `current_workset_id`更新→ジャーナルclear）を実装。失敗時はジャーナルから
+    ロールバックし、生存確認できないウィンドウを`unrecoverable_hwnds`として返す。
+    `current_workset_id`は成功時のみ更新。全ウィンドウ回収（§10.2）用に
+    `recover_all_windows`（`application::recovery_service`、退避ロックを取らず常時呼び出し可能）
+    も実装。
+  - **スレッド化は意図的に後回し**: §9.1の「Coordinatorスレッド」は、実際に別スレッドから
+    呼ぶ相手（ホットキースレッド・クイックスイッチャーUI）がPhase 7まで存在しないため、
+    今回は同期的に直接呼べるAPI＋`AtomicBool`の排他ガードのみを実装し、スレッド／
+    チャネル配線はPhase 7に持ち越した。
+  - テスト: `parking_allocator`／`parking_placement`／`main_placement`／`monitor_resolution`／
+    `recovery_service`の純粋ロジック単体テストに加え、`switch_coordinator`は
+    `FakeWindowOps`を使い「3セットを100回切替えて画面外ウィンドウ0」「固定セットが
+    常に指定枠へ戻る」「`EndDeferWindowPos`相当の失敗からフォールバックで復帰」
+    「フォールバックも失敗した場合のロールバック」「切替途中でウィンドウが消えた場合の
+    部分ロールバック」を実機なしで決定的に検証。`tests/windows_e2e.rs`に
+    `switch_between_two_real_worksets_minimizes_the_non_current_one`
+    （`#[ignore]`、実Notepad2枚を使い、非メインモニターを持たない構成に絞って
+    実際に最小化されることを確認）を追加。
+  - UI・ホットキー・クイックスイッチャーからの呼び出し経路は未配線（Phase 7の対象）。
+- **Phase 7（タスクトレイ・ホットキー・クイックスイッチャー）: 完了・実機検証済み。**
+  Phase 6で作った`SwitchCoordinator`を実際に呼び出す経路（グローバルホットキー・
+  クイックスイッチャーUI・トレイメニュー）を実装した。
+  - `hotkey::win32_hotkey`: `RegisterHotKey`/`UnregisterHotKey`を専用スレッド
+    （自前の`GetMessageW`ループ、Slint UIスレッドとは独立）で扱う`HotkeyThread`。
+    衝突検出は`acquire_single_instance`と同じ`GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED`
+    方式。リバインド失敗時は直前の組み合わせへ自己修復（呼び出し側は永続化済み設定の
+    ロールバックだけ行えばよい）。`MOD_NOREPEAT`を常時付与（押しっぱなしで
+    連続トグルするのを防止）。
+  - `windowing::popup_window`: Slintに公開APIが無い2点を生HWNDで補う——
+    `WS_EX_TOOLWINDOW`付与でタスクバー・Alt+Tabから除外（`exclude_from_taskbar_and_alt_tab`）、
+    `WM_ACTIVATE(WA_INACTIVE)`をWNDPROCサブクラス化で監視して`close_on_focus_loss`を
+    実装（`watch_deactivation`）。
+  - `application::popup_placement`／`application::quick_switcher_service`:
+    ポップアップ位置解決（カーソル/メインモニター中心＋フォールバック）と
+    ワークセット一覧の並び替え・絞り込みを、Win32/Slintに依存しない純粋関数として実装
+    （`main_placement`/`monitor_resolution`と同じ設計）。`SortMode::Recent`は
+    「最後に切り替えた時刻」を記録する場所がまだ無いため`Manual`と同一に扱う
+    （`sort_mode`自体のUIもまだ無い）。
+  - `ui/quick-switcher.slint`: 新規`QuickSwitcher`ウィンドウ（`no-frame`＋`always-on-top`）。
+    ↑/↓/Enter/Esc/Ctrl+,/数字キー1-9即切替/文字入力絞り込みを`FocusScope`で実装。
+    **実装上の発見**: `key-pressed`コールバック本文に単純な`if { ... return accept; }`を
+    12個前後並べただけで、このツールチェーンの`slint-build`（コンパイル時）が
+    スタックオーバーフローで異常終了する実バグを踏んだ（`else if`チェーンでも同様）。
+    回避策として、条件の後半を`function`に分割し1つのコールバック/関数あたりの
+    連続`if`文数を減らして解消（`ui/quick-switcher.slint`のコメント参照）。
+  - `ui/app-window.slint`の`AppWindow`を「設定」画面に転用（トレイ左クリックと
+    二重起動時の表示先が両方クイックスイッチャーに変わり、元の簡易ウィンドウが
+    どこからも開かれなくなったため）。ホットキー再設定UI（Ctrl/Alt/Shift/Winの
+    チェックボックス＋キー選択のComboBox）を追加。
+  - `src/app.rs`: `SwitchCoordinator<Win32WindowOps>`を`Rc`で保持し、クイックスイッチャーの
+    行クリック／Enter／数字キーから`switch_to`を実際に呼び出す。ホットキースレッドと
+    二重起動シグナル用スレッドは`Rc`を跨げない（`Rc`は`Send`ではない）ため、
+    `UI_CONTEXT`というUIスレッド専用の`thread_local!`にconfigの`Rc`を置き、
+    各スレッドは`slint::invoke_from_event_loop`経由でSend安全な小さいイベント値
+    （`HotkeyUiEvent`等）だけを渡してからUIスレッド側でその`thread_local`越しに
+    実体へアクセスする設計にした。起動時にウィンドウを強制表示しないよう変更
+    （完了条件「GUI非表示でもプロセス継続」）。「全管理ウィンドウを回収」は
+    `MessageBoxW`のYes/No確認を挟んでから実行。
+  - 実機確認で2件の実バグを発見・修正済み: (1) `ComboBox`の`current-value`を
+    Rustから`set_hotkey_key_choice(...)`で設定しても、`current-index`（既定0）由来の
+    表示と食い違い、保存済みのキー（例:「R」）ではなく`model[0]`（「A」）が
+    表示されてしまう問題 — `current-index`も明示的に同期する`hotkey-key-index`
+    プロパティを追加して解消。(2) `exclude_from_taskbar_and_alt_tab`を
+    ウィンドウ生成直後（初回`.show()`より前）に1度呼ぶだけでは、winit側の
+    `.show()`処理が`WS_EX_APPWINDOW`を再度付与してしまい`WS_EX_TOOLWINDOW`が
+    効かない — `.show()`のたびに再適用するよう修正して解消。両方とも
+    `PrintWindow`によるスクリーンショットと合成キー入力／マウスクリックによる
+    実機操作で発見・確認した。
+  - 手動確認: 起動直後は無表示でトレイのみ常駐／設定画面でのホットキー再設定
+    （実機に既存の競合と衝突→自動ロールバックのメッセージを実際に確認、
+    別の組み合わせへの再設定→成功）／新しいホットキーでクイックスイッチャーが
+    カーソルのあるモニター中央に正しく表示・同じホットキーで非表示（トグル）／
+    タスクバー・Alt+Tab非表示（`WS_EX_TOOLWINDOW`のビット確認）を実機で確認済み。
+    ワークセット未登録のため実際の切替・Esc閉じる・アウトフォーカスで閉じる・
+    トレイメニュー各項目のクリックは自動化テストと単体テストの範囲でのみ検証
+    （手動QAチェックリストとして残し、実機での網羅確認は次回以降）。
+  - エージェント状態表示・全設定画面（ホットキー以外）・初回セットアップ
+    ウィザードはPhase 7のチェックリスト外として意図的に対象外（Phase 8以降）。
+
+- **Phase 8（Codex連携）: 完了・実機検証済み。** Codex CLI/IDE拡張のライフサイクルフックを
+  唯一の連携経路とし、RepoDeckはCodexを起動・接続しない設計（PLAN.md §6.3）。
+  - `domain::agent`: `AgentState`（Idle/Running/NeedsInput/Ready/Blocked/Unknown）、
+    `AgentRun`、§6.2の6段階集約優先順位を実装する`aggregate_state`。表示順序
+    （§3.3: needs_input > ready > blocked > running > idle > unknown）とトレイ優先順位
+    （§6.7: needs_input > blocked > ready > running > idle）はReady/Blockedの順位が
+    入れ替わるため意図的に別関数（`row_display_priority`/`tray_priority`）とした。
+  - `ipc::protocol`: RepoDeck内部の正規化イベントschema v1（`NormalizedEvent`）と、
+    Codex hook JSON→正規化イベントの状態を持たない変換（`parse_and_adapt`）。
+    `permission_mode`はPLAN.md §6.3の消費フィールド一覧に載っているが、集約・イベント
+    対応表・通知のどこからも参照されないため実装せず（§6.4の転送JSON例にも無い）。
+  - `ipc::named_pipe`: `\\.\pipe\RepoDeck.AgentEvents.v1`の受信専用サーバー。
+    `ConvertStringSecurityDescriptorToSecurityDescriptorW("D:P(A;;GA;;;OW)")`で
+    所有者限定ACLを構築（Everyone・他ユーザー・組み込みグループ一切なし）。
+    `ConnectNamedPipe`/`ReadFile`は`lpOverlapped: None`の同期呼び出しのみでIOCP不要
+    （ベンダー同梱の`windows`クレートで確認済み）。`HotkeyThread`と異なり`Drop`は
+    シャットダウンフラグを立てるのみでスレッドをjoinしない（`ConnectNamedPipe`で
+    ブロック中のスレッドを起こす`PostThreadMessageW`相当の手段が無いため）。
+  - `src/bin/repodeck-hook.rs`: 標準入力→`ipc::protocol::parse_and_adapt`→
+    正規化JSONを名前付きパイプへ単発送信、常に終了コード0（Codexの hookランナーは
+    非ゼロ終了を実エラー扱いするため）。`CreateFileW(OPEN_EXISTING, ...)`は
+    `WaitNamedPipeW`によるリトライを行わないため、RepoDeck未起動時でも即座に失敗して
+    終了する（§6.4の「200ms以内に終了コード0」を構造的に満たす）。
+  - `application::agent_status_service`: `cwd`→ワークセットの対応付け（Gitルート
+    完全一致→配下判定の順、§6.6）、§6.3のイベント別状態遷移（`RunStarted`/
+    `NeedsInput`はupsert、`ToolUseObserved`は`NeedsInput`からの遷移のみ、
+    `RunCompleted`は`confirmed: false`のReadyを作成/更新）、`confirm_ready_and_recompute`
+    （§3.3「選択後」のready確認処理、`SwitchCoordinator::switch_to`成功後にのみ呼ぶ）。
+    一致しないイベントは`UnmatchedAgentEvent`として30分だけメモリ上に保持し、
+    後から一致するワークセットが登録されても昇格させない（§6.6）。
+  - トレイアイコンの状態バッジ6種は、PNGアセットを事前生成する代わりに`resvg`/
+    `tiny_skia`（既存のビルド依存）で起動時にメモリ上でレンダリングし、
+    `slint::Image::from_rgba8_premultiplied`で直接`Image`化した。設計時点では
+    「事前生成PNGを`slint::Image::load_from_path`で読み込む」想定だったが、
+    実装時にベンダーコードで`Image::from_rgba8_premultiplied`の存在を確認し、
+    インストール先パス解決が一切不要になるためこちらを採用（アセットファイルなし）。
+  - `SystemTrayIcon`を継承した`TrayIcon`コンポーネントの`icon`/`tooltip`は継承元の
+    組み込みプロパティであり、Slintはコンポーネント自身が宣言したプロパティにしか
+    Rust側セッターを生成しない——実機ビルドで`set_icon`/`set_tooltip`が存在しない
+    というコンパイルエラーで判明。`icon-source <=> root.icon`のような
+    component-level エイリアスプロパティを追加して解消（`ui/app-window.slint`）。
+  - 実機確認で実バグを1件発見・修正済み: `src/app.rs`の`handle_agent_ui_event`が、
+    パイプ経由で受信したバイト列（`repodeck-hook.exe`が送信する時点で既に
+    `ipc::protocol::parse_and_adapt`を適用済みの正規化JSON）へ**再度**
+    `parse_and_adapt`を呼んでいたため、`hook_event_name`フィールドが存在しないと
+    判定されて全イベントが「不正なJSON」として静かに破棄されていた
+    （実機のログに`missing field \`hook_event_name\``が出力されて発覚）。
+    受信バイト列を`NormalizedEvent`として直接デシリアライズするよう修正して解消。
+    単体テスト・自動E2Eテスト（モック無しの実`NamedPipeServer`＋実`repodeck-hook.exe`
+    サブプロセス往復）はどちらもこのバグを検出できておらず、実機でのボタン操作と
+    実際のバッジ色変化の目視確認だけが発見できた（Phase 7と同じ教訓）。
+  - 手動確認: 設定画面「Codex連携」セクションのレイアウト・hook実行ファイル検出
+    状態表示・ワークセット0件時の送信ボタン無効化を実機スクリーンショットで確認。
+    「hooks.json断片をコピー」クリック→クリップボードの実内容がPLAN.md §6.5の
+    生成後検証条件（4フック各1グループ・`type: command`・`timeout: 2`・
+    `commandWindows`の絶対パスを引用符で囲む）を満たすことを確認。実環境の
+    `config.json`へ一時テストワークセットを追加（ユーザー承認済み、検証後に
+    原状回復）した上で「テストイベントを送信」→実`repodeck-hook.exe`サブプロセスが
+    4フックを順に送信→クイックスイッチャーの行バッジが実際に緑（完了）へ変化する
+    ことを確認。該当ワークセットへの切替でバッジが確認済み（`confirmed: true`）に
+    なることも`runtime.json`の実内容で確認。トレイアイコンの色変化自体は
+    スクリーンショットでの目視確認はしていないが、バッジ更新と同一の
+    `handle_agent_ui_event`/`refresh_tray_status`経路で動くことをコードレビューで確認。
+  - Windowsトースト通知・`hooks.json`の自動書き込み・Codex App Serverへの接続・
+    エージェント状態変化での自動ワークセット切替は、PLAN.mdの対象外リストの通り
+    意図的にスコープ外（v0.2以降）。
+
+- **Phase 9（回復性・仕上げ）: 完了・実機検証済み。MVP全9 Phase完了。**
+  - **事前調査で判明した既実装/未実装の切り分け**: config backup復旧（項目3）は
+    Phase 3で既に完全実装・検証済み（`config_store.rs`の`corrupt_primary_recovers_from_backup`
+    等）で追加作業不要と確認。ログローテーション（項目4）は`tracing_appender::rolling::daily`
+    による日次ローテーションのみ既存で、保持期間（7日／50MB上限）は未実装だった。
+    起動時ジャーナル復旧（項目2）は`journal_store`の保存・クリアは`switch_coordinator.rs`
+    が既に行っていたが、`journal_store::load`を呼ぶコードが起動経路のどこにも無く、
+    起動時復旧処理そのものが丸ごと未実装だった。
+  - `application::monitor_watch_service`: `compute_fingerprint`（モニター構成の
+    安定・順序非依存なフィンガープリント、`RuntimeState.last_seen_monitor_fingerprint`
+    ―既存だが書き込み先が無く死んでいたフィールド―の実利用先）と
+    `find_now_offscreen_windows`（登録済みウィンドウのうち現在のライブ矩形が
+    どのモニターとも重ならないものだけを検出）。ユーザーとの相談の結果、
+    モニター変更時の自動復旧は「画面外になったウィンドウだけ最小化する」という
+    最小介入方針を採用（Phase 6の`parking_allocator`が既に持つ「配置不能なら
+    最小化」という方針と一貫させるため）。`recover_all_windows`（登録済み全ウィンドウを
+    強制的にメイン画面へ集約する既存の緊急操作）を自動トリガーにする案は、
+    無関係なセットの配置まで乱すため不採用とした。
+  - `src/domain/placement.rs`に`PixelRect::overlaps`を追加（`monitor_watch_service`が
+    使う唯一の新規ジオメトリ演算）。
+  - `application::crash_recovery`: `already_succeeded`（`switch_coordinator.rs`が
+    自身のコメントで明記していた「crashが`runtime.current_workset_id`更新後・
+    journal clear前で発生した場合、切替自体は成功しているので復旧不要」という
+    ケースの判定）と`restore_original_placement`。後者は`SwitchCoordinator::rollback`
+    （同一プロセス内でのロールバック）とは異なり、ジャーナルの生の`hwnd`を信用せず
+    `managed_window_id`を`workset_service::resolve_all_matches`で再解決してから
+    復元する（§7.4「HWNDは当該トランザクション内だけで使用し、再起動後は
+    プロセスIDと現在属性を再検証する」に対応、クラッシュとこの起動の間に対象
+    アプリが再起動されHWNDが変わっていても正しく追跡できる）。
+  - `src/windowing/popup_window.rs`: 既存の`watch_deactivation`（`WM_ACTIVATE`監視）と
+    並行する独立した第二のWNDPROCサブクラス機構`watch_display_changes`
+    （`WM_DISPLAYCHANGE`監視）を追加。共有リファクタリングではなく既存の
+    動作中コードへの影響を避けるための並行実装とし、常駐する設定ウィンドウ
+    （クイックスイッチャーと違いユーザーが閉じられない）をサブクラス対象とした。
+  - `src/windowing/autostart.rs`: `HKEY_CURRENT_USER\...\CurrentVersion\Run`への
+    レジストリ書き込みのみ（管理者権限不要、PLAN.md §11準拠）。`RegSetValueExW`等は
+    `WIN32_ERROR`を直接返す（`GetLastError`方式ではない）ため、`HRESULT_FROM_WIN32`相当の
+    変換を自前実装。
+  - `src/app.rs`の起動時クラッシュ復旧はPLAN.md §10.3の手順（検証→HWND再検証→
+    ダイアログ→3択提示→選択後に解決）をそのまま実装。ユーザーとの相談の結果、
+    復旧UIはSlintの専用ダイアログではなくネイティブ`MessageBoxW`
+    （`MB_YESNOCANCEL`、はい＝元の配置に戻す／いいえ＝全てメインへ回収／
+    キャンセル＝何もしない）を採用——ボタンラベルはWin32側で固定のため、
+    本文でそれぞれの意味を明記する形にした。
+  - **実機確認で判明したテスト治具側の問題**（RepoDeck自体のバグではない）:
+    手動検証用に`switch-journal.json`をPowerShellの`ConvertTo-Json`/`Set-Content -Encoding utf8`
+    で直接作成したところ、UTF-8 BOM（`EF BB BF`）が先頭に付与され、
+    `serde_json::from_str`が本物のBOM付きファイルに対してのみ解析失敗し、
+    復旧ダイアログが一切表示されない状態になった（同じ内容をBOM無しの文字列
+    リテラルとして直接パースする単体テストは成功していたため、原因の切り分けに
+    時間を要した）。RepoDeck自身の`journal_store::save`はBOMを一切書き込まないため
+    実運用では発生しない問題と判断し、プロダクションコードは変更せず、
+    治具側をBOM無しで書き直すことで解決。
+  - 実機確認: 設定画面の「起動設定」チェックボックスで実際のレジストリ値の
+    作成・削除を確認（`HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\RepoDeck`）。
+    「バージョン情報」セクションの表示とサードパーティ表示ボタン（実際に
+    `THIRD_PARTY_NOTICES.md`を開くことを確認）。起動時クラッシュ復旧は3つの
+    選択肢（元の配置に戻す／全てメインへ回収／何もしない）すべてを実際の
+    ダイアログクリックとログ出力で確認済み（それぞれ
+    `restored original placement after an interrupted switch` /
+    `recovered all windows after an interrupted switch` /
+    ジャーナルファイルが削除されずに残ることを確認）。モニター切断の実機確認は
+    このマシンの実モニター構成を変更するリスクを避けるため、単体テスト
+    （合成モニター／ウィンドウ矩形）でのみ検証。
+  - **配布物**: `.github/workflows/ci.yml`（development-plan.md §14.5の仕様通り。
+    GitHub Actions自体はこの環境から実行トリガーできないため、YAML構文の
+    手動レビューのみで検証）、`scripts/package.ps1`（実際に`cargo build --release`から
+    `RepoDeck-v0.1.0-windows-x64.zip`＋`.sha256`まで生成し、zipを展開して
+    `repodeck.exe`を独立ディレクトリから実際に起動できることを確認——「clean
+    Windows環境でZIPから起動」の完全な代替ではないが、この環境で可能な最も近い検証）、
+    `README.md`（日本語）／`README.en.md`（英語、相互リンク）。デモ用の実機
+    スクリーンショットは`docs/screenshots/`に格納し、実際の動画/GIF撮影は
+    この環境では不可能なためテキスト手順のみとした（ユーザーとの事前相談で
+    合意済み）。
 
 ### 実装メモ・既知の齟齬
 
@@ -123,9 +471,10 @@
   §7.2（domain型の正本）で定義される`PopupLocation` enumは`CursorMonitorCenter` /
   `MainMonitorCenter`の2種類のみで、`ForegroundMonitorCenter`と`FixedMonitor`が存在しない。
   §7.2は「次の型をdomain層の正本とする」と明記されているため、Phase 3の実装は§7.2の2種類を
-  正本として`src/domain/config.rs`に実装した。Phase 7（クイックスイッチャー）着手時に、
-  UI仕様の3種類（特にモニター指定を伴う`FixedMonitor`）を本当に実装するかどうかを再確認し、
-  必要なら§7.2の型定義自体をこのファイル側で更新してschema_versionを上げること。
+  正本として`src/domain/config.rs`に実装した。
+  **Phase 7で再確認済み**: `ForegroundMonitorCenter`/`FixedMonitor`は追加しないと決定した
+  （§13 Phase 7のチェックリストにこれらを要求する項目が無く、`popup_placement::resolve_popup_position`
+  は既存の2種類のみを実装）。将来追加する場合は§7.2の型定義とschema_versionの更新が必要。
 - **Windows 11パッケージ版Notepadのプロセス間接性**: `tests/windows_e2e.rs`実装中に判明。
   Windows 11では`notepad.exe`はApp Execution Aliasで、`std::process::Command::spawn()`が返す
   PIDは実際にウィンドウを所有するプロセスのPIDと一致しない（別プロセスへ委譲される）。
@@ -321,7 +670,7 @@ RepoDeckは、アプリの種類ではなく「一緒に使うウィンドウの
 
 既定値：
 
-- クイックスイッチャー：`Ctrl+Alt+R`
+- クイックスイッチャー：`Ctrl+Alt+W`
 - 非メイン画面の最大自動分割：4
 - UI表示位置：マウスカーソルのあるモニター中央
 - UI外クリックで閉じる：有効
@@ -405,6 +754,18 @@ RepoDeckは、アプリの種類ではなく「一緒に使うウィンドウの
 - 切替成功時はクイックスイッチャーを閉じる
 - 切替失敗時は閉じず、失敗理由と復旧操作を表示する
 - `ready`のセットを正常にメイン表示できた時点で、未確認フラグを解除して`idle`へ遷移する。ただし同一セットで別のエージェントが実行中なら集約状態を再計算する
+
+### 切り替えずに終わったとき
+
+呼び出したのに切り替えずに終わった場合は、現在セットの配置を再適用する（§3.8の再適用要求）。
+窓が手動で動かされていても「呼んで閉じる」だけで並びが戻るため、配置を直すための専用操作を持たない。
+
+- 再適用する閉じ方：`Esc`／`×`ボタン／ホットキー・トレイでのトグル閉じ／アウトフォーカスによる自動クローズ
+- ホールドサイクルで一周して現在セットのまま離した場合も再適用する（フォーカスのみで終わらせない）
+- 再適用しない場合：切替を実行したとき、および設定画面・セット管理を開いたとき、回収したとき、
+  メイン画面を空にしたとき。いずれも実行された操作を再配置で上書きしてしまうため
+- 閉じる合図は二重に届く（`Esc`で閉じる→非アクティブ化でも閉じる）ので、1回の呼び出しにつき1回だけ実行する
+- 閉じているアプリの起動はしない。再適用は並びを整える操作であり、窓を増やさない
 
 ## 3.4 タスクトレイ
 
@@ -620,7 +981,9 @@ MVPでは固定枠をグリッドセル単位に制限する。自由描画はMV
 処理：
 
 1. 多重切替を排他ロックで防止
-2. 対象が現在セットなら、フォーカスだけ行って成功終了
+2. 対象が現在セットなら、フォーカスだけ行って成功終了。ただし**再適用要求**（§3.3「切り替えずに
+   終わったとき」）では早期終了せず、対象セットに対して6〜8を実行する。このとき「出ていくセット」は
+   存在しないので、退避（5）も、退避先セルの明け渡しも、全画面解除も行わない
 3. 現在セットと対象セットのウィンドウを再解決
 4. 切替前の全対象配置をジャーナルへ保存
 5. 現在セットを退避

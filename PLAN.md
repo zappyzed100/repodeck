@@ -90,12 +90,34 @@ repodeck/
    matcher scoring、セット管理画面、再バインド（自動＋手動「このウィンドウを再登録」）。
    曖昧候補の対話的な選択UIは簡略化し、最高スコア候補への手動再登録のみを提供
    （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
-6. **Phase 6 — 退避割当・切替Coordinator**（未着手）: 自動枠割当、SwitchCoordinator、ジャーナル、ロールバック。
-7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（未着手）。
-8. **Phase 8 — Codex連携**（未着手）: 名前付きパイプ、`repodeck-hook.exe`、エージェント状態集約。
-9. **Phase 9 — 回復性・仕上げ**（未着手）: モニター変更監視、起動時復旧、配布物作成。
+6. **Phase 6 — 退避割当・切替Coordinator**（完了）: 自動枠割当（First Fit＋前回割当維持）、
+   固定枠優先、枠内縮小配置、枠不足時の最小化、`SwitchCoordinator`（12ステップ切替・
+   ジャーナル・ロールバック）、全ウィンドウ回収。UI（クイックスイッチャー・ホットキー）は
+   Phase 7待ちのため、バックエンドAPIとして実装（詳細は`docs/plans/development-plan.md`
+   冒頭の実装メモを参照）。
+7. **Phase 7 — タスクトレイ・ホットキー・クイックスイッチャー**（完了）: `RegisterHotKey`用の
+   専用スレッド（衝突検出・自己修復・設定画面からの再設定）、クイックスイッチャー
+   （検索・矢印/数字キー/Enter・タスクバー/Alt+Tab非表示・アウトフォーカスで閉じる）、
+   トレイメニュー刷新、`SwitchCoordinator`への実配線。エージェント状態表示はPhase 8待ち
+   （詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照）。
+8. **Phase 8 — Codex連携**（完了）: 名前付きパイプ（`\\.\pipe\RepoDeck.AgentEvents.v1`、
+   所有者限定ACL）、`repodeck-hook.exe`（標準入力→正規化JSON→単発送信、常に終了コード0）、
+   エージェント状態集約（`domain::agent`の6段階優先順位）、クイックスイッチャーの状態
+   バッジ・トレイアイコン色連動、設定画面「Codex連携」セクション（hook検出・hooks.json
+   スニペット生成＋コピー・設定フォルダーを開く・実プロセスによるテストイベント送信）。
+   詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照。
+9. **Phase 9 — 回復性・仕上げ**（完了）: モニター構成変更の監視（`WM_DISPLAYCHANGE`検知
+   →画面外ウィンドウのみ最小化）、起動時クラッシュ復旧（`switch-journal.json`残存時に
+   3択ダイアログ）、ログ保持（7日／50MB上限）、起動時自動実行設定、設定画面「バージョン
+   情報」セクション、配布一式（`.github/workflows/ci.yml`、`scripts/package.ps1`、
+   `README.md`/`README.en.md`）。config backup復旧はPhase 3で既に実装済みと確認。
+   詳細は`docs/plans/development-plan.md`冒頭の実装メモを参照。
 
 MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本とする。
+
+MVP完成後のUX改修（既定ホットキーの`Ctrl+Alt+W`化、クイックスイッチャーの✕ボタン・透過表示、
+レイアウトスタジオの選択モード廃止・自動分割「自動」・モニター除外、ホットキーの自由登録）は
+`docs/plans/development-plan.md` 冒頭の「MVP後のUX改修」を正本とする。
 
 ## タスク（機械可読 — Phase進捗を正規表現で読める記法）
 
@@ -112,7 +134,7 @@ MVP受け入れ基準25項目は `docs/plans/development-plan.md` §18 を正本
 - [x] Phase 3: 設定とドメインモデル
 - [x] Phase 4: レイアウトスタジオ
 - [x] Phase 5: ワークセット登録・照合
-- [ ] Phase 6: 退避割当・切替Coordinator `next`
-- [ ] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
-- [ ] Phase 8: Codex連携
-- [ ] Phase 9: 回復性・仕上げ
+- [x] Phase 6: 退避割当・切替Coordinator
+- [x] Phase 7: タスクトレイ・ホットキー・クイックスイッチャー
+- [x] Phase 8: Codex連携
+- [x] Phase 9: 回復性・仕上げ

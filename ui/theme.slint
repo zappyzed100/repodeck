@@ -28,9 +28,23 @@ export global Theme {
     // translucent overlays below, and the DWM backdrop blur itself where
     // the user has that setting on — not from seeing through the cards.
     out property <color> glass-base: rgba(13, 13, 16, 1.0);
+    // Quick Switcher backdrop variant, used only while Windows' own
+    // "Transparency effects" setting is on (checked at startup in
+    // `app::transparency_effects_enabled`): DWM then blurs everything behind
+    // the window, so alpha < 1.0 reads as frosted glass rather than the
+    // ghosted, overlapping text documented above. With the setting off the
+    // window falls back to the opaque glass-base.
+    // 0.60では背後の映像やテキストが透けて読めてしまう（ユーザー報告 2026-07-24）。
+    // この環境はDWMのぼかしが効かず透過分がそのまま滲むため、ほぼ不透明まで上げて
+    // 背後の内容を読めなくする。ごくわずかなガラス感だけ残す。
+    out property <color> glass-base-translucent: rgba(13, 13, 16, 0.96);
     out property <color> glass-panel: rgba(22, 22, 27, 1.0);
     out property <color> glass-panel-soft: rgba(255, 255, 255, 0.06);
     out property <color> glass-panel-strong: rgba(0, 0, 0, 0.90);
+    // 全ウィンドウが閉じているセットの減光色。`opacity` を使うとその要素が
+    // オフスクリーンのテクスチャ経由で合成され、スクロール位置が半端なときに
+    // 文字が再サンプリングされてボケるため、減光は色で表現する。
+    out property <color> closed-dim: rgba(120, 122, 130, 1.0);
     out property <color> glass-hover: rgba(255, 255, 255, 0.09);
     out property <color> glass-selected: rgba(10, 132, 255, 0.24);
 
@@ -119,6 +133,7 @@ export component GlassButton inherits Rectangle {
 // Small glass checkbox used in candidate/window lists.
 export component GlassCheckbox inherits Rectangle {
     in property <bool> checked: false;
+    in property <bool> enabled: true;
     callback toggled();
 
     width: 18px;
@@ -127,6 +142,7 @@ export component GlassCheckbox inherits Rectangle {
     background: checked ? Theme.accent : Theme.glass-panel-soft;
     border-width: 1px;
     border-color: checked ? Theme.accent : Theme.hairline-bright;
+    opacity: root.enabled ? 1.0 : 0.42;
     animate background { duration: Theme.duration-fast; easing: ease-out; }
 
     if checked: Text {
@@ -139,6 +155,55 @@ export component GlassCheckbox inherits Rectangle {
     }
 
     TouchArea {
+        enabled: root.enabled;
         clicked => { root.toggled(); }
+    }
+}
+
+// Prominent, unmissable action feedback ("保存しました" / "登録しました" / errors).
+// A colored pill (green success / red warning) with a leading status dot —
+// glyph-free so it renders in every font. Collapses to zero height when empty.
+export component StatusBanner inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-warning: false;
+
+    visible: root.text != "";
+    // Grows to fit wrapped text instead of clipping a long error to one line;
+    // `clip` still guards against any spill past the pill's rounded corners.
+    height: root.text != "" ? row.preferred-height : 0px;
+    clip: true;
+    border-radius: Theme.radius-md;
+    background: root.is-warning ? rgba(255, 69, 58, 0.16) : rgba(48, 209, 88, 0.16);
+    border-width: 1px;
+    border-color: root.is-warning ? Theme.danger : Theme.success;
+    animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
+
+    row := HorizontalLayout {
+        padding-left: Theme.space-sm;
+        padding-right: Theme.space-sm;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: Theme.space-sm;
+        alignment: start;
+
+        Rectangle {
+            width: 10px;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                y: 4px;
+                border-radius: 5px;
+                background: root.is-warning ? Theme.danger : Theme.success;
+            }
+        }
+        Text {
+            text: root.text;
+            font-family: Theme.font-text;
+            font-size: 13px;
+            font-weight: 600;
+            color: root.is-warning ? Theme.danger : Theme.success;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
     }
 }

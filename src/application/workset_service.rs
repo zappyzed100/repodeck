@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::domain::placement::{PixelRect, SavedPlacement, SavedShowState, normalize};
@@ -13,7 +14,7 @@ use crate::domain::workset::{
 };
 use crate::persistence::clock;
 use crate::windowing::enumerate::TopLevelWindow;
-use crate::windowing::matcher::{self, MatchDecision};
+use crate::windowing::matcher::{self, MatchDecision, TitlelessMatch};
 use crate::windowing::monitor::MonitorInfo;
 
 /// Searches `start` and its ancestors for a `.git` entry (PLAN.md §3.6:
@@ -38,6 +39,87 @@ pub fn resolve_repository(picked_folder: &Path) -> (PathBuf, RepositoryKind) {
         Some(git_root) => (git_root, RepositoryKind::Git),
         None => (picked_folder.to_path_buf(), RepositoryKind::Directory),
     }
+}
+
+/// Just the piece of a VS Code `.code-workspace` file (its multi-root
+/// workspace format) this module needs: the listed folders' `path` entries.
+/// Other top-level keys (`settings`, `extensions`, ...) are ignored by
+/// serde's default behavior.
+#[derive(Deserialize)]
+struct CodeWorkspaceFile {
+    folders: Vec<CodeWorkspaceFolder>,
+}
+
+#[derive(Deserialize)]
+struct CodeWorkspaceFolder {
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceFileError {
+    #[error("ワークスペースファイルを読み込めません")]
+    ReadFailed,
+    #[error("ワークスペースファイルの形式が不正です（.code-workspaceのJSONとして解釈できません）")]
+    ParseFailed,
+    #[error("ワークスペースファイルにフォルダーが1つも定義されていません")]
+    NoFolders,
+}
+
+/// Resolves a `.code-workspace` file's first listed folder to an absolute
+/// path (PLAN.md §3.6 workspace-file support). A relative `path` entry is
+/// resolved against the workspace file's own parent directory, matching VS
+/// Code's own resolution rule. Multi-root workspaces with more than one
+/// folder use only the first — a workset tracks one repository, not a set.
+pub fn resolve_workspace_file(workspace_path: &Path) -> Result<PathBuf, WorkspaceFileError> {
+    let contents =
+        std::fs::read_to_string(workspace_path).map_err(|_| WorkspaceFileError::ReadFailed)?;
+    let parsed: CodeWorkspaceFile =
+        serde_json::from_str(&contents).map_err(|_| WorkspaceFileError::ParseFailed)?;
+    let first = parsed
+        .folders
+        .first()
+        .ok_or(WorkspaceFileError::NoFolders)?;
+    let folder_path = PathBuf::from(&first.path);
+    if folder_path.is_absolute() {
+        Ok(folder_path)
+    } else {
+        let parent = workspace_path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(parent.join(folder_path))
+    }
+}
+
+/// Resolves the directory a workset should be matched against for agent
+/// cwd-correlation (`agent_status_service::map_event_to_workset`,
+/// PLAN.md §6.6). A `RepositoryKind::Workspace` workset's `repository_path`
+/// points at the `.code-workspace` file itself (not a directory it could be
+/// compared against a hook's `cwd`), so its first folder entry is parsed out
+/// here. If the file can no longer be read (moved/deleted since
+/// registration), falls back to the literal `repository_path` — matching
+/// then simply never succeeds rather than panicking.
+pub fn resolve_match_path(repository_path: &Path, repository_kind: RepositoryKind) -> PathBuf {
+    if repository_kind == RepositoryKind::Workspace
+        && let Ok(folder) = resolve_workspace_file(repository_path)
+    {
+        return folder;
+    }
+    repository_path.to_path_buf()
+}
+
+/// Whether a workset contains the OpenAI ChatGPT / Codex desktop app.
+///
+/// This is RepoDeck's marker for 「このセットでは Codex を回す」: such a set
+/// groups the ChatGPT app with the browser (and no VS Code repo), so it has no
+/// `repository_path` to correlate agent events against. `app.rs` uses this to
+/// auto-adopt an otherwise-unmatched Codex event's cwd into the active set the
+/// first time one arrives, so the set starts reflecting the run's status
+/// without the user typing a path.
+pub fn contains_chatgpt_codex_app(workset: &Workset) -> bool {
+    workset.windows.iter().any(|w| {
+        crate::application::launch_service::is_chatgpt_codex_app(
+            &w.matcher.executable_path,
+            &w.matcher.process_name,
+        )
+    })
 }
 
 /// Whether `candidate_path` is already registered under an existing workset
@@ -124,6 +206,10 @@ pub fn build_managed_window(
             show_state,
         },
         z_order,
+        // Filled in by the caller (registration), which knows the workset's
+        // repository path and can read a browser's URL from its live HWND.
+        launch_spec: None,
+        minimize_when_parked: false,
     })
 }
 
@@ -148,6 +234,7 @@ pub fn build_workset(
         sort_order,
         direct_hotkey: None,
         parking_policy: ParkingPolicy::Auto,
+        fullscreen_when_parked: false,
         windows,
         created_at: now.clone(),
         updated_at: now,
@@ -163,12 +250,194 @@ pub fn resolve_all_matches(
     worksets: &[Workset],
     live_windows: &[TopLevelWindow],
 ) -> HashMap<Uuid, MatchDecision> {
+    resolve_all_matches_with_bindings(worksets, live_windows, &HashMap::new(), None)
+}
+
+/// Whether a session HWND binding is still trustworthy: the live window at that
+/// HWND must belong to the same executable and window class the managed window
+/// was registered with (guards against Windows recycling the HWND for an
+/// unrelated window). Title/URL are deliberately NOT checked — that volatility
+/// is the whole reason bindings exist.
+///
+/// クラスは照合しない。登録アプリから宣言したウィンドウはそもそもクラスを持たず
+/// （宣言時点でアプリが起動しているとは限らない）、学習したクラスも WinForms の
+/// `WindowsForms10.Window.8.app.0.21b46d2_r3_ad1` のように実行ごとに変わりうる。
+/// 一致を要求すると、そうしたウィンドウは永久にバインドを保持できない。HWND の
+/// 使い回しに対しては実行ファイルの一致で十分に守れている。
+/// 起動引数そのものでウィンドウを特定する。ブラウザを `--user-data-dir` で用途別に
+/// 分けている場合だけ働く（Chromium 系はデータ領域が違えば独立プロセスになるので、
+/// そのプロセスのコマンドラインに引数が残る）。
+///
+/// タイトルもクラスも同じで見分けようのないブラウザを、確実に「この窓だ」と
+/// 特定できる唯一の手掛かり。該当しないウィンドウでは何もしない（コマンドライン
+/// 読み出しはプロセスを開くので、必要なときだけ行う）。
+fn find_by_launch_identity(
+    window: &ManagedWindow,
+    live_windows: &[TopLevelWindow],
+    bound: &HashSet<isize>,
+) -> Option<isize> {
+    let spec = window.launch_spec.as_ref()?;
+    let identity = crate::application::launch_service::browser_identity_arg(&spec.args)?;
+    let needle = identity
+        .trim_start_matches("--user-data-dir=")
+        .trim_matches('"');
+    if needle.is_empty() {
+        return None;
+    }
+
+    live_windows
+        .iter()
+        .filter(|w| !bound.contains(&w.hwnd))
+        .filter(|w| {
+            w.executable_path
+                .as_deref()
+                .is_some_and(|p| matcher::same_executable(p, &window.matcher.executable_path))
+        })
+        .find(|w| {
+            crate::windowing::process_info::read_process_command_line(w.process_id)
+                .is_some_and(|cmd| cmd.to_lowercase().contains(&needle.to_lowercase()))
+        })
+        .map(|w| w.hwnd)
+}
+
+fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
+    let same_app = live
+        .executable_path
+        .as_deref()
+        .is_some_and(|p| matcher::same_executable(p, &matcher.executable_path));
+    if !same_app {
+        return false;
+    }
+
+    // 実行ファイルだけでは「そのアプリの窓」しか言えない。登録が自分の窓を
+    // 見分ける手掛かり（`title_contains` / `title_regex`）を持っているなら、
+    // それが今も成り立っていることまで確かめる。
+    //
+    // ここを実行ファイルだけで通していたせいで、一度ついた誤りが二度と直らな
+    // かった。実機では `repodeck` セットの VS Code 登録が「02_求解・高速化」の
+    // 窓を握り、正しい `repodeck` の窓が後から現れても乗り換えなかった
+    // （2026-07-29）。手掛かりを持たない登録は今までどおり実行ファイルだけで
+    // 判断する——それ以上の材料が無く、要求すると永久にバインドを保持できない。
+    !matcher::has_discriminator(matcher) || matcher::has_title_evidence(matcher, live)
+}
+
+/// 実行ファイルごとの登録数。同じ実行ファイルを名乗る登録が2つ以上あると、
+/// 実行ファイル＋クラスの75点だけでは互いを見分けられない。
+fn registrations_per_executable(worksets: &[Workset]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for window in worksets.iter().flat_map(|w| w.windows.iter()) {
+        let key = window
+            .matcher
+            .executable_path
+            .as_os_str()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+}
+
+/// タイトルの根拠が無い候補を、この登録に限って自動バインドしてよいか。
+fn titleless_policy(counts: &HashMap<String, usize>, window: &ManagedWindow) -> TitlelessMatch {
+    let key = window
+        .matcher
+        .executable_path
+        .as_os_str()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if counts.get(&key).copied().unwrap_or(0) > 1 {
+        TitlelessMatch::Reject
+    } else {
+        TitlelessMatch::Accept
+    }
+}
+
+/// Like [`resolve_all_matches`], but first tries each managed window's tracked
+/// session HWND binding (PLAN.md §5.4 extension): if the bound HWND is still
+/// live and passes [`binding_still_valid`], it's used directly, bypassing
+/// content matching. This lets a browser window whose title/URL constantly
+/// change (a video tab) still be re-found. Anything without a usable binding
+/// falls back to the normal scoring matcher.
+///
+/// `priority_workset_id`, when given, is resolved first so that a window shared
+/// by several worksets binds to it: on a switch this is the target set, so the
+/// shared window lands on the main screen (with the activated set) instead of
+/// being claimed and parked by another set. The same physical window may be
+/// registered in multiple worksets — that is allowed and simply means the
+/// window follows whichever set is active.
+pub fn resolve_all_matches_with_bindings(
+    worksets: &[Workset],
+    live_windows: &[TopLevelWindow],
+    bindings: &HashMap<Uuid, isize>,
+    priority_workset_id: Option<Uuid>,
+) -> HashMap<Uuid, MatchDecision> {
     let mut bound: HashSet<isize> = HashSet::new();
     let mut results = HashMap::new();
+    let per_exe = registrations_per_executable(worksets);
 
-    for workset in worksets {
+    // The priority workset first, then the rest in their original order.
+    let ordered = priority_workset_id
+        .and_then(|id| worksets.iter().find(|w| w.id == id))
+        .into_iter()
+        .chain(
+            worksets
+                .iter()
+                .filter(|w| Some(w.id) != priority_workset_id),
+        );
+    for workset in ordered {
         for window in &workset.windows {
-            let decision = matcher::resolve_best_match(&window.matcher, live_windows, &bound);
+            if let Some(&hwnd) = bindings.get(&window.id) {
+                match live_windows.iter().find(|w| w.hwnd == hwnd) {
+                    Some(live)
+                        if !bound.contains(&hwnd) && binding_still_valid(&window.matcher, live) =>
+                    {
+                        bound.insert(hwnd);
+                        results.insert(window.id, MatchDecision::AutoRebind { hwnd });
+                        continue;
+                    }
+                    // バインド先のウィンドウがもう存在しない＝このエントリは閉じ
+                    // られた。内容マッチでの再発見はまだ許す（開き直した VS Code
+                    // はタイトルに同じフォルダ名を持つ）が、「同じアプリの別窓」
+                    // で妥協させてはいけない。妥協すると、閉じた Brave が別の
+                    // Brave ウィンドウを勝手に取り込み、セットは開いているように
+                    // 見え、開き直すが「対象なし」と言う。
+                    None => {
+                        // ブラウザを用途ごとに `--user-data-dir` で分けている場合、
+                        // その窓は独立プロセスなのでコマンドラインで確実に特定できる。
+                        // タイトルでは見分けられないブラウザでも、これなら正しい窓を
+                        // 取り戻せる。
+                        if let Some(hwnd) = find_by_launch_identity(window, live_windows, &bound) {
+                            bound.insert(hwnd);
+                            results.insert(window.id, MatchDecision::AutoRebind { hwnd });
+                            continue;
+                        }
+                        // バインドが指す窓が消えている＝閉じられた。再発見は許すが
+                        // 「同じアプリの別窓」で妥協させてはいけないので、登録数に
+                        // 関わらずタイトルの根拠を要求する。
+                        let decision = matcher::resolve_best_match(
+                            &window.matcher,
+                            live_windows,
+                            &bound,
+                            TitlelessMatch::Reject,
+                        );
+                        if let MatchDecision::AutoRebind { hwnd } = &decision {
+                            bound.insert(*hwnd);
+                        }
+                        results.insert(window.id, decision);
+                        continue;
+                    }
+                    // 生きてはいるが先のセットが確保済み、または HWND が無関係な
+                    // ウィンドウに再利用された場合は内容マッチへ委ねる。
+                    _ => {}
+                }
+            }
+
+            let decision = matcher::resolve_best_match(
+                &window.matcher,
+                live_windows,
+                &bound,
+                titleless_policy(&per_exe, window),
+            );
             if let MatchDecision::AutoRebind { hwnd } = &decision {
                 bound.insert(*hwnd);
             }
@@ -177,6 +446,47 @@ pub fn resolve_all_matches(
     }
 
     results
+}
+
+/// Extracts the fresh `managed_window_id → HWND` bindings from a resolution
+/// result, so the caller can persist them for next time.
+pub fn bindings_from_decisions(decisions: &HashMap<Uuid, MatchDecision>) -> HashMap<Uuid, isize> {
+    decisions
+        .iter()
+        .filter_map(|(id, decision)| match decision {
+            MatchDecision::AutoRebind { hwnd } => Some((*id, *hwnd)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 紐づけ表から、**もう存在しない登録**のぶんを落とす。落とした件数を返す。
+///
+/// `runtime.json` の `window_bindings` は書き足す一方だった。現役のエントリは自分の
+/// 項目を上書きするだけなので増えない——増えるのは、セットやウィンドウを削除しても
+/// その `managed_window_id` の項目が残り続けるからで、これが唯一の漏れ口。実機では
+/// 190件（現役の窓は22個）まで溜まっていた（2026-07-26）。
+///
+/// 残骸が害になるのは HWND を OS が再利用するからで、「現役の窓はもう別のエントリが
+/// 握っている」と主張してくる。実機の ChatGPT の窓は、存在しない6つの id に握られた
+/// 状態になり、セットが永久にバインドできなくなっていた。
+///
+/// **窓が既に消えている紐づけは落とさない。** あれは残骸ではなく情報を持っている:
+/// [`resolve_all_matches_with_bindings`] は「紐づけがあるのに窓が無い＝このエントリは
+/// 閉じられた」と読み、再発見に
+/// [`matcher::has_title_evidence`] の厳しい条件を課す。項目そのものを消すと、その
+/// 条件のない素の照合へ落ちてしまい、「閉じた Brave が無関係な別の Brave 窓を取り込む」
+/// 挙動が戻ってくる。生きている HWND が再利用されていた場合は `binding_still_valid`
+/// が弾くので、現役エントリの側はこれで足りている。
+pub fn prune_window_bindings(bindings: &mut HashMap<Uuid, isize>, worksets: &[Workset]) -> usize {
+    let known: HashSet<Uuid> = worksets
+        .iter()
+        .flat_map(|w| w.windows.iter())
+        .map(|w| w.id)
+        .collect();
+    let before = bindings.len();
+    bindings.retain(|id, _| known.contains(id));
+    before - bindings.len()
 }
 
 #[cfg(test)]
@@ -196,6 +506,55 @@ mod tests {
         std::fs::create_dir(repo_root.join(".git")).unwrap();
 
         assert_eq!(find_git_root(&nested), Some(repo_root));
+    }
+
+    fn workset_with_process(process_name: &str) -> Workset {
+        use crate::domain::placement::{NormalizedRect, PixelRect};
+        let mut ws = build_workset(
+            "s".into(),
+            "#fff".to_string(),
+            PathBuf::new(),
+            RepositoryKind::Directory,
+            0,
+            Vec::new(),
+        );
+        ws.windows.push(ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: WindowMatcher {
+                executable_path: PathBuf::from(r"C:\app.exe"),
+                process_name: process_name.to_string(),
+                window_class: "X".to_string(),
+                registered_title: "t".to_string(),
+                title_contains: None,
+                title_regex: None,
+            },
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 800, 600),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+            minimize_when_parked: false,
+        });
+        ws
+    }
+
+    #[test]
+    fn contains_chatgpt_codex_app_detects_the_app_by_process_name() {
+        assert!(contains_chatgpt_codex_app(&workset_with_process(
+            "ChatGPT.exe"
+        )));
+        assert!(!contains_chatgpt_codex_app(&workset_with_process(
+            "brave.exe"
+        )));
     }
 
     #[test]
@@ -229,6 +588,120 @@ mod tests {
         let (path, kind) = resolve_repository(&plain);
         assert_eq!(path, plain);
         assert_eq!(kind, RepositoryKind::Directory);
+    }
+
+    #[test]
+    fn resolve_workspace_file_reads_the_first_folders_absolute_path() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(
+            &ws_path,
+            format!(
+                r#"{{"folders": [{{"name": "proj", "path": "{}"}}], "settings": {{}}}}"#,
+                repo.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_workspace_file(&ws_path).unwrap(), repo);
+    }
+
+    #[test]
+    fn resolve_workspace_file_resolves_a_relative_path_against_its_own_parent() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": [{"path": "repo"}]}"#).unwrap();
+
+        assert_eq!(resolve_workspace_file(&ws_path).unwrap(), repo);
+    }
+
+    #[test]
+    fn resolve_workspace_file_uses_only_the_first_of_multiple_folders() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(
+            &ws_path,
+            r#"{"folders": [{"path": "first"}, {"path": "second"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path).unwrap(),
+            dir.path().join("first")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_a_workspace_with_no_folders() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("empty.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": []}"#).unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path),
+            Err(WorkspaceFileError::NoFolders)
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_invalid_json() {
+        let dir = tempdir().unwrap();
+        let ws_path = dir.path().join("broken.code-workspace");
+        std::fs::write(&ws_path, "not json at all").unwrap();
+
+        assert_eq!(
+            resolve_workspace_file(&ws_path),
+            Err(WorkspaceFileError::ParseFailed)
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.code-workspace");
+
+        assert_eq!(
+            resolve_workspace_file(&missing),
+            Err(WorkspaceFileError::ReadFailed)
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_resolves_a_workspace_kind_to_its_underlying_folder() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws_path = dir.path().join("proj.code-workspace");
+        std::fs::write(&ws_path, r#"{"folders": [{"path": "repo"}]}"#).unwrap();
+
+        assert_eq!(
+            resolve_match_path(&ws_path, RepositoryKind::Workspace),
+            repo
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_falls_back_to_the_literal_path_when_the_workspace_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.code-workspace");
+
+        assert_eq!(
+            resolve_match_path(&missing, RepositoryKind::Workspace),
+            missing
+        );
+    }
+
+    #[test]
+    fn resolve_match_path_returns_non_workspace_kinds_unchanged() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+
+        assert_eq!(resolve_match_path(&repo, RepositoryKind::Git), repo);
+        assert_eq!(resolve_match_path(&repo, RepositoryKind::Directory), repo);
     }
 
     fn monitor(device_name: &str, bounds: PixelRect) -> MonitorInfo {
@@ -385,6 +858,8 @@ mod tests {
                 show_state: SavedShowState::Normal,
             },
             z_order: 0,
+            launch_spec: None,
+            minimize_when_parked: false,
         };
         let mut managed_b = managed_a.clone();
         managed_b.id = Uuid::new_v4();
@@ -425,5 +900,250 @@ mod tests {
         // also claim it (the shared HWND cannot belong to two AutoRebinds).
         assert_eq!(*decision_a, MatchDecision::AutoRebind { hwnd: 1 });
         assert_ne!(*decision_b, MatchDecision::AutoRebind { hwnd: 1 });
+    }
+
+    #[test]
+    fn priority_workset_claims_a_shared_window_before_earlier_order() {
+        // Both worksets register the *same* window (shared): identical matcher.
+        let matcher = WindowMatcher {
+            executable_path: PathBuf::from(r"C:\code.exe"),
+            process_name: "code.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "repodeck".to_string(),
+            title_contains: None,
+            title_regex: None,
+        };
+        let managed_a = ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: matcher.clone(),
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: crate::domain::placement::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.1,
+                    height: 0.1,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 800, 600),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+            minimize_when_parked: false,
+        };
+        let mut managed_b = managed_a.clone();
+        managed_b.id = Uuid::new_v4();
+
+        let workset_a = build_workset(
+            "A".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\a"),
+            RepositoryKind::Git,
+            0,
+            vec![managed_a.clone()],
+        );
+        let workset_b = build_workset(
+            "B".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\b"),
+            RepositoryKind::Git,
+            1,
+            vec![managed_b.clone()],
+        );
+        let b_id = workset_b.id;
+        let live = [window_with(
+            1,
+            r"C:\code.exe",
+            "Chrome_WidgetWin_1",
+            "repodeck",
+        )];
+
+        // B is the priority (e.g. the switch target), so it claims the shared
+        // window even though A comes first in order.
+        let decisions = resolve_all_matches_with_bindings(
+            &[workset_a, workset_b],
+            &live,
+            &HashMap::new(),
+            Some(b_id),
+        );
+        assert_eq!(
+            decisions[&managed_b.id],
+            MatchDecision::AutoRebind { hwnd: 1 }
+        );
+        assert_ne!(
+            decisions[&managed_a.id],
+            MatchDecision::AutoRebind { hwnd: 1 }
+        );
+    }
+
+    /// 登録アプリから宣言したエントリ（クラス未学習、タイトルはアプリ名だけ）。
+    fn declared_window(exe: &str, app_name: &str) -> ManagedWindow {
+        ManagedWindow {
+            id: Uuid::new_v4(),
+            matcher: WindowMatcher {
+                executable_path: PathBuf::from(exe),
+                process_name: "app.exe".to_string(),
+                window_class: String::new(),
+                registered_title: app_name.to_string(),
+                title_contains: Some(app_name.to_string()),
+                title_regex: None,
+            },
+            main_placement: SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: crate::domain::placement::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.5,
+                    height: 1.0,
+                },
+                physical_rect_at_capture: PixelRect::new(0, 0, 0, 0),
+                show_state: SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: None,
+            minimize_when_parked: false,
+        }
+    }
+
+    fn single_set(windows: Vec<ManagedWindow>) -> Workset {
+        build_workset(
+            "S".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\s"),
+            RepositoryKind::Git,
+            0,
+            windows,
+        )
+    }
+
+    /// 実機で190件（現役の窓は22個）まで溜まっていた（2026-07-26）。残骸が現役の窓を
+    /// 握っているように見え、ChatGPT セットが永久にバインドできなくなっていた。
+    #[test]
+    fn bindings_of_deleted_registrations_are_pruned() {
+        let live_window = declared_window(r"C:\x\app.exe", "App");
+        let live_id = live_window.id;
+        let set = single_set(vec![live_window]);
+        let deleted_a = Uuid::new_v4();
+        let deleted_b = Uuid::new_v4();
+        let mut bindings: HashMap<Uuid, isize> =
+            [(live_id, 11), (deleted_a, 265198), (deleted_b, 265198)]
+                .into_iter()
+                .collect();
+
+        let pruned = prune_window_bindings(&mut bindings, std::slice::from_ref(&set));
+
+        assert_eq!(pruned, 2);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get(&live_id), Some(&11));
+    }
+
+    /// 窓が消えている紐づけは残骸ではない。あれがあると
+    /// `resolve_all_matches_with_bindings` は「閉じられたエントリ」と読んで、再発見に
+    /// `has_title_evidence` の厳しい条件を課す。消すと素の照合へ落ちて、閉じた
+    /// ブラウザが無関係な別の窓を取り込む挙動が戻る。
+    #[test]
+    fn a_binding_whose_window_is_gone_is_kept_because_it_still_carries_meaning() {
+        let managed = declared_window(r"C:\x\app.exe", "App");
+        let id = managed.id;
+        let set = single_set(vec![managed]);
+        // 999 はもう存在しない窓。それでも登録は生きている。
+        let mut bindings: HashMap<Uuid, isize> = [(id, 999)].into_iter().collect();
+
+        let pruned = prune_window_bindings(&mut bindings, std::slice::from_ref(&set));
+
+        assert_eq!(pruned, 0);
+        assert_eq!(bindings.get(&id), Some(&999));
+    }
+
+    #[test]
+    fn a_declared_window_holds_its_binding_even_though_no_class_was_registered() {
+        // クラス一致を要求していたため、宣言アプリはバインドを一切保持できず、
+        // 開き直しても紐づかなかった（VS Code / LibreHardwareMonitor / RDP）。
+        let managed = declared_window(r"C:\tool\LHM.exe", "Libre Hardware Monitor");
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            42,
+            r"C:\tool\LHM.exe",
+            "WindowsForms10.Window.8.app.0.1",
+            "Libre Hardware Monitor",
+        )];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 42)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 42 }
+        );
+    }
+
+    #[test]
+    fn a_closed_browser_does_not_adopt_another_window_of_the_same_browser() {
+        // Brave を閉じたのに、別の Brave ウィンドウへ紐づき直してしまい
+        // 「開き直せる閉じたアプリはありませんでした」になっていた。
+        let managed = declared_window(r"C:\brave\brave.exe", "Brave");
+        let set = single_set(vec![managed.clone()]);
+        // このエントリが結びついていた 10 は消え、無関係な Brave の窓 11 だけが残る。
+        let live = [window_with(
+            11,
+            r"C:\brave\brave.exe",
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        )];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 10)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(decisions[&managed.id], MatchDecision::Unresolved);
+    }
+
+    #[test]
+    fn a_closed_vscode_window_is_still_re_found_by_its_folder_in_the_title() {
+        // 一方、タイトルで自分だと分かるものは内容マッチでの再発見を許す：
+        // ユーザーが同じフォルダを開き直した VS Code は取り込んでよい。
+        let mut managed = declared_window(r"C:\VS\Code.exe", "Visual Studio Code");
+        managed.matcher.title_contains = Some("repo01".to_string());
+        let set = single_set(vec![managed.clone()]);
+        let live = [
+            window_with(
+                11,
+                r"C:\VS\Code.exe",
+                "Chrome_WidgetWin_1",
+                "repo01 - Visual Studio Code",
+            ),
+            window_with(
+                12,
+                r"C:\VS\Code.exe",
+                "Chrome_WidgetWin_1",
+                "repo07 - Visual Studio Code",
+            ),
+        ];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 10)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 11 }
+        );
+    }
+
+    #[test]
+    fn without_any_binding_a_declared_entry_still_adopts_a_running_window() {
+        // バインドが無い＝まだ一度も結びついていない（再起動後など）。この段階では
+        // 既に起動している窓を取り込めたほうが便利なので、従来どおり内容マッチ。
+        let managed = declared_window(r"C:\brave\brave.exe", "Brave");
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            11,
+            r"C:\brave\brave.exe",
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        )];
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &HashMap::new(), None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 11 }
+        );
     }
 }

@@ -1,5 +1,5 @@
-import { ScrollView } from "std-widgets.slint";
-import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
+import { GlassButton, GlassCheckbox, StatusBanner, Theme } from "theme.slint";
 
 export struct MonitorTile {
     x: length,
@@ -10,7 +10,19 @@ export struct MonitorTile {
     detail-label: string,
     role-label: string,
     is-main: bool,
+    is-sub: bool,
+    is-excluded: bool,
     selected: bool,
+}
+
+export struct SubScreenRow {
+    name: string,
+    // Whether the currently-selected monitor is assigned to this sub-screen.
+    assigned: bool,
+    // The area within the monitor(s): "全体" / "左半分" / "左上1/4" ...
+    region-label: string,
+    // Maximize (full-screen) windows parked into this sub-screen.
+    fullscreen: bool,
 }
 
 export struct MainScreenCandidate {
@@ -37,22 +49,35 @@ component SectionLabel inherits Text {
 export component LayoutStudio inherits Window {
     title: "RepoDeck — レイアウトスタジオ";
     icon: @image-url("../assets/repodeck-icon.svg");
-    // Fixed (not just preferred) size: showing/hiding the "メインを空にする"
-    // confirmation panel changes the layout tree's natural content width, and
-    // Slint would otherwise shrink the whole OS window to fit whichever
-    // branch is narrower (see the same fix in workset-dialog.slint).
-    width: 1000px;
-    height: 680px;
+    // A *preferred* (not fixed) size: unlike workset-dialog.slint, every
+    // branch that used to change this window's natural content size (the
+    // "メインを空にする" confirmation panel, the auto-split box below) has
+    // been pulled out of the layout flow — as a floating overlay and a
+    // fixed-height reservation respectively — so nothing left changes the
+    // preferred size at runtime. Leaving this as a preferred size (rather
+    // than a fixed one) matters: a fixed size makes Slint ignore the OS
+    // window's real size after a user resize/maximize, so `canvas-frame`
+    // below (and everything else) stays pinned at 1000x680 in a corner of
+    // the larger OS window instead of actually filling it.
+    // Opens large enough to show every element without scrolling (the content's
+    // natural size is ~940×780 — see the ScrollView's viewport minimums below).
+    preferred-width: 1240px;
+    preferred-height: 860px;
+    // Lowered so the window can shrink below the content's natural size; the
+    // content is wrapped in a ScrollView (below) that then shows scrollbars.
+    min-width: 560px;
+    min-height: 440px;
     background: transparent;
     default-font-family: Theme.font-text;
 
     in property <[MonitorTile]> monitor-tiles: [];
-    in property <bool> selecting-main: false;
     in property <int> selected-monitor-index: -1;
     in property <string> selected-monitor-detail: "モニターを選択してください";
     in property <bool> selected-is-main: false;
+    in property <bool> selected-excluded: false;
     in property <bool> selected-has-monitor: false;
-    in property <int> selected-auto-split: 1;
+    // 0 = 自動 (the app picks from the monitor's work area); 1/2/4 = manual.
+    in property <int> selected-auto-split: 0;
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
@@ -61,10 +86,17 @@ export component LayoutStudio inherits Window {
     in property <bool> empty-screen-panel-visible: false;
     in property <[MainScreenCandidate]> main-screen-candidates: [];
 
+    in property <[SubScreenRow]> sub-screen-rows: [];
+
     callback refresh-requested();
-    callback toggle-select-main-mode();
+    callback sub-screen-add(name: string);
+    callback sub-screen-delete(index: int);
+    callback sub-screen-toggle-monitor(index: int);
+    callback sub-screen-cycle-region(index: int);
+    callback sub-screen-toggle-fullscreen(index: int);
     callback monitor-clicked(index: int);
-    callback apply-main-selection();
+    callback toggle-main-requested();
+    callback toggle-excluded-requested();
     callback set-auto-split(monitor-index: int, split: int);
     callback empty-main-screen-requested();
     callback candidate-toggled(index: int);
@@ -72,6 +104,10 @@ export component LayoutStudio inherits Window {
     callback cancel-empty-main-screen();
     callback undo-requested();
     callback save-requested();
+    // Fires whenever the canvas card's actual on-screen size changes (first
+    // layout pass, or a window resize), so Rust can project monitor tiles
+    // onto the card's real bounds instead of a guessed constant.
+    callback canvas-resized(width: length, height: length);
 
     backdrop := Rectangle {
         x: 0;
@@ -83,39 +119,36 @@ export component LayoutStudio inherits Window {
         border-color: Theme.hairline-bright;
     }
 
-    VerticalLayout {
-        padding: Theme.space-md;
-        spacing: Theme.space-sm;
+    // Wraps all content so it can scroll (both axes) when the window is smaller
+    // than the content's natural size. `viewport-*` is max(visible, a content
+    // minimum): the content fills the window when there's room, and stays at
+    // its minimum (scrollbars appear) when the window is smaller.
+    content-scroll := ScrollView {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        // The content's natural size — the window opens at least this big, and
+        // shrinking below it reveals the scrollbars rather than clipping.
+        viewport-width: max(self.visible-width, 940px);
+        viewport-height: max(self.visible-height, 780px);
 
-        // --- Toolbar ---
-        HorizontalLayout {
-            spacing: Theme.space-xs;
-            height: 36px;
+        VerticalLayout {
+            width: content-scroll.viewport-width;
+            height: content-scroll.viewport-height;
+            padding: Theme.space-md;
+            spacing: Theme.space-sm;
 
-            GlassButton {
-                text: root.selecting-main ? "選択モードを終了" : "メイン画面を選択";
-                clicked => { root.toggle-select-main-mode(); }
-            }
-            GlassButton {
-                text: "選択を適用";
-                primary: root.selecting-main;
-                enabled: root.selecting-main;
-                clicked => { root.apply-main-selection(); }
-            }
+            // --- Toolbar ---
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                height: 36px;
+
             GlassButton {
                 text: "モニター一覧を更新";
                 clicked => { root.refresh-requested(); }
             }
             Rectangle { horizontal-stretch: 1; }
-            GlassButton {
-                text: "メイン画面を空にする";
-                clicked => { root.empty-main-screen-requested(); }
-            }
-            GlassButton {
-                text: "元に戻す";
-                enabled: root.undo-available;
-                clicked => { root.undo-requested(); }
-            }
             GlassButton {
                 text: "設定を保存";
                 primary: true;
@@ -131,16 +164,23 @@ export component LayoutStudio inherits Window {
             canvas-frame := GlassPanel {
                 horizontal-stretch: 1;
 
+                changed width => { root.canvas-resized(self.width, self.height); }
+                changed height => { root.canvas-resized(self.width, self.height); }
+
                 for tile[i] in root.monitor-tiles: Rectangle {
                     x: tile.x;
                     y: tile.y;
                     width: tile.width;
                     height: tile.height;
+                    // Clip so a small tile's labels can't spill over neighbouring
+                    // tiles (with many monitors the projected tiles get small).
+                    clip: true;
                     background: tile.selected ? Theme.glass-selected : (tile.is-main ? Theme.accent-soft : Theme.glass-panel-soft);
                     border-width: tile.selected ? 2px : 1px;
-                    border-color: tile.is-main ? Theme.accent : Theme.hairline-bright;
+                    border-color: tile.is-main ? Theme.accent : (tile.is-sub ? Theme.warning : Theme.hairline-bright);
                     border-radius: Theme.radius-sm;
-                    animate background, border-color { duration: Theme.duration-base; easing: ease-out; }
+                    opacity: tile.is-excluded ? 0.45 : 1.0;
+                    animate background, border-color, opacity { duration: Theme.duration-base; easing: ease-out; }
 
                     VerticalLayout {
                         padding: Theme.space-xs;
@@ -149,7 +189,7 @@ export component LayoutStudio inherits Window {
                             text: tile.role-label;
                             font-size: 12px;
                             font-weight: 700;
-                            color: tile.is-main ? Theme.accent : Theme.text-primary;
+                            color: tile.is-main ? Theme.accent : (tile.is-sub ? Theme.warning : (tile.is-excluded ? Theme.text-tertiary : Theme.text-primary));
                         }
                         Text {
                             text: tile.device-name;
@@ -187,34 +227,147 @@ export component LayoutStudio inherits Window {
                         wrap: word-wrap;
                     }
 
-                    if root.selected-has-monitor && !root.selected-is-main: Rectangle {
-                        height: 100px;
-                        VerticalLayout {
-                            spacing: Theme.space-xs;
-                            SectionLabel { text: "自動分割"; }
+                    // Always reserves this height, whether or not the per-monitor
+                    // controls are showing: letting this row's natural height
+                    // change with `selected-has-monitor`/`selected-is-main` would
+                    // feed back into the window's preferred size (now that it's
+                    // `preferred-width`/`preferred-height`, not a fixed size —
+                    // see the comment on `LayoutStudio` above), so the window
+                    // would visibly resize every time the selection changes.
+                    Rectangle {
+                        height: 540px;
+                        if root.selected-has-monitor: VerticalLayout {
+                            spacing: Theme.space-sm;
+                            alignment: start;
+
+                            GlassButton {
+                                text: root.selected-is-main ? "メイン画面から外す" : "メイン画面に登録する";
+                                primary: !root.selected-is-main && !root.selected-excluded;
+                                enabled: !root.selected-excluded;
+                                clicked => { root.toggle-main-requested(); }
+                            }
+
                             HorizontalLayout {
                                 spacing: Theme.space-xs;
-                                GlassButton {
-                                    text: "1分割";
-                                    primary: root.selected-auto-split == 1;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 1); }
+                                GlassCheckbox {
+                                    checked: root.selected-excluded;
+                                    enabled: !root.selected-is-main;
+                                    toggled => { root.toggle-excluded-requested(); }
                                 }
-                                GlassButton {
-                                    text: "2分割";
-                                    primary: root.selected-auto-split == 2;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 2); }
-                                }
-                                GlassButton {
-                                    text: "4分割";
-                                    primary: root.selected-auto-split == 4;
-                                    clicked => { root.set-auto-split(root.selected-monitor-index, 4); }
+                                Text {
+                                    text: "RepoDeckの操作対象にしない";
+                                    font-size: 12px;
+                                    color: root.selected-is-main ? Theme.text-tertiary : Theme.text-secondary;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
                                 }
                             }
+
+                            if !root.selected-is-main && !root.selected-excluded: VerticalLayout {
+                                spacing: Theme.space-xs;
+                                SectionLabel { text: "自動分割"; }
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    GlassButton {
+                                        text: "自動";
+                                        primary: root.selected-auto-split == 0;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 0); }
+                                    }
+                                    GlassButton {
+                                        text: "1";
+                                        primary: root.selected-auto-split == 1;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 1); }
+                                    }
+                                    GlassButton {
+                                        text: "2";
+                                        primary: root.selected-auto-split == 2;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 2); }
+                                    }
+                                    GlassButton {
+                                        text: "4";
+                                        primary: root.selected-auto-split == 4;
+                                        clicked => { root.set-auto-split(root.selected-monitor-index, 4); }
+                                    }
+                                }
+                                Text {
+                                    text: "「自動」は解像度から分割数を決めます。";
+                                    font-size: 10px;
+                                    color: Theme.text-tertiary;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            // --- Sub-screen (退避先) management ---
+                            Rectangle { height: 1px; background: Theme.hairline; }
+                            SectionLabel { text: "サブ画面（退避先エリア）"; }
                             Text {
-                                text: "固定枠の割当はワークセット登録後に利用できます。";
+                                text: "このモニターを割り当てるサブ画面を選択。1つのサブ画面に複数モニターも可。";
                                 font-size: 10px;
                                 color: Theme.text-tertiary;
                                 wrap: word-wrap;
+                            }
+                            ScrollView {
+                                height: 200px;
+                                VerticalLayout {
+                                    spacing: Theme.space-xs;
+                                    for sub[i] in root.sub-screen-rows: Rectangle {
+                                        height: 90px;
+                                        clip: true;
+                                        border-radius: Theme.radius-sm;
+                                        background: Theme.glass-panel-soft;
+                                        VerticalLayout {
+                                            padding: 6px;
+                                            spacing: 4px;
+                                            HorizontalLayout {
+                                                spacing: Theme.space-xs;
+                                                GlassCheckbox {
+                                                    checked: sub.assigned;
+                                                    enabled: !root.selected-is-main && !root.selected-excluded;
+                                                    toggled => { root.sub-screen-toggle-monitor(i); }
+                                                }
+                                                Text {
+                                                    text: sub.name;
+                                                    font-size: 12px;
+                                                    color: Theme.text-primary;
+                                                    vertical-alignment: center;
+                                                    horizontal-stretch: 1;
+                                                    overflow: elide;
+                                                }
+                                                GlassButton {
+                                                    text: "削除";
+                                                    clicked => { root.sub-screen-delete(i); }
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: Theme.space-xs;
+                                                GlassButton {
+                                                    text: sub.region-label;
+                                                    clicked => { root.sub-screen-cycle-region(i); }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                                GlassCheckbox {
+                                                    checked: sub.fullscreen;
+                                                    toggled => { root.sub-screen-toggle-fullscreen(i); }
+                                                }
+                                                Text { text: "全画面"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.space-xs;
+                                new-sub-name := LineEdit {
+                                    placeholder-text: "新しいサブ画面名";
+                                    horizontal-stretch: 1;
+                                }
+                                GlassButton {
+                                    text: "追加";
+                                    clicked => {
+                                        root.sub-screen-add(new-sub-name.text);
+                                        new-sub-name.text = "";
+                                    }
+                                }
                             }
                         }
                     }
@@ -223,11 +376,10 @@ export component LayoutStudio inherits Window {
         }
 
         // --- Status bar ---
-        Text {
+        StatusBanner {
             text: root.status-text;
-            font-size: 12px;
-            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
-            wrap: word-wrap;
+            is-warning: root.status-is-warning;
+        }
         }
     }
 

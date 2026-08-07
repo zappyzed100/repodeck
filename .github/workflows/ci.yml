@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancels an in-progress run for the same branch/PR when a new commit lands,
+# so only the latest push on a branch keeps consuming runner time
+# (development-plan.md §14.5).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI 全体で共通の Cargo 設定。
+# - CARGO_INCREMENTAL=0: CI は毎回クリーンに近いので増分は無駄。キャッシュも肥大
+#   させない（Swatinem/rust-cache 推奨）。
+# - リリースの LTO / codegen-units を上書きし、ビルドを大幅短縮する。配布用の
+#   本物のプロファイル（Cargo.toml: lto=true, codegen-units=1）は build.ps1 が
+#   使うのでそのまま。CI が確認したいのは「リリースでも通る」ことなので、CI では
+#   LTO を切り、codegen を分割して速く回す。
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+
+jobs:
+  docs-only-check:
+    runs-on: windows-latest
+    outputs:
+      docs_only: ${{ steps.check.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Determine whether only Markdown files changed
+        id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$base" "${{ github.sha }}")
+          if [ -z "$changed" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed" | grep -qvE '\.md$'; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    needs: docs-only-check
+    if: needs.docs-only-check.outputs.docs_only != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 依存ツリー（slint / windows-rs）が巨大なので、release 成果物まで含めて
+          # キャッシュを効かせる。ワークフロー変更でもキャッシュを共有し続けたい
+          # ので、キーには含めない。
+          cache-all-crates: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # リリースビルドは巨大依存の再コンパイルで重い。PR では fmt/clippy/test で
+      # 正しさを担保できるので走らせず、master への push 時（成果物が要る時）だけ
+      # 実行する。これで PR の CI は dev プロファイル（キャッシュ温）だけになり速い。
+      - name: canonical release build
+        if: github.event_name == 'push'
+        run: pwsh -NoProfile -File .\build.ps1 -SkipShortcut
+
+      - name: Upload release binaries
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: repodeck-release-binaries
+          path: |
+            target/release/repodeck.exe
+            target/release/repodeck-hook.exe
+          if-no-files-found: error

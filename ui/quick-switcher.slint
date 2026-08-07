@@ -1,0 +1,559 @@
+import { GlassButton, Theme } from "theme.slint";
+
+export struct QuickSwitcherRow {
+    workset-id: string,
+    name: string,
+    repository-name: string,
+    color: color,
+    is-current: bool,
+    is-parking-target: bool,
+    // このセットの登録ウィンドウのうち、今開いている数と総数。全部閉じている
+    // セットを一目で見分けられるようにする。
+    windows-open: int,
+    windows-total: int,
+    // Codex agent status (PLAN.md §6, Phase 8). Always shown now: `agent-symbol`
+    // + `agent-status-label` (✓成功 / ×失敗 / ●実行中・入力待ち / —未実行),
+    // coloured by `agent-status-color`.
+    agent-status-color: color,
+    agent-symbol: string,
+    agent-status-label: string,
+    agent-elapsed-text: string,
+    // 実行中・入力待ちなど「今まさに動いている」状態か。真のとき状態表示を
+    // 目立つピル（色付き背景＋大きめ太字）で描く。未実行/成功/失敗は控えめのまま。
+    agent-is-active: bool,
+    // Git working-tree status (empty for non-git repos, filled by a background
+    // refresh): current branch, "変更N" change count, "↑N未push" unpushed
+    // commits, and "最終commit" age.
+    branch-text: string,
+    changed-text: string,
+    unpushed-text: string,
+    last-commit-text: string,
+    // GitHub status via `gh` (filled by a slower background refresh): the
+    // current branch's open PR ("PR #18" / "PR ×N"), and the latest CI run
+    // (`ci-symbol` ✓/✕/●/— + `ci-text` 成功/失敗/実行中/未実行, `ci-color`).
+    pr-text: string,
+    ci-symbol: string,
+    ci-text: string,
+    ci-color: color,
+}
+
+export component QuickSwitcher inherits Window {
+    title: "RepoDeck — クイックスイッチャー";
+    icon: @image-url("../assets/repodeck-icon.svg");
+    no-frame: true;
+    always-on-top: true;
+    width: 820px;
+    height: 880px;
+    background: transparent;
+    default-font-family: Theme.font-text;
+
+    in property <[QuickSwitcherRow]> rows: [];
+    in-out property <int> selected-index: 0;
+    in-out property <string> filter-text: "";
+    // 起動していない（開いているウィンドウが1つも無い）セットを一覧から隠す
+    // トグル。状態はここが持ち、行の絞り込み自体は Rust 側で行う。
+    in-out property <bool> hide-closed: false;
+    in property <string> status-text: "";
+    in property <bool> status-is-warning: false;
+    // True only while Windows' "Transparency effects" setting is on — see
+    // `glass-base-translucent` in theme.slint for why this is gated.
+    in property <bool> translucent: false;
+
+    // Fires on every edit of the search field, including IME (Japanese) commits —
+    // a real `TextInput` is used instead of manual key capture precisely so
+    // composed input works.
+    callback filter-changed(text: string);
+    /// 「起動中のみ」トグルの切替後に発火。Rust 側は hide-closed を読み直して
+    /// 行を作り直すだけでよい。
+    callback hide-closed-toggled();
+    callback switch-requested(workset-id: string);
+    /// Close every live window belonging to that set (its apps quit; the set
+    /// itself stays registered and re-opens on the next switch).
+    callback close-workset-requested(workset-id: string);
+    callback recover-requested();
+    callback settings-requested();
+    callback manager-requested();
+    callback empty-main-requested();
+    callback close-requested();
+    /// セットの並び順を1つ上/下へ動かす（手動順を書き換える）。
+    callback move-workset-up(workset-id: string);
+    callback move-workset-down(workset-id: string);
+
+    backdrop := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: root.translucent ? Theme.glass-base-translucent : Theme.glass-base;
+        border-width: 1px;
+        border-color: Theme.hairline-bright;
+        border-radius: Theme.radius-lg;
+    }
+
+    forward-focus: search-input;
+
+    VerticalLayout {
+            padding: Theme.space-md;
+            spacing: Theme.space-sm;
+
+            HorizontalLayout {
+                spacing: Theme.space-xs;
+                height: 40px;
+                Rectangle {
+                    border-radius: Theme.radius-md;
+                    background: Theme.glass-panel-soft;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+                    clip: true;
+
+                    // Placeholder shown behind the input when it's empty.
+                    if root.filter-text == "": Text {
+                        x: Theme.space-sm;
+                        text: "検索…";
+                        color: Theme.text-tertiary;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                    }
+
+                    // A real `TextInput` (not manual key capture) so IME /
+                    // Japanese input works. Navigation keys are intercepted in
+                    // `key-pressed`; everything else falls through to normal
+                    // editing and composition.
+                    search-input := TextInput {
+                        x: Theme.space-sm;
+                        width: parent.width - 2 * Theme.space-sm;
+                        text <=> root.filter-text;
+                        color: Theme.text-primary;
+                        font-size: 15px;
+                        vertical-alignment: center;
+                        single-line: true;
+                        edited => { root.filter-changed(self.text); }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.close-requested();
+                                return accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                // Wraps: pressing up at the top jumps to the
+                                // bottom slot, mirroring the hold-to-cycle keys.
+                                root.selected-index = Math.mod(root.selected-index + root.rows.length, root.rows.length + 1);
+                                return accept;
+                            }
+                            if (event.text == Key.DownArrow) {
+                                // Wraps: the last slot (index == rows.length) is
+                                // the "empty the main screen" action; going one
+                                // further wraps back to the top.
+                                root.selected-index = Math.mod(root.selected-index + 1, root.rows.length + 1);
+                                return accept;
+                            }
+                            if (event.text == Key.Return) {
+                                if (root.selected-index >= root.rows.length) {
+                                    root.empty-main-requested();
+                                } else if (root.rows.length > 0) {
+                                    root.switch-requested(root.rows[root.selected-index].workset-id);
+                                }
+                                return accept;
+                            }
+                            if (event.modifiers.control && event.text == ",") {
+                                root.settings-requested();
+                                return accept;
+                            }
+                            if (event.modifiers.control && event.text == "m") {
+                                root.manager-requested();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                }
+
+                // 「起動中のみ」: 起動していないセットを一覧から隠すトグル。
+                // ON のときはアクセント枠＋選択背景で押し込み状態を示す。
+                hide-closed-button := Rectangle {
+                    width: 104px;
+                    border-radius: Theme.radius-md;
+                    background: root.hide-closed
+                        ? Theme.glass-selected
+                        : (hide-closed-touch.pressed || hide-closed-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft);
+                    border-width: 1px;
+                    border-color: root.hide-closed ? Theme.accent : Theme.hairline;
+                    animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
+
+                    Text {
+                        text: "起動中のみ";
+                        color: root.hide-closed ? Theme.text-primary : Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    hide-closed-touch := TouchArea {
+                        clicked => {
+                            root.hide-closed = !root.hide-closed;
+                            root.hide-closed-toggled();
+                        }
+                    }
+                }
+
+                manage-button := Rectangle {
+                    width: 104px;
+                    border-radius: Theme.radius-md;
+                    background: manage-touch.pressed || manage-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                    Text {
+                        text: "セット管理";
+                        color: Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    manage-touch := TouchArea {
+                        clicked => { root.manager-requested(); }
+                    }
+                }
+
+                close-button := Rectangle {
+                    width: 32px;
+                    border-radius: Theme.radius-md;
+                    background: close-touch.pressed || close-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                    // Uses "×" (U+00D7), which Segoe UI Variable Text includes,
+                    // rather than "✕" (U+2715) which the font lacks and renders as
+                    // a tofu box.
+                    Text {
+                        text: "×";
+                        color: Theme.text-secondary;
+                        font-size: 20px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    close-touch := TouchArea {
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            list-clip := Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                // Wraps the row list so the mouse wheel moves the selection the
+                // same way up/down do. Row clicks are handled by each row's own
+                // TouchArea; only unhandled scroll events bubble up to here.
+                TouchArea {
+                    scroll-event(event) => {
+                        // Wraps at both ends, same as the arrow / cycle keys.
+                        if (event.delta-y < 0) {
+                            root.selected-index = Math.mod(root.selected-index + 1, root.rows.length + 1);
+                        } else if (event.delta-y > 0) {
+                            root.selected-index = Math.mod(root.selected-index + root.rows.length, root.rows.length + 1);
+                        }
+                        return accept;
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-xs;
+
+                        // Scroll so the selected row is always visible even with
+                        // more rows than fit (kept roughly centred). row-h = row
+                        // height (62) + inter-row spacing.
+                        property <length> row-h: 104px + Theme.space-xs;
+                        property <length> content-h: root.rows.length * self.row-h;
+                        y: -Math.clamp(
+                            Math.min(root.selected-index, root.rows.length) * self.row-h
+                                + self.row-h / 2 - list-clip.height / 2,
+                            0px,
+                            Math.max(0px, self.content-h - list-clip.height)
+                        );
+
+                        for row[i] in root.rows: Rectangle {
+                        height: 104px;
+                        border-radius: Theme.radius-md;
+                        // The up/down selection is shown by the accent border;
+                        // the current workset by the filled background.
+                        background: row.is-current ? Theme.glass-selected : Theme.glass-panel-soft;
+                        border-width: i == root.selected-index ? 2px : 1px;
+                        border-color: i == root.selected-index ? Theme.accent : Theme.hairline;
+                        animate background, border-color { duration: Theme.duration-fast; easing: ease-out; }
+
+                        // Declared *before* the content so the row-wide click
+                        // target sits underneath it — otherwise it would cover
+                        // the per-row 閉じる button and swallow its clicks.
+                        TouchArea {
+                            clicked => {
+                                root.selected-index = i;
+                                root.switch-requested(row.workset-id);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding: Theme.space-sm;
+                            spacing: Theme.space-sm;
+
+                            // 左のカラーバーはセットの識別色。ウィンドウが全部
+                            // 閉じているセットは、色を消して沈んだ灰色にする。
+                            // 文字を読まなくても「これは閉じている」と一瞬で分かる。
+                            //
+                            // ここで `opacity` は使わない。Slint は不透明度を指定した
+                            // 要素をオフスクリーンのテクスチャへ描いてから合成するため、
+                            // スクロールで y が半端な位置になると再サンプリングされて
+                            // 文字がボケる。減光は「色そのもの」で表現する。
+                            Rectangle {
+                                width: 10px;
+                                border-radius: 5px;
+                                background: row.windows-total > 0 && row.windows-open == 0
+                                    ? Theme.closed-dim
+                                    : row.color;
+                                animate background { duration: Theme.duration-fast; easing: ease-out; }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 3px;
+                                horizontal-stretch: 1;
+
+                                // Line 1: name + badges … right: agent status.
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    Text {
+                                        text: row.name;
+                                        font-size: 18px;
+                                        font-weight: 600;
+                                        // 閉じているセットは名前も沈める（色で減光）。
+                                        color: row.windows-total > 0 && row.windows-open == 0
+                                            ? Theme.closed-dim
+                                            : Theme.text-primary;
+                                        overflow: elide;
+                                    }
+                                    if row.is-current: Text {
+                                        text: "現在";
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                        color: Theme.accent;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.is-parking-target: Text {
+                                        text: "固定枠";
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                        vertical-alignment: center;
+                                    }
+
+
+                                    Rectangle { horizontal-stretch: 1; }
+
+                                    // 状態ピル。実行中・入力待ちのときは色付き背景で
+                                    // 大きく目立たせ、それ以外（未実行/成功/失敗）は
+                                    // 従来どおり控えめのテキストに留める。
+                                    Rectangle {
+                                        border-radius: 7px;
+                                        background: row.agent-is-active ? row.agent-status-color.with-alpha(0.22) : transparent;
+                                        border-width: row.agent-is-active ? 1px : 0px;
+                                        border-color: row.agent-status-color.with-alpha(0.55);
+                                        horizontal-stretch: 0;
+
+                                        HorizontalLayout {
+                                            padding-left: row.agent-is-active ? 9px : 0px;
+                                            padding-right: row.agent-is-active ? 9px : 0px;
+                                            padding-top: row.agent-is-active ? 3px : 0px;
+                                            padding-bottom: row.agent-is-active ? 3px : 0px;
+                                            spacing: 5px;
+
+                                            Text {
+                                                text: row.agent-symbol;
+                                                font-size: row.agent-is-active ? 19px : 15px;
+                                                color: row.agent-status-color;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: row.agent-elapsed-text == "" ? row.agent-status-label : row.agent-status-label + " · " + row.agent-elapsed-text;
+                                                font-size: row.agent-is-active ? 17px : 14px;
+                                                font-weight: row.agent-is-active ? 700 : 400;
+                                                color: row.agent-is-active ? row.agent-status-color : Theme.text-secondary;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Line 2: branch · 変更N · 最終commit (falls back
+                                // to the folder name for a non-git repo).
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    Text {
+                                        text: row.branch-text == "" ? row.repository-name : row.branch-text;
+                                        font-size: 14px;
+                                        color: row.windows-total > 0 && row.windows-open == 0
+                                            ? Theme.closed-dim
+                                            : (row.branch-text == "" ? Theme.text-secondary : Theme.text-primary);
+                                        overflow: elide;
+                                    }
+                                    if row.changed-text != "": Text {
+                                        text: "·";
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.changed-text != "": Text {
+                                        text: row.changed-text;
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.unpushed-text != "": Text {
+                                        text: "·";
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.unpushed-text != "": Text {
+                                        text: row.unpushed-text;
+                                        font-size: 14px;
+                                        color: Theme.accent;
+                                    }
+                                    if row.last-commit-text != "": Text {
+                                        text: "·";
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.last-commit-text != "": Text {
+                                        text: row.last-commit-text;
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+
+                                // Line 3: GitHub — open PR for this branch and
+                                // the latest CI result. Hidden when gh has
+                                // nothing to show for the repo.
+                                HorizontalLayout {
+                                    spacing: Theme.space-xs;
+                                    if row.pr-text != "": Text {
+                                        text: row.pr-text;
+                                        font-size: 14px;
+                                        color: Theme.text-secondary;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.pr-text != "" && row.ci-text != "": Text {
+                                        text: "·";
+                                        font-size: 14px;
+                                        color: Theme.text-tertiary;
+                                    }
+                                    if row.ci-text != "": Text {
+                                        text: row.ci-symbol;
+                                        font-size: 15px;
+                                        color: row.ci-color;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.ci-text != "": Text {
+                                        text: "CI " + row.ci-text;
+                                        font-size: 14px;
+                                        color: Theme.text-secondary;
+                                        vertical-alignment: center;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            // 右端の操作を1列に：×（上）／▲／▼。並び替えは手動順を
+                            // 書き換えるので、絞り込み中（画面順＝全体順でない）は
+                            // ▲▼を隠す。端の行は片方を無効化。
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 3px;
+
+                                // ×（最上段）: このセットのアプリを閉じる（切替はしない）。
+                                Rectangle {
+                                    width: 30px;
+                                    height: 28px;
+                                    border-radius: Theme.radius-sm;
+                                    background: quit-touch.pressed || quit-touch.has-hover ? Theme.danger : Theme.glass-panel-strong;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+                                    // "×" (U+00D7): the font lacks U+2715.
+                                    Text {
+                                        text: "×";
+                                        font-size: 18px;
+                                        color: quit-touch.has-hover ? Theme.text-primary : Theme.text-tertiary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    quit-touch := TouchArea {
+                                        clicked => { root.close-workset-requested(row.workset-id); }
+                                    }
+                                }
+
+                                if root.filter-text == "": Rectangle {
+                                    width: 30px;
+                                    height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: up-touch.has-hover && i > 0 ? Theme.glass-hover : Theme.glass-panel-strong;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+                                    Text {
+                                        text: "▲";
+                                        font-size: 12px;
+                                        // 端の行では押せないので沈めるが、`opacity` は
+                                        // 使わない（テクスチャ合成で滲むため）。
+                                        color: i > 0 ? Theme.text-secondary : Theme.closed-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    up-touch := TouchArea {
+                                        enabled: i > 0;
+                                        clicked => { root.move-workset-up(row.workset-id); }
+                                    }
+                                }
+                                if root.filter-text == "": Rectangle {
+                                    width: 30px;
+                                    height: 24px;
+                                    border-radius: Theme.radius-sm;
+                                    background: down-touch.has-hover && i < root.rows.length - 1 ? Theme.glass-hover : Theme.glass-panel-strong;
+                                    animate background { duration: Theme.duration-fast; easing: ease-out; }
+                                    Text {
+                                        text: "▼";
+                                        font-size: 12px;
+                                        color: i < root.rows.length - 1 ? Theme.text-secondary : Theme.closed-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    down-touch := TouchArea {
+                                        enabled: i < root.rows.length - 1;
+                                        clicked => { root.move-workset-down(row.workset-id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+                }
+            }
+
+            if root.status-text != "": HorizontalLayout {
+                spacing: Theme.space-xs;
+                Text {
+                    text: root.status-text;
+                    font-size: 14px;
+                    color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+                if root.status-is-warning: GlassButton {
+                    text: "回収する";
+                    clicked => { root.recover-requested(); }
+                }
+            }
+
+            // Always-available action: clear the main screen. It is also the
+            // selectable slot at index == rows.length, so it lights up (accent
+            // fill) when reached by up/down or the mouse wheel.
+            GlassButton {
+                text: "メイン画面を空にする";
+                primary: root.selected-index >= root.rows.length;
+                clicked => { root.empty-main-requested(); }
+            }
+    }
+}

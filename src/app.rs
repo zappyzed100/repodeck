@@ -1,10 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use slint::Model;
+use slint::{Model, Timer, TimerMode};
 use tracing_appender::non_blocking::WorkerGuard;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, WAIT_OBJECT_0,
@@ -12,21 +13,47 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, WaitForSingleObject,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+use windows::Win32::UI::WindowsAndMessaging::{
+    IDNO, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MessageBoxW,
+};
 use windows::core::HSTRING;
 
+use crate::application::agent_status_service;
+use crate::application::crash_recovery::{self, JournalRecoveryChoice};
+use crate::application::display_recovery_service::{self, RecoveryDecision};
+use crate::application::integrity_service;
+use crate::application::launch_service;
 use crate::application::layout_service::{self, UndoEntry, UndoSnapshot};
+use crate::application::monitor_identity::{self, LiveMonitor};
+use crate::application::monitor_watch_service;
+use crate::application::popup_placement;
+use crate::application::quick_switcher_service;
+use crate::application::switch_coordinator::{SwitchCoordinator, SwitchRequest};
+use crate::application::window_ops::WindowOps;
 use crate::application::workset_service;
 use crate::diagnostics::logging;
-use crate::domain::config::AppConfig;
+use crate::domain::agent::{
+    AgentRun, AgentState, row_display_priority, state_color, tray_priority,
+};
+use crate::domain::config::{AppConfig, HotkeyConfig, HotkeyModifier, SortMode};
 use crate::domain::monitor::AutoSplit;
 use crate::domain::placement::SavedShowState;
-use crate::domain::workset::ManagedWindow;
-use crate::persistence::{clock, config_store};
+use crate::domain::workset::ParkingPolicy;
+use crate::hotkey::mouse_wheel_hook::MouseWheelHook;
+use crate::hotkey::win32_hotkey::{self, HotkeyEvent, HotkeyRegisterError, HotkeyThread};
+use crate::ipc::named_pipe::{self, NamedPipeServer, PipeServerEvent};
+use crate::ipc::protocol;
+use crate::persistence::{clock, config_store, journal_store, runtime_store};
+use crate::windowing::autostart;
 use crate::windowing::enumerate::{self, TopLevelWindow};
 use crate::windowing::matcher::MatchDecision;
 use crate::windowing::monitor::{self, MonitorInfo};
 use crate::windowing::placement as win_placement;
+use crate::windowing::popup_window;
+use crate::windowing::window_ops_impl::Win32WindowOps;
+use crate::windowing::{display_reset, display_watch, power_watch};
 
 slint::include_modules!();
 
@@ -44,10 +71,14 @@ const SHOW_REQUEST_EVENT_NAME: &str = r"Local\RepoDeck.ShowRequested.v1";
 /// icon is created.
 const APP_USER_MODEL_ID: &str = "RepoDeck.App";
 
-/// Logical-pixel size assumed for the monitor canvas projection (PLAN.md §15's
-/// "モニター図は実座標比率を維持"). This matches `layout-studio.slint`'s default
-/// window size; it is not recomputed if the user resizes the window, so very
-/// large/small windows will show the canvas letterboxed rather than filling it.
+/// Fallback logical-pixel size for the monitor canvas projection (PLAN.md
+/// §15's "モニター図は実座標比率を維持"), used only for the very first tile
+/// refresh — before the window has ever been shown, `canvas-frame` (the card
+/// the tiles are drawn into) hasn't been laid out yet, so its real size isn't
+/// known. Once `layout-studio.slint`'s `canvas-resized` callback reports the
+/// card's actual size, `LayoutStudioState::canvas_width/height` are updated to
+/// match and every subsequent projection uses the real bounds instead of this
+/// guess.
 const CANVAS_WIDTH: f64 = 700.0;
 const CANVAS_HEIGHT: f64 = 480.0;
 const CANVAS_PADDING: f64 = 12.0;
@@ -192,6 +223,37 @@ fn apply_glass_backdrop(window: &slint::Window) {
     }
 }
 
+/// Whether Windows' "Transparency effects" personalization setting
+/// (設定 > 個人用設定 > 色) is currently on. Gates the Quick Switcher's
+/// translucent backdrop: with the setting off, DWM doesn't blur behind the
+/// window, and any backdrop alpha < 1.0 shows other windows' text sharply
+/// through the popup (see `glass-base` in `ui/theme.slint`). Checked once at
+/// startup; toggling the Windows setting takes effect on the next launch.
+fn transparency_effects_enabled() -> bool {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+
+    let path = HSTRING::from(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = HSTRING::from("EnableTransparency");
+    let mut value: u32 = 0;
+    let mut size = u32::try_from(std::mem::size_of::<u32>()).unwrap();
+    // SAFETY: `path`/`name` are valid, NUL-terminated wide strings for the
+    // duration of the call; `value`/`size` describe a DWORD-sized buffer,
+    // matching `RRF_RT_REG_DWORD`.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &path,
+            &name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(std::ptr::from_mut(&mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    status == ERROR_SUCCESS && value == 1
+}
+
 fn load_or_default_config(data_dir: &Path) -> AppConfig {
     match config_store::load(data_dir) {
         Ok(Some(result)) => {
@@ -200,7 +262,21 @@ fn load_or_default_config(data_dir: &Path) -> AppConfig {
                     "config.json was unreadable; recovered settings from config.backup.json"
                 );
             }
-            result.config
+            let mut config = result.config;
+            // 宣言時にアプリ名を針にしていた古い VS Code エントリを、開いている
+            // フォルダ名の針へ移行する。保存に失敗しても今回の起動には効いている
+            // ので、次回また移行するだけ。
+            let retitled = launch_service::retitle_declared_vscode_windows(&mut config.worksets);
+            if retitled > 0 {
+                tracing::info!(
+                    retitled,
+                    "migrated declared VS Code windows to a folder title needle"
+                );
+                if let Err(err) = config_store::save(data_dir, &config) {
+                    tracing::warn!(error = %err, "failed to save the migrated config");
+                }
+            }
+            config
         }
         Ok(None) => {
             tracing::info!("no config.json found; starting from defaults (first run)");
@@ -219,12 +295,17 @@ fn load_or_default_config(data_dir: &Path) -> AppConfig {
 /// undo snapshot for "メインを空にする" (PLAN.md §3.5).
 struct LayoutStudioState {
     monitors: Vec<MonitorInfo>,
-    auto_splits: HashMap<String, AutoSplit>,
-    selecting_main: bool,
-    pending_main_ids: Vec<String>,
+    /// Unsaved per-monitor split edits; the value is `None` for 「自動」.
+    auto_splits: HashMap<String, Option<AutoSplit>>,
+    /// Unsaved per-monitor 「操作対象にしない」 edits.
+    excluded_overrides: HashMap<String, bool>,
     selected_index: Option<usize>,
     undo_snapshot: UndoSnapshot,
     pending_candidates: Vec<TopLevelWindow>,
+    /// The canvas card's real on-screen size, kept in sync with
+    /// `canvas-resized` (see `CANVAS_WIDTH`/`CANVAS_HEIGHT`'s doc comment).
+    canvas_width: f64,
+    canvas_height: f64,
 }
 
 impl LayoutStudioState {
@@ -232,34 +313,54 @@ impl LayoutStudioState {
         Self {
             monitors: Vec::new(),
             auto_splits: HashMap::new(),
-            selecting_main: false,
-            pending_main_ids: Vec::new(),
+            excluded_overrides: HashMap::new(),
             selected_index: None,
             undo_snapshot: UndoSnapshot::default(),
             pending_candidates: Vec::new(),
+            canvas_width: CANVAS_WIDTH,
+            canvas_height: CANVAS_HEIGHT,
         }
     }
 
-    fn auto_split_for(&self, config: &AppConfig, device_name: &str) -> AutoSplit {
-        self.auto_splits
-            .get(device_name)
-            .copied()
-            .or_else(|| {
-                config
-                    .monitors
-                    .iter()
-                    .find(|saved| saved.stable_id == device_name)
-                    .map(|saved| saved.auto_split)
-            })
-            .unwrap_or(AutoSplit::One)
+    /// The monitor's effective split choice: unsaved edit first, then the
+    /// saved config; `None` means 「自動」 (also the default for monitors
+    /// never configured).
+    fn auto_split_for(&self, config: &AppConfig, device_name: &str) -> Option<AutoSplit> {
+        if let Some(&choice) = self.auto_splits.get(device_name) {
+            return choice;
+        }
+        config
+            .monitors
+            .iter()
+            .find(|saved| saved.stable_id == device_name)
+            .and_then(|saved| saved.auto_split)
+    }
+
+    /// The monitor's effective 「操作対象にしない」 state, unsaved edit first.
+    fn excluded_for(&self, config: &AppConfig, device_name: &str) -> bool {
+        if let Some(&excluded) = self.excluded_overrides.get(device_name) {
+            return excluded;
+        }
+        config
+            .monitors
+            .iter()
+            .find(|saved| saved.stable_id == device_name)
+            .is_some_and(|saved| saved.excluded)
     }
 }
 
-fn auto_split_label(split: AutoSplit) -> &'static str {
+/// Tile caption for a non-main monitor's split: 「自動」 shows what it
+/// currently resolves to so the choice is never a black box.
+fn auto_split_label(
+    split: Option<AutoSplit>,
+    work_area: crate::domain::placement::PixelRect,
+) -> String {
     match split {
-        AutoSplit::One => "AUTO (1分割)",
-        AutoSplit::TwoColumns => "AUTO (2分割)",
-        AutoSplit::FourGrid => "AUTO (4分割)",
+        None => format!(
+            "自動 ({}分割)",
+            layout_service::resolve_auto_split(work_area).cell_count()
+        ),
+        Some(split) => format!("{}分割", split.cell_count()),
     }
 }
 
@@ -277,17 +378,13 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
         }
     };
 
-    let main_ids: &[String] = if state.selecting_main {
-        &state.pending_main_ids
-    } else {
-        &config.main_monitor_ids
-    };
+    let main_ids: &[String] = &config.main_monitor_ids;
 
     let bounds: Vec<_> = monitors.iter().map(|m| m.bounds_px).collect();
     let canvas_rects = layout_service::project_monitors_to_canvas(
         &bounds,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT,
+        state.canvas_width,
+        state.canvas_height,
         CANVAS_PADDING,
     );
 
@@ -297,10 +394,19 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
         .enumerate()
         .map(|(index, (monitor, rect))| {
             let main_order = main_ids.iter().position(|id| id == &monitor.device_name);
+            let excluded = state.excluded_for(config, &monitor.device_name);
+            let sub = config
+                .sub_screens
+                .iter()
+                .find(|s| s.monitor_ids.iter().any(|id| id == &monitor.device_name));
             let split = state.auto_split_for(config, &monitor.device_name);
             let role_label = match main_order {
                 Some(order) => format!("MAIN {}", order + 1),
-                None => auto_split_label(split).to_string(),
+                None if excluded => "対象外".to_string(),
+                None => match sub {
+                    Some(s) => format!("サブ: {}", s.name),
+                    None => auto_split_label(split, monitor.work_area_px),
+                },
             };
             let dpi_percent = monitor.dpi_x * 100 / 96;
 
@@ -317,6 +423,8 @@ fn refresh_monitor_tiles(layout: &LayoutStudio, config: &AppConfig, state: &mut 
                 .into(),
                 role_label: role_label.into(),
                 is_main: main_order.is_some(),
+                is_sub: sub.is_some(),
+                is_excluded: excluded,
                 selected: state.selected_index == Some(index),
             }
         })
@@ -351,11 +459,14 @@ fn refresh_selected_monitor_panel(
 
     layout.set_selected_has_monitor(true);
     layout.set_selected_is_main(is_main);
+    layout.set_selected_excluded(state.excluded_for(config, &monitor.device_name));
     layout.set_selected_auto_split(match split {
-        AutoSplit::One => 1,
-        AutoSplit::TwoColumns => 2,
-        AutoSplit::FourGrid => 4,
+        None => 0,
+        Some(AutoSplit::One) => 1,
+        Some(AutoSplit::TwoColumns) => 2,
+        Some(AutoSplit::FourGrid) => 4,
     });
+    layout.set_selected_monitor_index(i32::try_from(index).unwrap_or(-1));
     layout.set_selected_monitor_detail(
         format!(
             "{}\n{}×{} (作業領域 {}×{})\nDPI {}%{}",
@@ -373,6 +484,62 @@ fn refresh_selected_monitor_panel(
         )
         .into(),
     );
+
+    refresh_sub_screen_rows(layout, config, monitor.device_name.as_str());
+}
+
+/// Removes `device_name` from every sub-screen. Used to keep a monitor's role
+/// exclusive (a monitor is main, a sub-screen member, excluded, or normal — not
+/// several at once).
+fn remove_monitor_from_all_sub_screens(config: &mut AppConfig, device_name: &str) {
+    for sub in &mut config.sub_screens {
+        sub.monitor_ids.retain(|id| id != device_name);
+    }
+}
+
+/// Rebuilds the Layout Studio's sub-screen list, marking which ones contain
+/// `device_name` (the selected monitor).
+/// The sub-screen "region" options the region button cycles through: whole
+/// area, left/right half, and the four quarters, as `(split, cell, label)`.
+const SUB_REGIONS: [(AutoSplit, usize, &str); 7] = [
+    (AutoSplit::One, 0, "全体"),
+    (AutoSplit::TwoColumns, 0, "左半分"),
+    (AutoSplit::TwoColumns, 1, "右半分"),
+    (AutoSplit::FourGrid, 0, "左上¼"),
+    (AutoSplit::FourGrid, 1, "右上¼"),
+    (AutoSplit::FourGrid, 2, "左下¼"),
+    (AutoSplit::FourGrid, 3, "右下¼"),
+];
+
+fn sub_region_label(split: AutoSplit, cell: usize) -> &'static str {
+    SUB_REGIONS
+        .iter()
+        .find(|(s, c, _)| *s == split && *c == cell)
+        .map_or("全体", |(_, _, label)| label)
+}
+
+/// The next `(split, cell)` in the region cycle after the given one.
+fn next_sub_region(split: AutoSplit, cell: usize) -> (AutoSplit, usize) {
+    let idx = SUB_REGIONS
+        .iter()
+        .position(|(s, c, _)| *s == split && *c == cell)
+        .unwrap_or(0);
+    let (s, c, _) = SUB_REGIONS[(idx + 1) % SUB_REGIONS.len()];
+    (s, c)
+}
+
+fn refresh_sub_screen_rows(layout: &LayoutStudio, config: &AppConfig, device_name: &str) {
+    let rows: Vec<SubScreenRow> = config
+        .sub_screens
+        .iter()
+        .map(|s| SubScreenRow {
+            name: s.name.clone().into(),
+            assigned: s.monitor_ids.iter().any(|id| id == device_name),
+            region_label: sub_region_label(s.split, s.cell_index).into(),
+            fullscreen: s.fullscreen,
+        })
+        .collect();
+    layout.set_sub_screen_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
 }
 
 fn resolve_main_monitor_bounds(
@@ -426,33 +593,27 @@ fn wire_layout_studio(
     let l = layout.as_weak();
     let c = config.clone();
     let s = state.clone();
+    layout.on_canvas_resized(move |width, height| {
+        let (width, height) = (width as f64, height as f64);
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let Some(layout) = l.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        state.canvas_width = width;
+        state.canvas_height = height;
+        refresh_monitor_tiles(&layout, &c.borrow(), &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
     layout.on_refresh_requested(move || {
         if let Some(layout) = l.upgrade() {
             let mut state = s.borrow_mut();
             refresh_monitor_tiles(&layout, &c.borrow(), &mut state);
             layout.set_status_text("モニター一覧を更新しました。".into());
             layout.set_status_is_warning(false);
-        }
-    });
-
-    let l = layout.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    layout.on_toggle_select_main_mode(move || {
-        if let Some(layout) = l.upgrade() {
-            let mut state = s.borrow_mut();
-            let config = c.borrow();
-            if state.selecting_main {
-                state.selecting_main = false;
-                layout.set_status_text("メイン画面選択をキャンセルしました。".into());
-            } else {
-                state.selecting_main = true;
-                state.pending_main_ids = config.main_monitor_ids.clone();
-                layout.set_status_text("メイン画面にするモニターをクリックしてください。".into());
-            }
-            layout.set_status_is_warning(false);
-            layout.set_selecting_main(state.selecting_main);
-            refresh_monitor_tiles(&layout, &config, &mut state);
         }
     });
 
@@ -466,49 +627,238 @@ fn wire_layout_studio(
         };
         let mut state = s.borrow_mut();
         let config = c.borrow();
-
-        if state.selecting_main {
-            let Some(monitor) = state.monitors.get(index) else {
-                return;
-            };
-            let device_name = monitor.device_name.clone();
-            if let Some(pos) = state
-                .pending_main_ids
-                .iter()
-                .position(|id| id == &device_name)
-            {
-                state.pending_main_ids.remove(pos);
-            } else {
-                state.pending_main_ids.push(device_name);
-            }
-        } else {
-            state.selected_index = Some(index);
-            refresh_selected_monitor_panel(&layout, &config, &state);
-        }
+        state.selected_index = Some(index);
+        refresh_selected_monitor_panel(&layout, &config, &state);
         refresh_monitor_tiles(&layout, &config, &mut state);
     });
 
     let l = layout.as_weak();
     let c = config.clone();
     let s = state.clone();
-    layout.on_apply_main_selection(move || {
+    layout.on_toggle_main_requested(move || {
         let Some(layout) = l.upgrade() else { return };
         let mut state = s.borrow_mut();
         let mut config = c.borrow_mut();
+        let Some(monitor) = state.selected_index.and_then(|i| state.monitors.get(i)) else {
+            return;
+        };
+        let device_name = monitor.device_name.clone();
 
-        if state.pending_main_ids.is_empty() {
-            layout.set_status_text("メイン画面は1台以上選択してください。".into());
+        if let Some(pos) = config
+            .main_monitor_ids
+            .iter()
+            .position(|id| id == &device_name)
+        {
+            config.main_monitor_ids.remove(pos);
+            layout.set_status_text(
+                "メイン画面から外しました。「設定を保存」で確定してください。".into(),
+            );
+        } else {
+            config.main_monitor_ids.push(device_name.clone());
+            // Main is mutually exclusive with 対象外 and sub-screen membership.
+            state.excluded_overrides.insert(device_name.clone(), false);
+            remove_monitor_from_all_sub_screens(&mut config, &device_name);
+            layout.set_status_text(
+                "メイン画面に登録しました。「設定を保存」で確定してください。".into(),
+            );
+        }
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_toggle_excluded_requested(move || {
+        let Some(layout) = l.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        let Some(monitor) = state.selected_index.and_then(|i| state.monitors.get(i)) else {
+            return;
+        };
+        let device_name = monitor.device_name.clone();
+
+        let excluded = !state.excluded_for(&config, &device_name);
+        state
+            .excluded_overrides
+            .insert(device_name.clone(), excluded);
+        if excluded {
+            // 対象外 is mutually exclusive with main and sub-screen membership.
+            if let Some(pos) = config
+                .main_monitor_ids
+                .iter()
+                .position(|id| id == &device_name)
+            {
+                config.main_monitor_ids.remove(pos);
+            }
+            remove_monitor_from_all_sub_screens(&mut config, &device_name);
+            layout.set_status_text(
+                "このモニターを操作対象から外しました。「設定を保存」で確定してください。".into(),
+            );
+        } else {
+            layout.set_status_text(
+                "このモニターを操作対象に戻しました。「設定を保存」で確定してください。".into(),
+            );
+        }
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    // --- Sub-screen (退避先) management ---
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_add(move |name| {
+        let Some(layout) = l.upgrade() else { return };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            layout.set_status_text("サブ画面の名前を入力してください。".into());
             layout.set_status_is_warning(true);
             return;
         }
-
-        config.main_monitor_ids = state.pending_main_ids.clone();
-        state.selecting_main = false;
-        layout.set_selecting_main(false);
-        layout
-            .set_status_text("メイン画面を更新しました。「設定を保存」で確定してください。".into());
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if config.sub_screens.iter().any(|sub| sub.name == name) {
+            layout.set_status_text("同じ名前のサブ画面が既にあります。".into());
+            layout.set_status_is_warning(true);
+            return;
+        }
+        config.sub_screens.push(crate::domain::config::SubScreen {
+            id: uuid::Uuid::new_v4(),
+            name: name.clone(),
+            monitor_ids: Vec::new(),
+            split: AutoSplit::One,
+            cell_index: 0,
+            fullscreen: false,
+        });
+        layout.set_status_text(
+            format!("サブ画面「{name}」を追加しました。モニターを割り当ててください。").into(),
+        );
         layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
         refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    layout.on_sub_screen_delete(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if index >= config.sub_screens.len() {
+            return;
+        }
+        let removed = config.sub_screens.remove(index);
+        // Any workset that parked to this sub-screen falls back to 自動.
+        for workset in &mut config.worksets {
+            if workset.parking_policy
+                == (crate::domain::workset::ParkingPolicy::SubScreen {
+                    sub_screen_id: removed.id,
+                })
+            {
+                workset.parking_policy = crate::domain::workset::ParkingPolicy::Auto;
+            }
+        }
+        let _ = config_store::save(&dir, &config);
+        layout.set_status_text(format!("サブ画面「{}」を削除しました。", removed.name).into());
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_toggle_monitor(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        let Some(device_name) = state
+            .selected_index
+            .and_then(|i| state.monitors.get(i))
+            .map(|m| m.device_name.clone())
+        else {
+            return;
+        };
+        // A monitor can only belong to one sub-screen; assigning here removes it
+        // from any other, from main, and from 対象外.
+        let already = config
+            .sub_screens
+            .get(index)
+            .is_some_and(|sub| sub.monitor_ids.iter().any(|id| id == &device_name));
+        remove_monitor_from_all_sub_screens(&mut config, &device_name);
+        if !already {
+            if let Some(pos) = config
+                .main_monitor_ids
+                .iter()
+                .position(|id| id == &device_name)
+            {
+                config.main_monitor_ids.remove(pos);
+            }
+            state.excluded_overrides.insert(device_name.clone(), false);
+            if let Some(sub) = config.sub_screens.get_mut(index) {
+                sub.monitor_ids.push(device_name);
+            }
+        }
+        layout.set_status_text(
+            "サブ画面の割当を更新しました。「設定を保存」で確定してください。".into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_cycle_region(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let mut config = c.borrow_mut();
+        if let Some(sub) = config.sub_screens.get_mut(index) {
+            let (split, cell) = next_sub_region(sub.split, sub.cell_index);
+            sub.split = split;
+            sub.cell_index = cell;
+        }
+        layout.set_status_text(
+            "サブ画面の領域を変更しました。「設定を保存」で確定してください。".into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
+        refresh_monitor_tiles(&layout, &config, &mut state);
+    });
+
+    let l = layout.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    layout.on_sub_screen_toggle_fullscreen(move |index| {
+        let Some(layout) = l.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let state = s.borrow();
+        let mut config = c.borrow_mut();
+        if let Some(sub) = config.sub_screens.get_mut(index) {
+            sub.fullscreen = !sub.fullscreen;
+        }
+        layout.set_status_text(
+            "サブ画面の全画面設定を変更しました。「設定を保存」で確定してください。".into(),
+        );
+        layout.set_status_is_warning(false);
+        refresh_selected_monitor_panel(&layout, &config, &state);
     });
 
     let l = layout.as_weak();
@@ -527,9 +877,10 @@ fn wire_layout_studio(
         };
         let device_name = monitor.device_name.clone();
         let split = match split {
-            2 => AutoSplit::TwoColumns,
-            4 => AutoSplit::FourGrid,
-            _ => AutoSplit::One,
+            1 => Some(AutoSplit::One),
+            2 => Some(AutoSplit::TwoColumns),
+            4 => Some(AutoSplit::FourGrid),
+            _ => None, // 自動
         };
         state.auto_splits.insert(device_name, split);
 
@@ -548,7 +899,7 @@ fn wire_layout_studio(
 
         if config.main_monitor_ids.is_empty() {
             layout.set_status_text(
-                "メイン画面が未設定です。先に「メイン画面を選択」してください。".into(),
+                "メイン画面が未設定です。先にモニターを選択して「メイン画面に登録する」を押してください。".into(),
             );
             layout.set_status_is_warning(true);
             return;
@@ -705,13 +1056,18 @@ fn wire_layout_studio(
             .map(|monitor| crate::domain::monitor::SavedMonitor {
                 stable_id: monitor.device_name.clone(),
                 device_name: monitor.device_name.clone(),
-                device_path: None,
+                // ハードウェア由来の同一性。これを落とすと、あとで
+                // `\\.\DISPLAYn` が入れ替わったときに
+                // `monitor_identity::plan_remap` が bounds でしか
+                // 追跡できなくなる。
+                device_path: crate::windowing::monitor::device_interface_path(&monitor.device_name),
                 friendly_name: None,
                 bounds_px: monitor.bounds_px,
                 work_area_px: monitor.work_area_px,
                 dpi_x: monitor.dpi_x,
                 dpi_y: monitor.dpi_y,
                 auto_split: state.auto_split_for(&config, &monitor.device_name),
+                excluded: state.excluded_for(&config, &monitor.device_name),
             })
             .collect();
 
@@ -767,16 +1123,54 @@ fn match_status_label(decision: Option<&MatchDecision>) -> (String, bool) {
     }
 }
 
+/// One app queued for the set being registered: which registered launch app,
+/// the one input that app needs, and the screen it opens on.
+///
+/// A set is *declared* rather than captured — the apps need not be running (or
+/// even installed on this desktop) at registration time — so the placement is
+/// chosen here instead of read off a live window.
+#[derive(Clone)]
+struct PendingApp {
+    app: crate::domain::workset::LaunchApp,
+    /// Folder/workspace for VS Code, URL for a browser, arguments otherwise.
+    input: String,
+    /// ウィンドウごとの起動引数（UIの「引数」欄）。既定は登録アプリの引数だが、
+    /// ここで上書きできる。ブラウザーを用途別に分ける `--user-data-dir` もここ。
+    extra_args: String,
+    /// Index into `AppConfig.main_monitor_ids`.
+    monitor_index: usize,
+    /// How that monitor is divided, and which cell (reading order) this app takes.
+    split: AutoSplit,
+    cell_index: usize,
+    /// 退避時に移動せず最小化するか（`ManagedWindow::minimize_when_parked`）。
+    minimize_when_parked: bool,
+}
+
 /// UI-only Workset Manager state: the last enumerated monitor list (needed to
-/// resolve a candidate's main-monitor index at registration time), the
-/// in-progress registration form, and which workset is selected in the list.
+/// label the 画面 picker), the in-progress registration form, and which workset
+/// is selected in the list.
 struct WorksetManagerState {
     monitors: Vec<MonitorInfo>,
     registering: bool,
-    picked_repository: Option<(PathBuf, crate::domain::workset::RepositoryKind)>,
-    registration_candidates: Vec<TopLevelWindow>,
     selected_color: slint::Color,
     selected_workset_index: Option<usize>,
+    fullscreen_when_parked: bool,
+    /// "メイン画面を空にする" candidates awaiting the user's minimize choice.
+    pending_empty_candidates: Vec<TopLevelWindow>,
+    /// Rolling undo snapshot for the last "メイン画面を空にする" action.
+    empty_undo_snapshot: UndoSnapshot,
+    /// 退避先 selection for the workset being registered: -1 = 自動, otherwise
+    /// an index into `AppConfig.sub_screens`.
+    parking_selected_sub: i32,
+    /// The apps making up the set being registered, in the order they were added.
+    pending_apps: Vec<PendingApp>,
+    /// 追加済みの行を編集中なら、その `pending_apps` の位置。`None` なら、
+    /// アプリのフォームは新しい行を作るためのもの。
+    editing_pending_index: Option<usize>,
+    /// When set, the registration view is changing this existing set rather
+    /// than creating a new one, and 更新 replaces it in place (keeping its id,
+    /// created_at, sort_order and hotkey).
+    editing_workset_id: Option<uuid::Uuid>,
 }
 
 impl WorksetManagerState {
@@ -784,12 +1178,662 @@ impl WorksetManagerState {
         Self {
             monitors: Vec::new(),
             registering: false,
-            picked_repository: None,
-            registration_candidates: Vec::new(),
             selected_color: hex_to_color("#2563eb"),
             selected_workset_index: None,
+            fullscreen_when_parked: false,
+            pending_empty_candidates: Vec::new(),
+            empty_undo_snapshot: UndoSnapshot::default(),
+            parking_selected_sub: -1,
+            pending_apps: Vec::new(),
+            editing_pending_index: None,
+            editing_workset_id: None,
         }
     }
+}
+
+/// The Start Menu catalogue behind the 起動候補 registry's "スタートメニューから
+/// 選ぶ" picker (UI 1). A process-wide cache rather than manager state so the
+/// background loader thread can fill it (mirrors `GIT_CACHE`); the UI thread
+/// only ever reads it.
+static APP_CATALOG: std::sync::LazyLock<
+    std::sync::Mutex<Vec<crate::windowing::start_menu::StartMenuApp>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Reads the catalogue on a background thread and pushes it into the manager.
+/// Resolving a few hundred `.lnk` shortcuts takes long enough that doing it
+/// inline would stall opening the manager, so it loads once at startup (and
+/// again whenever the user asks for a refresh).
+fn spawn_app_catalog_load(manager: slint::Weak<WorksetManager>) {
+    std::thread::spawn(move || {
+        let apps = crate::windowing::start_menu::enumerate();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut catalog) = APP_CATALOG.lock() {
+                *catalog = apps;
+            }
+            if let Some(manager) = manager.upgrade() {
+                push_app_catalog(&manager);
+            }
+        });
+    });
+}
+
+/// Which catalogue entries the registry's picker is currently showing, as
+/// indices into `APP_CATALOG`. The picker is filtered by the search box, so the
+/// combo's row index is not the catalogue index — this maps one to the other.
+static APP_CATALOG_VIEW: std::sync::LazyLock<std::sync::Mutex<Vec<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Pushes the catalogue entries matching the registry's search box into its
+/// picker and clears the selection. An empty query shows everything.
+fn push_app_catalog(manager: &WorksetManager) {
+    let query = manager.get_registry_search().trim().to_lowercase();
+    let (names, view, total) = match APP_CATALOG.lock() {
+        Ok(catalog) => {
+            let mut names: Vec<slint::SharedString> = Vec::new();
+            let mut view: Vec<usize> = Vec::new();
+            for (index, app) in catalog.iter().enumerate() {
+                if query.is_empty() || app.name.to_lowercase().contains(&query) {
+                    names.push(app.name.clone().into());
+                    view.push(index);
+                }
+            }
+            (names, view, catalog.len())
+        }
+        Err(_) => (Vec::new(), Vec::new(), 0),
+    };
+
+    let shown = view.len();
+    if let Ok(mut current) = APP_CATALOG_VIEW.lock() {
+        *current = view;
+    }
+    manager.set_start_menu_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_registry_catalog_index(-1);
+    manager.set_registry_catalog_count(
+        if query.is_empty() {
+            format!("{total}件")
+        } else {
+            format!("{shown} / {total}件")
+        }
+        .into(),
+    );
+}
+
+/// Pushes `config.launch_apps` into both places it is shown: the registry's
+/// 登録済み list (UI 1) and the attach picker in the registration view (UI 2).
+/// Clears the picker's selection, since the indices it addresses just moved —
+/// and with it any 追加済みの行 being edited, whose 更新 needs that selection.
+fn refresh_launch_apps(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &mut WorksetManagerState,
+) {
+    let names: Vec<slint::SharedString> = config
+        .launch_apps
+        .iter()
+        .map(|app| app.name.clone().into())
+        .collect();
+    manager.set_app_catalog(std::rc::Rc::new(slint::VecModel::from(names)).into());
+
+    let rows: Vec<LaunchAppSummary> = config
+        .launch_apps
+        .iter()
+        .map(|app| LaunchAppSummary {
+            name: app.name.clone().into(),
+            program: app.program.display().to_string().into(),
+            args: app.args.clone().into(),
+        })
+        .collect();
+    manager.set_registered_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+
+    clear_pending_app_form(manager, state);
+}
+
+/// The 分割 options offered by the 画面 picker, in the order the combo lists them.
+const PLACEMENT_SPLITS: [(AutoSplit, &str); 3] = [
+    (AutoSplit::One, "1分割（全画面）"),
+    (AutoSplit::TwoColumns, "2分割（左右）"),
+    (AutoSplit::FourGrid, "4分割"),
+];
+
+/// The cell names for a split, in the same reading order as
+/// `layout_service::auto_split_cells`.
+fn placement_cell_labels(split: AutoSplit) -> Vec<&'static str> {
+    match split {
+        AutoSplit::One => vec!["全画面"],
+        AutoSplit::TwoColumns => vec!["左", "右"],
+        AutoSplit::FourGrid => vec!["左上", "右上", "左下", "右下"],
+    }
+}
+
+/// The 分割 at the combo's row index, defaulting to whole-monitor.
+fn placement_split_at(index: i32) -> AutoSplit {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| PLACEMENT_SPLITS.get(i))
+        .map_or(AutoSplit::One, |(split, _)| *split)
+}
+
+/// Fills the 画面 picker with the main monitors, keeping the row order aligned
+/// with `AppConfig.main_monitor_ids` so a row index *is* the monitor index.
+/// Falls back to the device name when the monitor isn't currently connected.
+fn refresh_placement_monitors(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &WorksetManagerState,
+) {
+    let names: Vec<slint::SharedString> = config
+        .main_monitor_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let live = state.monitors.iter().find(|m| &m.device_name == id);
+            match live {
+                Some(monitor) => format!(
+                    "画面{}: {}×{}{}",
+                    index + 1,
+                    monitor.bounds_px.width,
+                    monitor.bounds_px.height,
+                    if monitor.is_primary { "（主）" } else { "" }
+                )
+                .into(),
+                None => format!("画面{}: {id}（未接続）", index + 1).into(),
+            }
+        })
+        .collect();
+    let has_monitors = !names.is_empty();
+    manager.set_placement_monitors(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_placement_monitor_index(if has_monitors { 0 } else { -1 });
+    refresh_placement_monitor_tiles(manager, config, state);
+}
+
+/// 配置プレビュー用のタイルを作る。全メイン画面を囲む矩形で正規化するので、
+/// 実際の左右・上下関係と解像度差がそのまま縮小されて描かれる。未接続の画面は
+/// 位置が分からないので、既知の画面の右隣に等幅で並べる。
+fn refresh_placement_monitor_tiles(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &WorksetManagerState,
+) {
+    let live: Vec<(usize, &MonitorInfo)> = config
+        .main_monitor_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            state
+                .monitors
+                .iter()
+                .find(|m| &m.device_name == id)
+                .map(|m| (index, m))
+        })
+        .collect();
+    if live.is_empty() {
+        manager.set_placement_monitor_tiles(
+            std::rc::Rc::new(slint::VecModel::from(Vec::<PlacementMonitorTile>::new())).into(),
+        );
+        return;
+    }
+
+    // 全メイン画面を囲む矩形。
+    let min_x = live.iter().map(|(_, m)| m.bounds_px.x).min().unwrap_or(0);
+    let min_y = live.iter().map(|(_, m)| m.bounds_px.y).min().unwrap_or(0);
+    let max_x = live
+        .iter()
+        .map(|(_, m)| m.bounds_px.right())
+        .max()
+        .unwrap_or(1);
+    let max_y = live
+        .iter()
+        .map(|(_, m)| m.bounds_px.bottom())
+        .max()
+        .unwrap_or(1);
+    let span_x = ((max_x - min_x) as f32).max(1.0);
+    let span_y = ((max_y - min_y) as f32).max(1.0);
+
+    let tiles: Vec<PlacementMonitorTile> = live
+        .iter()
+        .map(|(index, m)| PlacementMonitorTile {
+            label: format!("画面{}", index + 1).into(),
+            nx: (m.bounds_px.x - min_x) as f32 / span_x,
+            ny: (m.bounds_px.y - min_y) as f32 / span_y,
+            nw: m.bounds_px.width as f32 / span_x,
+            nh: m.bounds_px.height as f32 / span_y,
+        })
+        .collect();
+    manager.set_placement_monitor_tiles(std::rc::Rc::new(slint::VecModel::from(tiles)).into());
+}
+
+/// Fills the 位置 picker with the cells of the currently selected 分割.
+fn refresh_placement_cells(manager: &WorksetManager) {
+    let split = placement_split_at(manager.get_placement_split_index());
+    let labels: Vec<slint::SharedString> = placement_cell_labels(split)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    manager.set_placement_cells(std::rc::Rc::new(slint::VecModel::from(labels)).into());
+    manager.set_placement_cell_index(0);
+}
+
+/// How one queued app reads in the list: name, its input, and where it opens.
+fn pending_app_label(pending: &PendingApp) -> String {
+    let where_ = format!(
+        "画面{} {}",
+        pending.monitor_index + 1,
+        match pending.split {
+            AutoSplit::One => "全画面".to_string(),
+            split => format!(
+                "{}/{}",
+                PLACEMENT_SPLITS
+                    .iter()
+                    .find(|(s, _)| *s == split)
+                    .map_or("", |(_, label)| label),
+                placement_cell_labels(split)
+                    .get(pending.cell_index)
+                    .copied()
+                    .unwrap_or("")
+            ),
+        }
+    );
+    let input = pending.input.trim();
+    if input.is_empty() {
+        format!("{}  ―  {where_}", pending.app.name)
+    } else {
+        format!("{}  {input}  ―  {where_}", pending.app.name)
+    }
+}
+
+/// Pushes the apps queued for the set being registered (UI 2).
+fn refresh_pending_apps(manager: &WorksetManager, state: &WorksetManagerState) {
+    let rows: Vec<slint::SharedString> = state
+        .pending_apps
+        .iter()
+        .map(|pending| pending_app_label(pending).into())
+        .collect();
+    manager.set_pending_apps(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+/// アプリのフォームを空に戻し、行の編集中状態も解除する。追加・更新のあとと、
+/// 登録画面を開き直したときに呼ぶ。
+fn clear_pending_app_form(manager: &WorksetManager, state: &mut WorksetManagerState) {
+    state.editing_pending_index = None;
+    manager.set_pending_edit_index(-1);
+    manager.set_app_selected_index(-1);
+    apply_app_selection(manager, None);
+}
+
+/// 追加済みの行をアプリのフォームへ読み戻す。「編集」はこれで、行を消して入れ直す
+/// 代わりに同じフォームをそのまま使い回す。
+///
+/// 戻り値は、その行のアプリを起動候補の一覧から選び直せたか。選び直せないのは、
+/// 起動候補から消されたアプリ（または実行中の窓から作られた代替）のときで、
+/// 「更新」を押す前にアプリを選び直してもらう必要がある。
+fn load_pending_app_into_form(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    pending: &PendingApp,
+) -> bool {
+    // 同じ起動候補を選び直す。id が一致しないときは実行ファイルで拾う。
+    let catalog_index = config
+        .launch_apps
+        .iter()
+        .position(|app| app.id == pending.app.id)
+        .or_else(|| {
+            config.launch_apps.iter().position(|app| {
+                crate::windowing::matcher::same_executable(&app.program, &pending.app.program)
+            })
+        })
+        .and_then(|i| i32::try_from(i).ok());
+    manager.set_app_selected_index(catalog_index.unwrap_or(-1));
+    // 入力欄の種類（フォルダー / URL / 引数）はアプリで決まる。行が持つアプリで
+    // 欄を組み立ててから、保存済みの値を入れ直す。
+    apply_app_selection(manager, Some(&pending.app));
+    manager.set_app_input_text(pending.input.clone().into());
+    manager.set_app_args_text(pending.extra_args.clone().into());
+
+    manager.set_placement_monitor_index(i32::try_from(pending.monitor_index).unwrap_or(0));
+    manager.set_placement_split_index(
+        PLACEMENT_SPLITS
+            .iter()
+            .position(|(split, _)| *split == pending.split)
+            .and_then(|i| i32::try_from(i).ok())
+            .unwrap_or(0),
+    );
+    // セル一覧は分割に属するので、分割を入れたあとで作り直す。位置は先頭に戻される
+    // ので、そのあとに書き戻す。
+    refresh_placement_cells(manager);
+    manager.set_placement_cell_index(i32::try_from(pending.cell_index).unwrap_or(0));
+
+    catalog_index.is_some()
+}
+
+/// The registered launch app at `index` in `config.launch_apps`, if any.
+fn launch_app_at(config: &AppConfig, index: i32) -> Option<crate::domain::workset::LaunchApp> {
+    let index = usize::try_from(index).ok()?;
+    config.launch_apps.get(index).cloned()
+}
+
+/// The catalogue entry behind row `index` of the registry's (filtered) picker.
+fn catalog_app(index: i32) -> Option<crate::windowing::start_menu::StartMenuApp> {
+    let row = usize::try_from(index).ok()?;
+    let catalog_index = *APP_CATALOG_VIEW.lock().ok()?.get(row)?;
+    APP_CATALOG.lock().ok()?.get(catalog_index).cloned()
+}
+
+/// Builds a `ManagedWindow` for one declared app of a set.
+///
+/// The matcher pairs the executable with the app's registered name as a title
+/// hint: the executable alone scores below the auto-rebind threshold, so the
+/// name is what actually lets the window bind once the app is running.
+/// Placement comes from the 画面 picker rather than a live window — the app may
+/// not be running (or even installed) when the set is declared.
+fn build_launch_app_window(
+    pending: &PendingApp,
+    z_order: usize,
+    main_ids: &[String],
+) -> crate::domain::workset::ManagedWindow {
+    use crate::domain::placement::{PixelRect, SavedPlacement, SavedShowState};
+    use crate::domain::workset::{LaunchKind, ManagedWindow, WindowMatcher};
+
+    let app = &pending.app;
+    let input = pending.input.trim();
+    let kind = launch_service::classify(&app.program);
+    let mut spec = match kind {
+        LaunchKind::VsCode => launch_service::build_launch_spec(
+            &app.program,
+            (!input.is_empty()).then(|| Path::new(input)),
+            None,
+        ),
+        LaunchKind::Browser => launch_service::build_launch_spec(
+            &app.program,
+            None,
+            (!input.is_empty()).then_some(input),
+        ),
+        LaunchKind::Generic => launch_service::build_launch_spec(&app.program, None, None),
+    };
+    // A generic app has no structured argument, so pass the field through as
+    // the registered command line would.
+    if kind == LaunchKind::Generic && !input.is_empty() {
+        spec.args = input.split_whitespace().map(str::to_string).collect();
+    }
+    // UIの「引数」欄の内容を先頭に付ける。既定値は登録アプリの引数だが、画面に
+    // 出ているのでウィンドウごとに変えられる。ブラウザーの `--user-data-dir=...`
+    // もここを通る（用途別に独立した Brave を扱うための経路）。
+    let extra = launch_service::split_registered_args(&pending.extra_args);
+    if !extra.is_empty() {
+        spec.args = [extra, std::mem::take(&mut spec.args)].concat();
+    }
+    // The registered AUMID is the shell's own, so it beats the one
+    // `build_launch_spec` guesses from the install path (which assumes the
+    // application id is `App` — true for ChatGPT, not for Claude or Teams).
+    if app.aumid.is_some() {
+        spec.aumid = app.aumid.clone();
+    }
+
+    let monitor_index = pending.monitor_index.min(main_ids.len().saturating_sub(1));
+    ManagedWindow {
+        id: uuid::Uuid::new_v4(),
+        matcher: WindowMatcher {
+            executable_path: app.program.clone(),
+            process_name: app
+                .program
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            // ウィンドウが存在するまで不明。最初にバインドしたウィンドウから
+            // 学習する（`remember_learned_classes`）。
+            window_class: String::new(),
+            registered_title: app.name.clone(),
+            // 保存する価値があるのは、そのアプリの *他の* ウィンドウと区別できる
+            // 針だけ。VS Code はタイトルに開いたフォルダ名を出すので、1 セットに
+            // VS Code が 2 つあっても見分けがつく。アプリ名そのものだと開くすべて
+            // のウィンドウに一致してしまい、閉じたブラウザのエントリが無関係な同じ
+            // ブラウザの窓を取り込む原因になっていた。
+            title_contains: launch_service::declared_title_needle(kind, input),
+            title_regex: None,
+        },
+        main_placement: SavedPlacement {
+            monitor_id: main_ids.get(monitor_index).cloned().unwrap_or_default(),
+            main_monitor_index: monitor_index,
+            normalized_rect: layout_service::normalized_split_cell(
+                pending.split,
+                pending.cell_index,
+            ),
+            physical_rect_at_capture: PixelRect::new(0, 0, 0, 0),
+            // Only a whole-monitor app is maximized: a maximized window ignores
+            // its rect, which would silently undo a half/quarter cell.
+            show_state: if pending.split == AutoSplit::One {
+                SavedShowState::Maximized
+            } else {
+                SavedShowState::Normal
+            },
+        },
+        z_order: i32::try_from(z_order).unwrap_or(0),
+        launch_spec: Some(spec),
+        // 編集時も、詳細で切り替えた「退避せず最小化」の設定を引き継ぐ。
+        minimize_when_parked: pending.minimize_when_parked,
+    }
+}
+
+/// Turns a saved `ManagedWindow` back into the form row it was declared from,
+/// so an existing set can be edited.
+///
+/// The launch app is looked up in the registry by executable; a window whose
+/// app is no longer registered (or that predates the registry, having been
+/// captured from a live window) gets a stand-in built from its own matcher, so
+/// editing a set never silently drops one of its entries.
+fn pending_from_managed_window(
+    window: &crate::domain::workset::ManagedWindow,
+    config: &AppConfig,
+) -> PendingApp {
+    use crate::domain::workset::{LaunchApp, LaunchKind};
+
+    let app = config
+        .launch_apps
+        .iter()
+        .find(|a| {
+            crate::windowing::matcher::same_executable(&a.program, &window.matcher.executable_path)
+        })
+        .cloned()
+        .unwrap_or_else(|| LaunchApp {
+            id: uuid::Uuid::new_v4(),
+            name: if window.matcher.registered_title.is_empty() {
+                window.matcher.process_name.clone()
+            } else {
+                window.matcher.registered_title.clone()
+            },
+            program: window.matcher.executable_path.clone(),
+            args: String::new(),
+            aumid: window.launch_spec.as_ref().and_then(|s| s.aumid.clone()),
+        });
+
+    // 保存済みの起動引数から、UIの2つの欄（フォルダー/URL と 引数）を復元する。
+    // `build_launch_spec` が付ける定型フラグ（`-n` / `--new-window`）は、編集時に
+    // 再度付くので引数欄には出さない。
+    let (input, extra_args) = window.launch_spec.as_ref().map_or_else(
+        || (String::new(), String::new()),
+        |spec| {
+            let is_kind_flag =
+                |a: &String| matches!(a.as_str(), "-n" | "--new-window" | "-new-window");
+            match spec.kind {
+                LaunchKind::VsCode | LaunchKind::Browser => {
+                    let input = spec
+                        .args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .cloned()
+                        .unwrap_or_default();
+                    let extra: Vec<&String> = spec
+                        .args
+                        .iter()
+                        .filter(|a| a.starts_with('-') && !is_kind_flag(a))
+                        .collect();
+                    (input, join_args_for_display(&extra))
+                }
+                // 汎用アプリは入力欄も引数なので、まとめて引数欄へ出す。
+                LaunchKind::Generic => (
+                    String::new(),
+                    join_args_for_display(&spec.args.iter().collect::<Vec<_>>()),
+                ),
+            }
+        },
+    );
+
+    let (split, cell_index) =
+        layout_service::split_cell_from_normalized(window.main_placement.normalized_rect);
+    PendingApp {
+        app,
+        input,
+        extra_args,
+        monitor_index: window.main_placement.main_monitor_index,
+        split,
+        cell_index,
+        minimize_when_parked: window.minimize_when_parked,
+    }
+}
+
+/// 引数の配列を、UIの引数欄へ出せる1行にする。空白を含む引数は引用符で包むので、
+/// そのまま再度 `split_registered_args` に通しても元のトークンに戻る。
+fn join_args_for_display(args: &[&String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(' ') && !a.contains('"') {
+                // `--user-data-dir=D:\Brave Data\x` → `--user-data-dir="D:\Brave Data\x"`
+                match a.split_once('=') {
+                    Some((flag, value)) => format!("{flag}=\"{value}\""),
+                    None => format!("\"{a}\""),
+                }
+            } else {
+                (*a).clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Shows the one input the selected app actually needs: a folder/workspace for
+/// VS Code, a URL for a browser, free-form arguments for anything else.
+fn apply_app_selection(manager: &WorksetManager, app: Option<&crate::domain::workset::LaunchApp>) {
+    use crate::domain::workset::LaunchKind;
+    let Some(app) = app else {
+        manager.set_app_kind_label("".into());
+        manager.set_app_input_visible(false);
+        manager.set_app_input_is_path(false);
+        manager.set_app_input_text("".into());
+        return;
+    };
+
+    let (kind_label, input_label, placeholder, is_path) =
+        match launch_service::classify(&app.program) {
+            LaunchKind::VsCode => (
+                "VS Code",
+                "フォルダー / ワークスペース",
+                "例: C:\\code\\myrepo（または .code-workspace）",
+                true,
+            ),
+            LaunchKind::Browser => ("ブラウザー", "URL", "例: https://example.com", false),
+            LaunchKind::Generic => ("アプリ", "追加の引数（任意）", "例: --flag", false),
+        };
+    manager.set_app_kind_label(kind_label.into());
+    manager.set_app_input_label(input_label.into());
+    manager.set_app_input_placeholder(placeholder.into());
+    manager.set_app_input_visible(true);
+    manager.set_app_input_is_path(is_path);
+    // フォルダー/URL 欄は空から。引数は専用の「引数」欄へ、登録アプリの既定値を
+    // 初期表示する（何が付くのかが見え、ウィンドウごとに変えられる）。
+    manager.set_app_input_text(slint::SharedString::new());
+    manager.set_app_args_text(app.args.clone().into());
+}
+
+/// Distinct workset colors offered at registration. A workset's color is its
+/// at-a-glance identity, so already-used ones are filtered out of the choices.
+const WORKSET_PALETTE: [&str; 16] = [
+    "#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#db2777", "#65a30d",
+    "#ea580c", "#4f46e5", "#0d9488", "#9333ea", "#ca8a04", "#e11d48", "#0ea5e9", "#f43f5e",
+];
+
+/// Sets the registration color swatches to the palette colors not already used
+/// by an existing workset, and selects the first available one. Falls back to
+/// the full palette if every color is somehow taken.
+fn refresh_color_choices(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &mut WorksetManagerState,
+) {
+    let used: std::collections::HashSet<String> = config
+        .worksets
+        .iter()
+        .map(|w| w.color.to_ascii_lowercase())
+        .collect();
+    let available: Vec<&str> = WORKSET_PALETTE
+        .iter()
+        .copied()
+        .filter(|c| !used.contains(&c.to_ascii_lowercase()))
+        .collect();
+    let list: Vec<&str> = if available.is_empty() {
+        WORKSET_PALETTE.to_vec()
+    } else {
+        available
+    };
+    if let Some(first) = list.first() {
+        state.selected_color = hex_to_color(first);
+    }
+    let colors: Vec<slint::Color> = list.iter().map(|c| hex_to_color(c)).collect();
+    manager.set_color_choices(std::rc::Rc::new(slint::VecModel::from(colors)).into());
+    manager.set_selected_color(state.selected_color);
+}
+
+/// The repository a declared set describes: the folder or `.code-workspace`
+/// its VS Code entry opens.
+///
+/// The registration screen has no repository picker — a set is a list of apps,
+/// and the only one of them that names a repository is VS Code. Resolving it
+/// here keeps `repository_path` (agent matching, the quick switcher's git
+/// status) working without asking the user for the same path twice. `None`
+/// when the set has no VS Code entry, or its folder is blank or relative.
+fn derive_repository(
+    pending: &[PendingApp],
+) -> Option<(PathBuf, crate::domain::workset::RepositoryKind)> {
+    use crate::domain::workset::{LaunchKind, RepositoryKind};
+
+    let entry = pending.iter().find(|p| {
+        launch_service::classify(&p.app.program) == LaunchKind::VsCode && !p.input.trim().is_empty()
+    })?;
+    let path = PathBuf::from(entry.input.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    // A `.code-workspace` is stored as-is (that is what `RepositoryKind::
+    // Workspace` means); a folder resolves to its git root when it has one.
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("code-workspace"))
+    {
+        // Parsed eagerly so a malformed workspace file is caught now rather
+        // than silently breaking agent cwd matching later.
+        if workset_service::resolve_workspace_file(&path).is_err() {
+            return None;
+        }
+        return Some((path, RepositoryKind::Workspace));
+    }
+    Some(workset_service::resolve_repository(&path))
+}
+
+/// Populates the registration screen's 退避先 sub-screen chips from the current
+/// config, clamping the selection back to 自動 if it's out of range.
+fn refresh_parking_subs(
+    manager: &WorksetManager,
+    config: &AppConfig,
+    state: &mut WorksetManagerState,
+) {
+    let names: Vec<slint::SharedString> = config
+        .sub_screens
+        .iter()
+        .map(|s| s.name.clone().into())
+        .collect();
+    if state.parking_selected_sub >= i32::try_from(names.len()).unwrap_or(0) {
+        state.parking_selected_sub = -1;
+    }
+    manager.set_parking_subs(std::rc::Rc::new(slint::VecModel::from(names)).into());
+    manager.set_parking_selected_sub(state.parking_selected_sub);
 }
 
 fn refresh_workset_summaries(
@@ -825,12 +1869,31 @@ fn refresh_workset_summaries(
                 )
             };
 
+            let parking_label = match &workset.parking_policy {
+                ParkingPolicy::Auto => "退避先: 自動".to_string(),
+                ParkingPolicy::SubScreen { sub_screen_id } => {
+                    let name = config
+                        .sub_screens
+                        .iter()
+                        .find(|s| s.id == *sub_screen_id)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("不明なサブ");
+                    format!("退避先: サブ「{name}」")
+                }
+                ParkingPolicy::Fixed { .. } => "退避先: 固定枠".to_string(),
+            };
+
             WorksetSummary {
                 name: workset.name.clone().into(),
-                repository_path: workset.repository_path.display().to_string().into(),
+                repository_path: if workset.repository_path.as_os_str().is_empty() {
+                    "（リポジトリなし）".into()
+                } else {
+                    workset.repository_path.display().to_string().into()
+                },
                 window_count: workset.windows.len() as i32,
                 color: hex_to_color(&workset.color),
                 status_label: status_label.into(),
+                parking_label: parking_label.into(),
             }
         })
         .collect();
@@ -842,11 +1905,22 @@ fn refresh_selected_workset_detail(
     manager: &WorksetManager,
     config: &AppConfig,
     state: &WorksetManagerState,
+    data_dir: &Path,
 ) {
+    // Keep the Slint `selected-workset-index` in sync so the detail-pane
+    // buttons (which enable on `>= 0`) and the row highlight reflect the
+    // selection.
+    manager.set_selected_workset_index(
+        state
+            .selected_workset_index
+            .and_then(|i| i32::try_from(i).ok())
+            .unwrap_or(-1),
+    );
     let Some(index) = state.selected_workset_index else {
         manager.set_selected_workset_windows(
             std::rc::Rc::new(slint::VecModel::from(Vec::<ManagedWindowSummary>::new())).into(),
         );
+        manager.set_selected_missing_count(0);
         return;
     };
     let Some(workset) = config.worksets.get(index) else {
@@ -855,7 +1929,18 @@ fn refresh_selected_workset_detail(
 
     let live_windows =
         enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
-    let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
+    // Use the session HWND bindings (same as a real switch) so a window pinned
+    // to a specific HWND shows as resolved, not "ambiguous", even when another
+    // same-app window (e.g. a second browser) exists elsewhere.
+    let bindings = runtime_store::load(data_dir).window_bindings;
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &bindings,
+        // Resolve the set being inspected first, so a window it shares with
+        // another set still shows as resolved here.
+        Some(workset.id),
+    );
 
     let rows: Vec<ManagedWindowSummary> = workset
         .windows
@@ -866,11 +1951,632 @@ fn refresh_selected_workset_detail(
                 title: window.matcher.registered_title.clone().into(),
                 status_label: label.into(),
                 status_is_warning: warn,
+                minimize_when_parked: window.minimize_when_parked,
             }
         })
         .collect();
 
+    let missing = count_reopenable_missing(workset, &decisions);
+    manager.set_selected_missing_count(i32::try_from(missing).unwrap_or(0));
     manager.set_selected_workset_windows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+}
+
+/// Counts a workset's windows that are currently closed (no confident live
+/// match) AND carry a `launch_spec`, i.e. can be reopened.
+fn count_reopenable_missing(
+    workset: &crate::domain::workset::Workset,
+    decisions: &HashMap<uuid::Uuid, MatchDecision>,
+) -> usize {
+    workset
+        .windows
+        .iter()
+        .filter(|w| {
+            w.launch_spec.is_some()
+                && !matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
+        })
+        .count()
+}
+
+thread_local! {
+    /// Keeps the single-shot "reopen closed apps → settle → place" timer alive
+    /// between the launch and the deferred placement.
+    static REOPEN_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+}
+
+/// Switches to `workset_id` so its (now reopened) windows get matched and
+/// placed. If it is already the current workset, the current id is first
+/// cleared so the switch performs a full restore rather than a no-op.
+fn reopen_place_workset(
+    workset_id: uuid::Uuid,
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+    coordinator: &SwitchCoordinator<Win32WindowOps>,
+) {
+    reconcile_monitor_identity(data_dir, config, "reopen");
+
+    let mut runtime = runtime_store::load(data_dir);
+    if runtime.current_workset_id == Some(workset_id) {
+        runtime.current_workset_id = None;
+        let _ = runtime_store::save(data_dir, &runtime);
+    }
+    let cfg = config.borrow();
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    if let Err(err) = coordinator.switch_to(SwitchRequest {
+        worksets: &cfg.worksets,
+        fixed_slots: &cfg.fixed_slots,
+        sub_screens: &cfg.sub_screens,
+        saved_monitors: &cfg.monitors,
+        main_monitor_ids: &cfg.main_monitor_ids,
+        live_monitors: &live_monitors,
+        live_windows: &live_windows,
+        target_workset_id: workset_id,
+    }) {
+        tracing::warn!(error = %err, "reopen: failed to place workset after relaunch");
+    }
+}
+
+/// Asks every live window of `workset_id` to close, returning the set's name
+/// and how many windows were asked.
+///
+/// 既定では `WM_CLOSE` を投げるだけなので、アプリは拒否も保存確認もできる——
+/// ユーザーの同意なしに失われるものはない。例外は
+/// [`launch_service::closes_only_by_kill`] に挙げたアプリ（リモートデスクトップ）
+/// だけで、これは `WM_CLOSE` では閉じないためプロセスを終了させる。セット自体は
+/// 登録されたままなので、あとで切り替えれば全部起動し直される。
+///
+/// 閉じたウィンドウの HWND はバインドとして *記録* する（消さない）。HWND が
+/// 消えたバインドこそが「このウィンドウは閉じられた」と解決側が気づく手がかり
+/// だから。消してしまうと内容マッチに戻り、同じアプリの別ウィンドウへ結び直され
+/// て、セットは開いたままに見え、開き直すの対象がなくなる。閉じるのを拒んだ
+/// アプリは HWND が生きたままなので、バインドも保たれる——これも正しい。
+fn close_workset_windows(
+    config: &AppConfig,
+    data_dir: &Path,
+    workset_id: uuid::Uuid,
+) -> Option<(String, usize)> {
+    let workset = config.worksets.iter().find(|w| w.id == workset_id)?;
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut runtime = runtime_store::load(data_dir);
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &runtime.window_bindings,
+        Some(workset_id),
+    );
+
+    let targets: Vec<(uuid::Uuid, isize, bool)> = workset
+        .windows
+        .iter()
+        .filter_map(|w| match decisions.get(&w.id) {
+            Some(MatchDecision::AutoRebind { hwnd }) => Some((
+                w.id,
+                *hwnd,
+                launch_service::closes_only_by_kill(&w.matcher.executable_path),
+            )),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return Some((workset.name.clone(), 0));
+    }
+
+    let closed = targets
+        .iter()
+        .filter(|(_, hwnd, by_kill)| {
+            let hwnd = HWND(*hwnd as *mut _);
+            if *by_kill {
+                tracing::info!(target: "switch", "close-workset: terminating a process that ignores WM_CLOSE");
+                win_placement::kill_window_process(hwnd)
+            } else {
+                win_placement::close_window(hwnd)
+            }
+        })
+        .count();
+    tracing::info!(target: "switch", %workset_id, closed, "close-workset: posted WM_CLOSE");
+
+    for (id, hwnd, _) in targets {
+        runtime.window_bindings.insert(id, hwnd);
+    }
+    let _ = runtime_store::save(data_dir, &runtime);
+
+    Some((workset.name.clone(), closed))
+}
+
+/// What to acquire after launching a switch target's closed windows: the
+/// pre-launch HWND set and, per launched window, its managed id + expected
+/// executable/class so the newly-appeared window can be bound to it.
+struct PendingAcquire {
+    workset_id: uuid::Uuid,
+    before: std::collections::HashSet<isize>,
+    /// まだバインドできていない起動済みエントリ。現れた順に減っていく。
+    dead: Vec<Launched>,
+    /// バインド済みのエントリ。窓が消えたら `dead` へ戻る。
+    bound: Vec<BoundWindow>,
+    /// これまでに確保した HWND。別のエントリが同じ窓を二重に取らないようにする。
+    claimed: std::collections::HashSet<isize>,
+    /// Relaunched browsers whose launch spec carried no URL — they open a blank
+    /// window with the address bar focused, so they are minimized once bound so
+    /// stray keystrokes during the switch can't land in the omnibox (2026-07-23).
+    blank_browsers: std::collections::HashSet<uuid::Uuid>,
+}
+
+/// 起動したが、まだどのウィンドウとも結びついていない管理ウィンドウ。
+/// `class` は登録済みのウィンドウクラス（宣言由来なら空）。
+struct Launched {
+    id: uuid::Uuid,
+    exe: PathBuf,
+    class: String,
+    /// ブラウザを用途別に分ける `--user-data-dir=...`（あれば）。同時に複数の
+    /// プロファイルを起動しても取り違えないよう、コマンドラインで特定する。
+    identity: Option<String>,
+}
+
+/// 結びついた管理ウィンドウと、その相手の HWND・実際に観測したクラス。
+struct BoundWindow {
+    launched: Launched,
+    hwnd: isize,
+    observed_class: String,
+}
+
+/// Launches the target workset's closed (unresolved) windows that carry a
+/// launch spec, returning what to acquire afterwards — or `None` if every
+/// window is already open (nothing to launch). Browsers open a fresh window;
+/// VS Code / Codex are only "dead" here if content matching already failed to
+/// find their window, so relaunching them won't duplicate an open one.
+fn launch_missing_for_switch(
+    config: &AppConfig,
+    bindings: &std::collections::HashMap<uuid::Uuid, isize>,
+    live_windows: &[TopLevelWindow],
+    target_id: uuid::Uuid,
+) -> Option<PendingAcquire> {
+    let workset = config.worksets.iter().find(|w| w.id == target_id)?;
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        live_windows,
+        bindings,
+        Some(target_id),
+    );
+
+    let mut dead = Vec::new();
+    let mut blank_browsers = std::collections::HashSet::new();
+    for w in &workset.windows {
+        let alive = matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }));
+        if !alive && let Some(spec) = &w.launch_spec {
+            match crate::windowing::app_launch::launch(spec) {
+                Ok(()) => {
+                    let no_url = spec.kind == crate::domain::workset::LaunchKind::Browser
+                        && !spec.args.iter().any(|a| a.contains("://"));
+                    tracing::info!(
+                        target: "launch", managed = %w.id, program = %spec.program.display(),
+                        class = %w.matcher.window_class, no_url,
+                        "switch: relaunching closed app via set"
+                    );
+                    if no_url {
+                        blank_browsers.insert(w.id);
+                    }
+                    dead.push(Launched {
+                        id: w.id,
+                        exe: spec.program.clone(),
+                        class: w.matcher.window_class.clone(),
+                        identity: launch_service::browser_identity_arg(&spec.args).cloned(),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(target: "launch", error = %err, program = %spec.program.display(), "switch: relaunch failed");
+                }
+            }
+        }
+    }
+
+    if dead.is_empty() {
+        return None;
+    }
+    tracing::info!(target: "launch", workset = %workset.name, relaunched = dead.len(), "switch: awaiting relaunched windows to bind");
+    Some(PendingAcquire {
+        workset_id: target_id,
+        before: live_windows.iter().map(|w| w.hwnd).collect(),
+        dead,
+        bound: Vec::new(),
+        claimed: std::collections::HashSet::new(),
+        blank_browsers,
+    })
+}
+
+/// 再起動したウィンドウから今学習したウィンドウクラスを、保存済みのセットへ
+/// 書き戻す。以後その宣言ウィンドウは、キャプチャ由来のものと同じようにマッチし、
+/// バインドを保持できる。
+fn remember_learned_classes(
+    learned: &[(uuid::Uuid, String)],
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+) {
+    if learned.is_empty() {
+        return;
+    }
+    {
+        let mut config = config.borrow_mut();
+        for workset in &mut config.worksets {
+            for window in &mut workset.windows {
+                if let Some((_, class)) = learned.iter().find(|(id, _)| *id == window.id) {
+                    tracing::info!(target: "launch", managed = %window.id, class = %class, "learned window class from the relaunched window");
+                    window.matcher.window_class.clone_from(class);
+                }
+            }
+        }
+    }
+    if let Err(err) = config_store::save(data_dir, &config.borrow()) {
+        tracing::warn!(error = %err, "failed to save learned window classes");
+    }
+}
+
+/// 起動したウィンドウが現れるのを待つ間隔と、諦めるまでの回数（約 15 秒）。
+///
+/// 以前は 2.5 秒の一発勝負だった。WinForms や Tauri のコールドスタートはそれを
+/// 平気で超えるので、LibreHardwareMonitor HUD は毎回「現れなかった」扱いになり、
+/// 起動はしたのに未バインドのまま残っていた。現れ次第バインドし、全部揃うか
+/// 期限切れで打ち切る。
+const ACQUIRE_POLL_INTERVAL: Duration = Duration::from_millis(600);
+const ACQUIRE_MAX_POLLS: u32 = 25;
+
+// 監視は期限まで続けるが、揃った時点でいったん配置する。リモートデスクトップは
+// 本体（`TscShellContainerClass`）の前に接続中ダイアログ（`#32770`）を数秒出す。
+// 最初に見えた窓で確定してしまうと、消えるダイアログに紐づいたまま終わる。
+// かといって全員を期限いっぱい待たせると、普通のアプリの配置まで遅くなる。
+// そこで「早く配置し、差し替わったら配置し直す」。
+
+/// いま現れているウィンドウのうち、まだバインドできていないエントリに割り当て
+/// られるものを結びつける。結びついたものは `dead` から `bound` へ移る。
+/// 新たに結びついたものがあれば `true`。
+fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
+    let after = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut newly_bound: Vec<BoundWindow> = Vec::new();
+
+    pending.dead.retain(|launched| {
+        // 用途別ブラウザ（`--user-data-dir`）は、同時に複数起動しても取り違えない
+        // よう、まずコマンドラインで特定する。該当しなければ従来どおり
+        // 「新しく現れた同じ実行ファイルの窓」で拾う。
+        let by_identity = launched.identity.as_deref().and_then(|identity| {
+            find_window_by_command_line(&after, &pending.before, &pending.claimed, identity)
+        });
+        let Some(w) = by_identity.or_else(|| {
+            launch_service::find_launched_window(
+                &after,
+                &pending.before,
+                &pending.claimed,
+                &launched.exe,
+                &launched.class,
+            )
+        }) else {
+            return true; // まだ現れていない。次のポーリングで見る。
+        };
+        tracing::info!(target: "launch", managed = %launched.id, hwnd = w.hwnd, class = %w.window_class, "switch: bound relaunched window to its set");
+        pending.claimed.insert(w.hwnd);
+        newly_bound.push(BoundWindow {
+            launched: Launched {
+                id: launched.id,
+                exe: launched.exe.clone(),
+                class: launched.class.clone(),
+                identity: launched.identity.clone(),
+            },
+            hwnd: w.hwnd,
+            observed_class: w.window_class.clone(),
+        });
+        false
+    });
+
+    let bound_any = !newly_bound.is_empty();
+    pending.bound.append(&mut newly_bound);
+    bound_any
+}
+
+/// 新しく現れたウィンドウのうち、プロセスのコマンドラインに `identity`（用途別
+/// ブラウザの `--user-data-dir=...`）を含むものを探す。Chromium 系はデータ領域が
+/// 違えば独立プロセスになるので、これで「どのブラウザの窓か」を確実に決められる。
+fn find_window_by_command_line<'a>(
+    after: &'a [TopLevelWindow],
+    before: &std::collections::HashSet<isize>,
+    claimed: &std::collections::HashSet<isize>,
+    identity: &str,
+) -> Option<&'a TopLevelWindow> {
+    after
+        .iter()
+        .filter(|w| !before.contains(&w.hwnd) && !claimed.contains(&w.hwnd))
+        .find(|w| window_matches_identity(w, identity))
+}
+
+/// バインド済みのうち、その後ウィンドウが消えたものを `dead` へ戻す。戻したもの
+/// があれば `true`。起動直後のスプラッシュや接続中ダイアログに飛びついたまま
+/// 終わらないための番人。
+fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
+    let live: std::collections::HashSet<isize> =
+        enumerate::enumerate_top_level_windows(std::process::id())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.hwnd)
+            .collect();
+    let mut vanished = false;
+    pending.bound.retain(|b| {
+        if live.contains(&b.hwnd) {
+            return true;
+        }
+        tracing::info!(target: "launch", managed = %b.launched.id, hwnd = b.hwnd, class = %b.observed_class, "switch: the window we bound vanished; waiting for the real one");
+        pending.claimed.remove(&b.hwnd);
+        pending.dead.push(Launched {
+            id: b.launched.id,
+            exe: b.launched.exe.clone(),
+            class: b.launched.class.clone(),
+            identity: b.launched.identity.clone(),
+        });
+        vanished = true;
+        false
+    });
+    vanished
+}
+
+/// 起動しても新しい窓が現れなかったエントリを、既に動いているその窓へ結びつける。
+/// 結びつけたものがあれば `true`。
+///
+/// 単一インスタンスのアプリ——パッケージ版の ChatGPT/Codex のような——は、AUMID で
+/// 起動しても既存インスタンスが前に出るだけで新しい窓を作らない。すると「現れた窓と
+/// ペアリングする」経路が一度も走らず、宣言由来のエントリは `window_class` を学習
+/// できない。学習できないと得点が `AUTO_REBIND_THRESHOLD` に届かないので毎回
+/// 「閉じている」と誤判定されて起動を試み、また新しい窓は出ない——という循環に陥る
+/// （2026-07-26: ChatGPT セットが実際にこれで、実行ファイル一致50＋タイトル完全一致
+/// 20の70点、閾値に5点足りなかった）。
+///
+/// なので諦める前に、照合が弾いた窓をもう一度見る。ただし条件は厳しく取る:
+///
+/// - **起動前から在った窓だけ**（`before`）。起動途中の窓を先回りして掴まない
+/// - まだ誰にも結びついていない窓だけ
+/// - 用途別ブラウザ（`--user-data-dir`）は、そのプロファイルの窓だけ
+/// - タイトルに「そのアプリの他の窓ではなくこの窓だ」と言える根拠があるもの
+///   （`has_title_evidence`）。これが無いと、ユーザーが自分で開いただけの無関係な
+///   ブラウザ窓をセットが奪ってしまう
+/// - 該当が**ちょうど1つ**のときだけ。複数あるなら取り違えるので何もしない
+///
+/// 一度結びつけば `remember_learned_classes` がクラスを書き戻すので、次の切替から
+/// 通常の照合で一致する。つまりこの経路を通るのはセットにつき一度だけ。
+fn bind_already_running_windows(
+    pending: &mut PendingAcquire,
+    config: &AppConfig,
+    data_dir: &Path,
+) -> bool {
+    if pending.dead.is_empty() {
+        return false;
+    }
+    let live = enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let runtime = runtime_store::load(data_dir);
+    // 他のエントリが握っている窓は対象外。ただし判定に使うのは「いまも存在する」
+    // エントリの紐づけだけ（消えたセットの残骸を真に受けると、現役の窓が握られて
+    // いるように見えて候補が消える）。
+    let known_ids: std::collections::HashSet<uuid::Uuid> = config
+        .worksets
+        .iter()
+        .flat_map(|w| w.windows.iter())
+        .map(|w| w.id)
+        .collect();
+    let awaiting: std::collections::HashSet<uuid::Uuid> =
+        pending.dead.iter().map(|d| d.id).collect();
+    let bound_elsewhere = launch_service::hwnds_bound_to_other_entries(
+        &runtime.window_bindings,
+        &known_ids,
+        &awaiting,
+    );
+    let windows = config
+        .worksets
+        .iter()
+        .find(|w| w.id == pending.workset_id)
+        .map(|w| w.windows.as_slice())
+        .unwrap_or_default();
+
+    let mut newly_bound: Vec<BoundWindow> = Vec::new();
+    let claimed = &mut pending.claimed;
+    let blank_browsers = &mut pending.blank_browsers;
+    let before = &pending.before;
+    pending.dead.retain(|launched| {
+        let Some(managed) = windows.iter().find(|w| w.id == launched.id) else {
+            return true;
+        };
+        let only = match launch_service::resolve_already_running_window(
+            &live,
+            before,
+            claimed,
+            &bound_elsewhere,
+            &managed.matcher,
+            &launched.exe,
+            |w| match launched.identity.as_deref() {
+                None => true,
+                Some(identity) => window_matches_identity(w, identity),
+            },
+        ) {
+            launch_service::AlreadyRunning::Only(w) => w,
+            launch_service::AlreadyRunning::Ambiguous(count) => {
+                tracing::info!(
+                    target: "launch", managed = %launched.id, candidates = count,
+                    "switch: the app is already running but has several unbound windows; not guessing"
+                );
+                return true;
+            }
+            launch_service::AlreadyRunning::NoCandidate => return true,
+        };
+        tracing::info!(
+            target: "launch", managed = %launched.id, hwnd = only.hwnd, class = %only.window_class,
+            "switch: bound an already-running window that the launch could not recreate"
+        );
+        claimed.insert(only.hwnd);
+        // 既に開いていた窓なので、アドレスバーにフォーカスが当たった起動直後の
+        // ブラウザ扱いで最小化してはいけない。
+        blank_browsers.remove(&launched.id);
+        newly_bound.push(BoundWindow {
+            launched: Launched {
+                id: launched.id,
+                exe: launched.exe.clone(),
+                class: launched.class.clone(),
+                identity: launched.identity.clone(),
+            },
+            hwnd: only.hwnd,
+            observed_class: only.window_class.clone(),
+        });
+        false
+    });
+
+    let bound_any = !newly_bound.is_empty();
+    pending.bound.append(&mut newly_bound);
+    bound_any
+}
+
+/// その窓のプロセスが `identity`（用途別ブラウザの `--user-data-dir=...`）で起動
+/// されたものか。
+fn window_matches_identity(window: &TopLevelWindow, identity: &str) -> bool {
+    let needle = identity
+        .trim_start_matches("--user-data-dir=")
+        .trim_matches('"')
+        .to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    crate::windowing::process_info::read_process_command_line(window.process_id)
+        .is_some_and(|cmd| cmd.to_lowercase().contains(&needle))
+}
+
+/// バインドの受付を終えて、結果を保存し、セットを配置してメイン画面へ移す。
+///
+/// 起動待ちの間にユーザーが別のセットへ切り替えていたら、バインドの保存だけ行い
+/// 配置はしない。ここで配置すると、いま見ているセットを押しのけて数秒前のセットが
+/// 戻ってくる——「いきなり配置が変わる」の正体だった。`force` は「開き直す」を
+/// 押された初回だけ真で、そのときはまだ現在セットでなくても配置してよい（それが
+/// 押した人の意図なので）。
+fn finish_acquire(
+    pending: &mut PendingAcquire,
+    config: &Rc<RefCell<AppConfig>>,
+    data_dir: &Path,
+    coordinator: &SwitchCoordinator<Win32WindowOps>,
+    force: bool,
+) {
+    // 諦める前に、起動しても窓が増えなかったエントリを既存の窓へ結びつける。
+    // ここまで来ているのは待ち時間を使い切った（＝新しい窓は現れない）ときだけ。
+    bind_already_running_windows(pending, &config.borrow(), data_dir);
+
+    for launched in &pending.dead {
+        tracing::warn!(target: "launch", managed = %launched.id, program = %launched.exe.display(), class = %launched.class, "switch: relaunched app did not appear in time to bind");
+    }
+
+    let mut runtime = runtime_store::load(data_dir);
+    for b in &pending.bound {
+        runtime.window_bindings.insert(b.launched.id, b.hwnd);
+    }
+    let still_current = runtime.current_workset_id == Some(pending.workset_id);
+    let _ = runtime_store::save(data_dir, &runtime);
+
+    // 観測したクラスが登録値と違えば書き戻す。消えなかった窓のクラスだけを覚える
+    // ので、接続中ダイアログの `#32770` を掴まされることはない。
+    let learned: Vec<(uuid::Uuid, String)> = pending
+        .bound
+        .iter()
+        .filter(|b| !b.observed_class.is_empty() && b.observed_class != b.launched.class)
+        .map(|b| (b.launched.id, b.observed_class.clone()))
+        .collect();
+    remember_learned_classes(&learned, config, data_dir);
+
+    if !force && !still_current {
+        tracing::info!(target: "launch", workset = %pending.workset_id, "switch: the user moved on; bindings saved, placement skipped");
+        return;
+    }
+    reopen_place_workset(pending.workset_id, config, data_dir, coordinator);
+
+    // URL を持たずに起動したブラウザはアドレスバーにフォーカスが当たった状態で
+    // 開く。切替中の打鍵がオムニボックスへ流れ込まないよう、配置後に最小化する。
+    for b in &pending.bound {
+        if pending.blank_browsers.contains(&b.launched.id) {
+            tracing::info!(target: "launch", hwnd = b.hwnd, "minimizing relaunched blank browser (no captured URL)");
+            Win32WindowOps.minimize(b.hwnd);
+        }
+    }
+}
+
+/// 監視の途中経過。
+struct AcquireWatch {
+    pending: PendingAcquire,
+    polls: u32,
+    /// 一度でも配置したか。以後は差し替わりが起きたときだけ配置し直す。
+    placed: bool,
+}
+
+/// 起動したウィンドウが現れるのを繰り返し確認し、現れ次第それを起動した管理
+/// ウィンドウへ結びつける。全部揃った時点で配置して `on_done` を呼び、そのあとも
+/// 期限まで見張って、掴んだ窓が消えたら本物へ結び直して配置し直す。
+///
+/// `force_first_placement` は「開き直す」ボタンから呼ぶときだけ真。あのボタンは
+/// 現在セットでないものを開き直すことがあり、そのときも配置してよい。切替経由の
+/// 呼び出しでは偽——切替はもう終わっているので、ここでの配置はやり直しであって、
+/// ユーザーが別のセットへ移っていたら黙って見送るべきものになる。
+fn start_acquire_watch(
+    pending: PendingAcquire,
+    config: Rc<RefCell<AppConfig>>,
+    data_dir: PathBuf,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
+    force_first_placement: bool,
+    on_done: impl Fn() + 'static,
+) {
+    let watch = RefCell::new(AcquireWatch {
+        pending,
+        polls: 0,
+        placed: false,
+    });
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        ACQUIRE_POLL_INTERVAL,
+        move || {
+            enum Step {
+                Wait,
+                Place { first: bool },
+            }
+            let (step, expired) = {
+                let mut watch = watch.borrow_mut();
+                let watch = &mut *watch;
+                watch.polls += 1;
+                let vanished = drop_vanished_bindings(&mut watch.pending);
+                let newly_bound = bind_appeared_windows(&mut watch.pending);
+                let expired = watch.polls >= ACQUIRE_MAX_POLLS;
+                let all_bound = watch.pending.dead.is_empty();
+                let step = match (watch.placed, all_bound) {
+                    // 初回：全部揃ったら（または期限切れなら）配置する。
+                    (false, _) if all_bound || expired => Step::Place { first: true },
+                    // 二度目以降：掴んだ窓が本物へ差し替わったときだけ配置し直す。
+                    (true, true) if vanished || newly_bound => Step::Place { first: false },
+                    _ => Step::Wait,
+                };
+                (step, expired)
+            };
+            if let Step::Place { first } = step {
+                let mut watch = watch.borrow_mut();
+                watch.placed = true;
+                finish_acquire(
+                    &mut watch.pending,
+                    &config,
+                    &data_dir,
+                    &coordinator,
+                    first && force_first_placement,
+                );
+                drop(watch);
+                // 紐づけ結果が変わったので、開いている管理画面にも反映させる。
+                on_done();
+            }
+            if expired {
+                REOPEN_TIMER.with(|t| {
+                    if let Some(timer) = t.borrow().as_ref() {
+                        timer.stop();
+                    }
+                });
+                on_done();
+            }
+        },
+    );
+    REOPEN_TIMER.with(|t| *t.borrow_mut() = Some(timer));
 }
 
 fn wire_workset_manager(
@@ -878,36 +2584,29 @@ fn wire_workset_manager(
     data_dir: PathBuf,
     config: Rc<RefCell<AppConfig>>,
     state: Rc<RefCell<WorksetManagerState>>,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
 ) {
     {
         let mut state = state.borrow_mut();
         refresh_workset_summaries(manager, &config.borrow(), &mut state);
-        manager.set_color_choices(
-            std::rc::Rc::new(slint::VecModel::from(
-                [
-                    "#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2",
-                ]
-                .map(hex_to_color)
-                .to_vec(),
-            ))
-            .into(),
-        );
-        manager.set_selected_color(state.selected_color);
+        refresh_color_choices(manager, &config.borrow(), &mut state);
     }
 
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_refresh_requested(move || {
         let Some(manager) = m.upgrade() else { return };
         let mut state = s.borrow_mut();
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
     });
 
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
+    let d = data_dir.clone();
     manager.on_workset_selected(move |index| {
         let Some(manager) = m.upgrade() else { return };
         let Ok(index) = usize::try_from(index) else {
@@ -917,7 +2616,7 @@ fn wire_workset_manager(
         if index < c.borrow().worksets.len() {
             state.selected_workset_index = Some(index);
         }
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
     });
 
     let m = manager.as_weak();
@@ -951,110 +2650,963 @@ fn wire_workset_manager(
             }
         }
         refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-        refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
     });
+
+    // ---- UI 1: 起動候補を登録 (the launch-app registry) ----
+    // Load the Start Menu catalogue once, now, so the registry's picker is
+    // populated the first time it is opened.
+    spawn_app_catalog_load(manager.as_weak());
+    refresh_launch_apps(manager, &config.borrow(), &mut state.borrow_mut());
 
     let m = manager.as_weak();
     let c = config.clone();
     let s = state.clone();
-    let pid = std::process::id();
-    manager.on_start_registration(move || {
+    manager.on_open_app_registry(move || {
         let Some(manager) = m.upgrade() else { return };
-        let mut state = s.borrow_mut();
-        let config = c.borrow();
-
-        if config.main_monitor_ids.is_empty() {
-            manager.set_status_text("メイン画面が未設定です。先にレイアウトスタジオで「メイン画面を選択」してください。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
-        let main_bounds = resolve_main_monitor_bounds(&state.monitors, &config.main_monitor_ids);
-        let live_windows = match enumerate::enumerate_top_level_windows(pid) {
-            Ok(windows) => windows,
-            Err(err) => {
-                manager.set_status_text(format!("ウィンドウ一覧の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
-        let candidates = layout_service::find_windows_on_main_screen(&live_windows, &main_bounds);
-
-        if candidates.is_empty() {
-            manager.set_status_text("メイン画面に候補ウィンドウがありません。登録したいウィンドウをメイン画面へ配置してください。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        let model_items: Vec<RegistrationCandidate> = candidates
-            .iter()
-            .map(|w| RegistrationCandidate {
-                title: w.title.clone().into(),
-                process_name: w.executable_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| w.window_class.clone()).into(),
-                checked: true,
-            })
-            .collect();
-        manager.set_candidates(std::rc::Rc::new(slint::VecModel::from(model_items)).into());
-        state.registration_candidates = candidates;
-        state.picked_repository = None;
-        manager.set_picked_folder_label("（未選択）".into());
-        manager.set_resolved_repo_label("".into());
-        manager.set_registering(true);
-        manager.set_status_text("リポジトリフォルダーを選択し、登録するウィンドウを確認してください。".into());
+        manager.set_registry_search("".into());
+        manager.set_registry_name("".into());
+        manager.set_registry_path("".into());
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+        push_app_catalog(&manager);
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
+        manager.set_managing_apps(true);
+        manager.set_status_text(
+            "アプリの名称とパスを入力するか、スタートメニューから選んでください。".into(),
+        );
         manager.set_status_is_warning(false);
     });
 
     let m = manager.as_weak();
-    manager.on_cancel_registration(move || {
+    manager.on_close_app_registry(move || {
         let Some(manager) = m.upgrade() else { return };
-        manager.set_registering(false);
-    });
-
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    manager.on_pick_folder_requested(move || {
-        let Some(manager) = m.upgrade() else { return };
-        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-
-        let (repository_path, repository_kind) = workset_service::resolve_repository(&folder);
-        if workset_service::is_duplicate_repository(&c.borrow().worksets, &repository_path) {
-            manager.set_status_text("このリポジトリは既に登録されています。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        manager.set_picked_folder_label(folder.display().to_string().into());
-        let kind_label = match repository_kind {
-            crate::domain::workset::RepositoryKind::Git => "Gitリポジトリ",
-            crate::domain::workset::RepositoryKind::Directory => "通常フォルダー",
-        };
-        manager.set_resolved_repo_label(
-            format!(
-                "{kind_label}として登録されます: {}",
-                repository_path.display()
-            )
-            .into(),
-        );
-        s.borrow_mut().picked_repository = Some((repository_path, repository_kind));
+        manager.set_managing_apps(false);
         manager.set_status_text("".into());
         manager.set_status_is_warning(false);
     });
 
     let m = manager.as_weak();
-    manager.on_candidate_toggled(move |index| {
+    manager.on_registry_catalog_refresh_requested(move || {
+        spawn_app_catalog_load(m.clone());
+    });
+
+    let m = manager.as_weak();
+    manager.on_registry_search_changed(move |_query| {
+        let Some(manager) = m.upgrade() else { return };
+        // The query is read back off the property, which the LineEdit has
+        // already written — no need to thread the argument through.
+        push_app_catalog(&manager);
+    });
+
+    // Picking a Start Menu entry only *fills the form* — the user still presses
+    // 登録 — so a wrong pick can be corrected before anything is persisted.
+    let m = manager.as_weak();
+    manager.on_registry_catalog_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Some(app) = catalog_app(index) else {
+            return;
+        };
+        manager.set_registry_name(app.name.clone().into());
+        manager.set_registry_path(app.target.display().to_string().into());
+        manager.set_registry_args(app.args.clone().into());
+        manager.set_registry_aumid(app.aumid.clone().unwrap_or_default().into());
+    });
+
+    let m = manager.as_weak();
+    manager.on_registry_browse_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("実行ファイル", &["exe"])
+            .pick_file()
+        else {
+            return;
+        };
+        // Fill the name from the file stem when it is still blank, so browsing
+        // alone is enough to register.
+        if manager.get_registry_name().trim().is_empty()
+            && let Some(stem) = path.file_stem()
+        {
+            manager.set_registry_name(stem.to_string_lossy().into_owned().into());
+        }
+        manager.set_registry_path(path.display().to_string().into());
+        // A browsed exe carries neither shortcut arguments nor an AUMID — drop
+        // whatever a catalogue entry picked earlier in this form left behind.
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    manager.on_registry_save_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let name = manager.get_registry_name().trim().to_string();
+        let program = PathBuf::from(manager.get_registry_path().trim());
+        let args = manager.get_registry_args().trim().to_string();
+        let aumid = Some(manager.get_registry_aumid().trim().to_string()).filter(|a| !a.is_empty());
+
+        if name.is_empty() {
+            manager.set_status_text("名称を入力してください。".into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+        if program.as_os_str().is_empty() {
+            manager.set_status_text("パスを入力してください。".into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+        // A missing target is a warning, not a rejection: a network or
+        // removable-drive app is still worth registering.
+        let missing = !program.exists();
+
+        {
+            let mut config = c.borrow_mut();
+            if config
+                .launch_apps
+                .iter()
+                .any(|a| a.name.eq_ignore_ascii_case(&name))
+            {
+                drop(config);
+                manager.set_status_text(format!("「{name}」は既に登録されています。").into());
+                manager.set_status_is_warning(true);
+                return;
+            }
+            config.launch_apps.push(crate::domain::workset::LaunchApp {
+                id: uuid::Uuid::new_v4(),
+                name: name.clone(),
+                program,
+                args,
+                aumid,
+            });
+        }
+
+        if let Err(err) = config_store::save(&dir, &c.borrow()) {
+            c.borrow_mut().launch_apps.pop();
+            tracing::warn!(error = %err, "launch-app registry: failed to save config");
+            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
+        manager.set_registry_catalog_index(-1);
+        manager.set_registry_name("".into());
+        manager.set_registry_path("".into());
+        manager.set_registry_args("".into());
+        manager.set_registry_aumid("".into());
+        // Keep the search query: registering several apps in a row usually
+        // means several matches of the same search.
+        manager.set_status_text(
+            if missing {
+                format!("「{name}」を登録しました（指定のパスは現在見つかりません）。")
+            } else {
+                format!("「{name}」を登録しました。")
+            }
+            .into(),
+        );
+        manager.set_status_is_warning(missing);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    manager.on_registry_delete_requested(move |index| {
         let Some(manager) = m.upgrade() else { return };
         let Ok(index) = usize::try_from(index) else {
             return;
         };
-        let model = manager.get_candidates();
+
+        let removed = {
+            let mut config = c.borrow_mut();
+            if index >= config.launch_apps.len() {
+                return;
+            }
+            config.launch_apps.remove(index)
+        };
+
+        if let Err(err) = config_store::save(&dir, &c.borrow()) {
+            c.borrow_mut().launch_apps.insert(index, removed);
+            tracing::warn!(error = %err, "launch-app registry: failed to save config");
+            manager.set_status_text(format!("保存に失敗しました: {err}").into());
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        refresh_launch_apps(&manager, &c.borrow(), &mut s.borrow_mut());
+        manager.set_status_text(
+            format!(
+                "「{}」を起動候補から削除しました（登録済みセットはそのままです）。",
+                removed.name
+            )
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    // ---- UI 2: セットに紐づけ ----
+    let m = manager.as_weak();
+    let c = config.clone();
+    manager.on_app_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let app = launch_app_at(&c.borrow(), index);
+        apply_app_selection(&manager, app.as_ref());
+    });
+
+    let m = manager.as_weak();
+    manager.on_placement_split_selected(move |_index| {
+        let Some(manager) = m.upgrade() else { return };
+        // The cell list belongs to the split, so re-derive it (and reset to the
+        // first cell) whenever the split changes.
+        refresh_placement_cells(&manager);
+    });
+
+    let m = manager.as_weak();
+    manager.on_app_pick_folder_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            manager.set_app_input_text(path.display().to_string().into());
+        }
+    });
+
+    let m = manager.as_weak();
+    manager.on_app_pick_workspace_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("VS Code ワークスペース", &["code-workspace"])
+            .pick_file()
+        {
+            manager.set_app_input_text(path.display().to_string().into());
+        }
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_add_app_confirmed(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let input = manager.get_app_input_text().to_string();
+        let extra_args = manager.get_app_args_text().to_string();
+        let index = manager.get_app_selected_index();
+
+        let Some(app) = launch_app_at(&c.borrow(), index) else {
+            manager.set_status_text("追加するアプリを選んでください。".into());
+            manager.set_status_is_warning(true);
+            return;
+        };
+
+        let monitor_index = manager.get_placement_monitor_index();
+        let Ok(monitor_index) = usize::try_from(monitor_index) else {
+            manager.set_status_text(
+                "メイン画面が設定されていません。レイアウトスタジオでメイン画面を指定してください。"
+                    .into(),
+            );
+            manager.set_status_is_warning(true);
+            return;
+        };
+        let split = placement_split_at(manager.get_placement_split_index());
+        let cell_index = usize::try_from(manager.get_placement_cell_index()).unwrap_or(0);
+
+        // Queued, not saved: the set doesn't exist yet, so the whole list is
+        // applied when 登録 is pressed.
+        let mut state = s.borrow_mut();
+        let name = app.name.clone();
+        // 編集中の行があれば、追加ではなくその行を書き換える。「退避せず最小化」は
+        // このフォームにない設定なので、行が持っている値を引き継ぐ。
+        let editing = state
+            .editing_pending_index
+            .filter(|index| *index < state.pending_apps.len());
+        let entry = PendingApp {
+            app,
+            input,
+            extra_args,
+            monitor_index,
+            split,
+            cell_index,
+            // 既定は退避。登録後に詳細のチェックボックスで最小化へ切り替える。
+            minimize_when_parked: editing
+                .is_some_and(|index| state.pending_apps[index].minimize_when_parked),
+        };
+        match editing {
+            Some(index) => state.pending_apps[index] = entry,
+            None => state.pending_apps.push(entry),
+        }
+        refresh_pending_apps(&manager, &state);
+        clear_pending_app_form(&manager, &mut state);
+        drop(state);
+
+        manager.set_status_text(
+            match editing {
+                Some(_) => format!("「{name}」を更新しました。「更新」でセットに保存されます。"),
+                None => format!("「{name}」を追加しました。「登録」でセットに保存されます。"),
+            }
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    // 追加済みの行の「編集」: その行をフォームへ読み戻し、以降は「この内容で更新」が
+    // 同じ行を書き換える。
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_pending_app_edit_requested(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        let Some(pending) = state.pending_apps.get(index).cloned() else {
+            return;
+        };
+        let found = load_pending_app_into_form(&manager, &c.borrow(), &pending);
+        state.editing_pending_index = Some(index);
+        manager.set_pending_edit_index(i32::try_from(index).unwrap_or(-1));
+        drop(state);
+
+        if found {
+            manager.set_status_text(format!("「{}」を編集しています。", pending.app.name).into());
+            manager.set_status_is_warning(false);
+        } else {
+            manager.set_status_text(
+                format!(
+                    "「{}」は起動候補にありません。アプリを選び直してください。",
+                    pending.app.name
+                )
+                .into(),
+            );
+            manager.set_status_is_warning(true);
+        }
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_pending_app_edit_cancelled(move || {
+        let Some(manager) = m.upgrade() else { return };
+        clear_pending_app_form(&manager, &mut s.borrow_mut());
+        manager.set_status_text("編集をやめました。".into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_pending_app_removed(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let mut state = s.borrow_mut();
+        if index >= state.pending_apps.len() {
+            return;
+        }
+        state.pending_apps.remove(index);
+        // 編集中の行が消えたらフォームも空に戻す。手前の行が消えたときは、同じ行を
+        // 指し続けるように番号をずらす。
+        match state.editing_pending_index {
+            Some(editing) if editing == index => clear_pending_app_form(&manager, &mut state),
+            Some(editing) if editing > index => {
+                state.editing_pending_index = Some(editing - 1);
+                manager.set_pending_edit_index(i32::try_from(editing - 1).unwrap_or(-1));
+            }
+            _ => {}
+        }
+        refresh_pending_apps(&manager, &state);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let dir = data_dir.clone();
+    let coord = coordinator.clone();
+    manager.on_reopen_closed_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        // Reuse the switch path's launch-and-acquire flow rather than launching
+        // by hand. Launching alone left the reopened windows unbound: nothing
+        // told RepoDeck *which* managed window each new window belonged to, so
+        // they only bound if the matcher happened to score them past the
+        // auto-rebind threshold — which a fresh window (different title, no
+        // recorded class) usually doesn't. `acquire_launched_and_place` pairs
+        // each newly-appeared window with the entry it was launched for.
+        let pending = {
+            let state = s.borrow();
+            let config = c.borrow();
+            let Some(workset) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get(i))
+            else {
+                return;
+            };
+            let workset_id = workset.id;
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+            let runtime = runtime_store::load(&dir);
+            launch_missing_for_switch(&config, &runtime.window_bindings, &live_windows, workset_id)
+        };
+
+        let Some(pending) = pending else {
+            manager.set_status_text("開き直せる閉じたアプリはありませんでした。".into());
+            manager.set_status_is_warning(false);
+            return;
+        };
+
+        let launched = pending.dead.len();
+        manager.set_status_text(
+            format!(
+                "{launched}個のアプリを起動しました。配置を復元しています… （復元完了まで、同じアプリを手動で起動しないでください）"
+            )
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+
+        // ウィンドウが現れるのを待ちながら、現れた順に結びつけて配置する。
+        let c2 = c.clone();
+        let dir2 = dir.clone();
+        let m2 = m.clone();
+        let s2 = s.clone();
+        start_acquire_watch(pending, c.clone(), dir.clone(), coord.clone(), true, move || {
+            if let Some(manager) = m2.upgrade() {
+                let mut state = s2.borrow_mut();
+                refresh_workset_summaries(&manager, &c2.borrow(), &mut state);
+                refresh_selected_workset_detail(&manager, &c2.borrow(), &state, &dir2);
+                manager.set_status_text("配置を復元しました。".into());
+                manager.set_status_is_warning(false);
+            }
+        });
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_close_workset_windows_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let workset_id = {
+            let state = s.borrow();
+            let config = c.borrow();
+            let Some(workset) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get(i))
+            else {
+                return;
+            };
+            workset.id
+        };
+        let Some((name, closed)) = close_workset_windows(&c.borrow(), &d, workset_id) else {
+            return;
+        };
+
+        manager.set_status_text(
+            if closed == 0 {
+                format!("「{name}」は開いていません。")
+            } else {
+                format!("「{name}」のウィンドウ{closed}個に終了を要求しました。")
+            }
+            .into(),
+        );
+        manager.set_status_is_warning(false);
+        let mut state = s.borrow_mut();
+        refresh_workset_summaries(&manager, &c.borrow(), &mut state);
+        refresh_selected_workset_detail(&manager, &c.borrow(), &state, &d);
+    });
+
+    // 退避せず最小化: 選択セットの index 番目のウィンドウの
+    // `minimize_when_parked` を反転して保存する。次の切り替えから有効。
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_toggle_window_minimize_when_parked(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        {
+            let mut config = c.borrow_mut();
+            let state = s.borrow();
+            let Some(window) = state
+                .selected_workset_index
+                .and_then(|i| config.worksets.get_mut(i))
+                .and_then(|w| w.windows.get_mut(index))
+            else {
+                return;
+            };
+            window.minimize_when_parked = !window.minimize_when_parked;
+        }
+        if let Err(err) = config_store::save(&d, &c.borrow()) {
+            tracing::warn!(error = %err, "failed to save minimize-when-parked toggle");
+        }
+        refresh_selected_workset_detail(&manager, &c.borrow(), &s.borrow(), &d);
+    });
+
+    // 編集: load the selected set back into the registration view. Everything
+    // about it is recoverable from what was saved, so the same form serves both
+    // creating and changing — only the target of 登録/更新 differs.
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_edit_workset_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        let config = c.borrow();
+        let Some(workset) = state
+            .selected_workset_index
+            .and_then(|i| config.worksets.get(i))
+        else {
+            return;
+        };
+
+        state.editing_workset_id = Some(workset.id);
+        state.pending_apps = workset
+            .windows
+            .iter()
+            .map(|w| pending_from_managed_window(w, &config))
+            .collect();
+        state.selected_color = hex_to_color(&workset.color);
+        state.fullscreen_when_parked = workset.fullscreen_when_parked;
+        state.parking_selected_sub = match &workset.parking_policy {
+            crate::domain::workset::ParkingPolicy::SubScreen { sub_screen_id } => config
+                .sub_screens
+                .iter()
+                .position(|sub| sub.id == *sub_screen_id)
+                .and_then(|i| i32::try_from(i).ok())
+                .unwrap_or(-1),
+            _ => -1,
+        };
+        let name = workset.name.clone();
+
+        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
+        refresh_pending_apps(&manager, &state);
+        refresh_launch_apps(&manager, &config, &mut state);
+        refresh_placement_monitors(&manager, &config, &state);
+        manager.set_placement_split_index(0);
+        refresh_placement_cells(&manager);
+        refresh_parking_subs(&manager, &config, &mut state);
+
+        // The full palette, not just unused colors — this set's own color has to
+        // stay selectable.
+        manager.set_color_choices(
+            std::rc::Rc::new(slint::VecModel::from(
+                WORKSET_PALETTE
+                    .iter()
+                    .map(|c| hex_to_color(c))
+                    .collect::<Vec<_>>(),
+            ))
+            .into(),
+        );
+        manager.set_selected_color(state.selected_color);
+        manager.set_registration_name(name.into());
+        manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
+        manager.set_registration_editing(true);
+        manager.set_registering(true);
+        manager.set_status_text("アプリ・画面・名前を変更して「更新」を押してください。".into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    manager.on_start_registration(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        let config = c.borrow();
+
+        state.pending_apps.clear();
+        state.editing_workset_id = None;
+        manager.set_registration_editing(false);
+        // Monitors are re-enumerated here so the 画面 picker labels the screens
+        // as they are *now*, not as they were when the manager opened.
+        state.monitors = monitor::enumerate_monitors().unwrap_or_default();
+        refresh_pending_apps(&manager, &state);
+        refresh_launch_apps(&manager, &config, &mut state);
+        refresh_placement_monitors(&manager, &config, &state);
+        manager.set_placement_split_index(0);
+        refresh_placement_cells(&manager);
+        manager.set_registration_name("".into());
+        state.fullscreen_when_parked = false;
+        manager.set_fullscreen_when_parked(false);
+        // Reset the 退避先 picker to 自動 and refresh the sub-screen chips.
+        state.parking_selected_sub = -1;
+        refresh_parking_subs(&manager, &config, &mut state);
+        // Offer only colors not already taken by an existing workset.
+        refresh_color_choices(&manager, &config, &mut state);
+        manager.set_registering(true);
+        manager.set_status_text(
+            "名前を入力し、このセットで開くアプリと画面を追加してください。".into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_fullscreen_toggled(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        state.fullscreen_when_parked = !state.fullscreen_when_parked;
+        manager.set_fullscreen_when_parked(state.fullscreen_when_parked);
+    });
+
+    // --- 退避先 (自動 / サブ画面) selection ---
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_parking_sub_selected(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        s.borrow_mut().parking_selected_sub = index;
+        manager.set_parking_selected_sub(index);
+    });
+
+    // --- "メイン画面を空にする" (moved here from Layout Studio) ---
+    // Runs directly, with no confirmation panel: registered windows on the main
+    // screen are parked to their workset's destination; everything else on main
+    // is minimized.
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_empty_main_screen_requested(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        let config = c.borrow();
+
+        if config.main_monitor_ids.is_empty() {
+            manager.set_status_text(
+                "メイン画面が未設定です。先にレイアウトスタジオでメイン画面を登録してください。"
+                    .into(),
+            );
+            manager.set_status_is_warning(true);
+            return;
+        }
+
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        state.monitors = live_monitors.clone();
+        let main_bounds = resolve_main_monitor_bounds(&live_monitors, &config.main_monitor_ids);
+        let windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let candidates = layout_service::find_windows_on_main_screen(&windows, &main_bounds);
+
+        if candidates.is_empty() {
+            manager.set_status_text("メイン画面に対象のウィンドウはありませんでした。".into());
+            manager.set_status_is_warning(false);
+            return;
+        }
+
+        let (owner_park_rect, owner_fullscreen) =
+            compute_empty_main_destinations(&config, &d, &live_monitors, &windows);
+
+        let mut entries = Vec::new();
+        let mut parked = 0usize;
+        let mut minimized = 0usize;
+        for window in &candidates {
+            let hwnd = HWND(window.hwnd as *mut _);
+            let before_show_state = match win_placement::get_show_state(hwnd) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let before_rect = match win_placement::get_normal_rect(hwnd) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if let Some(rect) = owner_park_rect.get(&window.hwnd) {
+                // Un-maximize + fill the cell (visible bounds, so the invisible
+                // DWM border doesn't leave a gutter between windows).
+                win_placement::set_placement(hwnd, *rect, false, true);
+                if owner_fullscreen.contains(&window.hwnd) {
+                    crate::windowing::key_input::send_fullscreen_keys(hwnd, None);
+                }
+                parked += 1;
+            } else {
+                win_placement::minimize(hwnd);
+                minimized += 1;
+            }
+            entries.push(UndoEntry {
+                hwnd: window.hwnd,
+                process_id: window.process_id,
+                before_rect,
+                before_show_state,
+            });
+        }
+
+        state.empty_undo_snapshot = UndoSnapshot { entries };
+        manager.set_empty_undo_available(!state.empty_undo_snapshot.is_empty());
+        manager.set_empty_screen_panel_visible(false);
+        manager
+            .set_status_text(format!("{parked}個を退避、{minimized}個を最小化しました。").into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    manager.on_empty_candidate_toggled(move |index| {
+        let Some(manager) = m.upgrade() else { return };
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let model = manager.get_main_screen_candidates();
         if let Some(mut row) = model.row_data(index) {
             row.checked = !row.checked;
             model.set_row_data(index, row);
         }
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_cancel_empty_main_screen(move || {
+        let Some(manager) = m.upgrade() else { return };
+        s.borrow_mut().pending_empty_candidates.clear();
+        manager.set_empty_screen_panel_visible(false);
+        manager.set_status_text("キャンセルしました。".into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let c = config.clone();
+    let s = state.clone();
+    let d = data_dir.clone();
+    manager.on_confirm_empty_main_screen(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+
+        // Map each live HWND to the workset that owns it (if any) and, for
+        // worksets with a sub-screen destination, the rect to park it into —
+        // so a window registered in another set is sent to its parking area
+        // instead of being minimized.
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let (owner_park_rect, owner_fullscreen): (
+            std::collections::HashMap<isize, crate::domain::placement::PixelRect>,
+            std::collections::HashSet<isize>,
+        ) = {
+            let config = c.borrow();
+            let live_windows =
+                enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+            let runtime = runtime_store::load(&d);
+            let decisions = workset_service::resolve_all_matches_with_bindings(
+                &config.worksets,
+                &live_windows,
+                &runtime.window_bindings,
+                None,
+            );
+
+            // Auto/Fixed worksets park to allocator-assigned cells; SubScreen
+            // worksets to their sub cell. `current_workset_id: None` so the
+            // *active* workset (whose windows are on main) is parked too — the
+            // whole point of emptying the main screen.
+            use crate::application::parking_allocator::{
+                AllocationInput, ParkAssignment, ParkingSlotId, allocate_parking,
+            };
+            let previous: std::collections::HashMap<uuid::Uuid, ParkingSlotId> = runtime
+                .auto_slot_assignments
+                .iter()
+                .filter_map(|(k, v)| {
+                    Some((uuid::Uuid::parse_str(k).ok()?, ParkingSlotId::decode(v)?))
+                })
+                .collect();
+            let sub_screen_monitor_ids: Vec<String> = config
+                .sub_screens
+                .iter()
+                .flat_map(|s| s.monitor_ids.iter().cloned())
+                .collect();
+            // Only sets with live windows reserve a cell (see allocate_parking).
+            let worksets_with_windows: std::collections::HashSet<uuid::Uuid> = config
+                .worksets
+                .iter()
+                .filter(|w| {
+                    w.windows.iter().any(|mw| {
+                        matches!(decisions.get(&mw.id), Some(MatchDecision::AutoRebind { .. }))
+                    })
+                })
+                .map(|w| w.id)
+                .collect();
+            let allocation = allocate_parking(&AllocationInput {
+                worksets: &config.worksets,
+                current_workset_id: None,
+                fixed_slots: &config.fixed_slots,
+                main_monitor_ids: &config.main_monitor_ids,
+                live_monitors: &live_monitors,
+                saved_monitors: &config.monitors,
+                sub_screen_monitor_ids: &sub_screen_monitor_ids,
+                previous_assignments: &previous,
+                worksets_with_windows: &worksets_with_windows,
+            });
+
+            let mut rects = std::collections::HashMap::new();
+            let mut fullscreen = std::collections::HashSet::new();
+            for workset in &config.worksets {
+                use crate::domain::workset::ParkingPolicy;
+                // Where this workset's windows should park, and whether to send
+                // full-screen keys. `None` → its windows fall through to minimize.
+                let dest: Option<(crate::domain::placement::PixelRect, bool)> =
+                    match &workset.parking_policy {
+                        ParkingPolicy::SubScreen { sub_screen_id } => config
+                            .sub_screens
+                            .iter()
+                            .find(|s| s.id == *sub_screen_id)
+                            .and_then(|sub| {
+                                let live_ids: std::collections::HashSet<uuid::Uuid> = config
+                                    .worksets
+                                    .iter()
+                                    .filter(|w| {
+                                        w.windows.iter().any(|mw| {
+                                            matches!(
+                                                decisions.get(&mw.id),
+                                                Some(MatchDecision::AutoRebind { .. })
+                                            )
+                                        })
+                                    })
+                                    .map(|w| w.id)
+                                    .collect();
+                                let slot =
+                                    crate::application::switch_coordinator::sub_screen_slot_rect(
+                                        sub,
+                                        &config.worksets,
+                                        workset.id,
+                                        &live_monitors,
+                                        &live_ids,
+                                    )?;
+                                // Full-screen only for a sole occupant — a shared
+                                // sub-screen can't have overlapping full windows.
+                                let sole = crate::application::switch_coordinator::sub_screen_sharer_count(
+                                    &config.worksets,
+                                    *sub_screen_id,
+                                ) <= 1;
+                                Some((slot, sole && (workset.fullscreen_when_parked || sub.fullscreen)))
+                            }),
+                        _ => match allocation.assignments.get(&workset.id) {
+                            Some(ParkAssignment::AutoSlot { rect, .. })
+                            | Some(ParkAssignment::FixedSlot { rect, .. }) => {
+                                Some((*rect, workset.fullscreen_when_parked))
+                            }
+                            _ => None,
+                        },
+                    };
+                let Some((slot, want_fullscreen)) = dest else {
+                    continue;
+                };
+                // Resolve this workset's live windows and their main-screen rects
+                // so they can be shrunk into the cell preserving relative layout.
+                let mut hwnds = Vec::new();
+                let mut main_rects = Vec::new();
+                for w in &workset.windows {
+                    if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id)
+                        && let Some(outcome) =
+                            crate::application::main_placement::resolve_main_restore(
+                                &w.main_placement,
+                                &live_monitors,
+                                &config.main_monitor_ids,
+                            )
+                    {
+                        hwnds.push(*hwnd);
+                        main_rects.push(outcome.rect);
+                    }
+                }
+                if hwnds.is_empty() {
+                    continue;
+                }
+                match crate::application::parking_placement::plan_park_into_slot(&main_rects, slot) {
+                    crate::application::parking_placement::ParkPlan::ShrinkToFit(mapped) => {
+                        for (hwnd, rect) in hwnds.iter().zip(mapped) {
+                            rects.insert(*hwnd, rect);
+                            if want_fullscreen {
+                                fullscreen.insert(*hwnd);
+                            }
+                        }
+                    }
+                    // Windows too small to park → left out, minimized below.
+                    crate::application::parking_placement::ParkPlan::MinimizeWhole => {}
+                }
+            }
+            (rects, fullscreen)
+        };
+
+        let model = manager.get_main_screen_candidates();
+        let mut entries = Vec::new();
+        let mut parked = 0usize;
+        let mut minimized = 0usize;
+        for (index, window) in state.pending_empty_candidates.iter().enumerate() {
+            let checked = model.row_data(index).map(|row| row.checked).unwrap_or(false);
+            if !checked {
+                continue;
+            }
+            let hwnd = HWND(window.hwnd as *mut _);
+            let before_show_state = match win_placement::get_show_state(hwnd) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(error = %err, hwnd = window.hwnd, "empty-main: skipping window, failed to read show state");
+                    continue;
+                }
+            };
+            let before_rect = match win_placement::get_normal_rect(hwnd) {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::warn!(error = %err, hwnd = window.hwnd, "empty-main: skipping window, failed to read normal rect");
+                    continue;
+                }
+            };
+
+            if let Some(rect) = owner_park_rect.get(&window.hwnd) {
+                // Registered in another set with a sub-screen: park it there.
+                win_placement::restore(hwnd);
+                if win_placement::set_window_rect(hwnd, *rect).is_ok() {
+                    let want_fs = owner_fullscreen.contains(&window.hwnd);
+                    if want_fs {
+                        // Send the browser's own full-screen key (F) so a parked
+                        // video fills the sub-screen. No refocus target here — the
+                        // main screen is being emptied.
+                        crate::windowing::key_input::send_fullscreen_keys(hwnd, None);
+                    }
+                    parked += 1;
+                } else {
+                    win_placement::minimize(hwnd);
+                    minimized += 1;
+                }
+            } else {
+                win_placement::minimize(hwnd);
+                minimized += 1;
+            }
+            entries.push(UndoEntry {
+                hwnd: window.hwnd,
+                process_id: window.process_id,
+                before_rect,
+                before_show_state,
+            });
+        }
+
+        state.empty_undo_snapshot = UndoSnapshot { entries };
+        state.pending_empty_candidates.clear();
+
+        manager.set_empty_undo_available(!state.empty_undo_snapshot.is_empty());
+        manager.set_empty_screen_panel_visible(false);
+        manager.set_status_text(
+            format!("{parked}個を退避、{minimized}個を最小化しました。").into(),
+        );
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_undo_empty_main_screen(move || {
+        let Some(manager) = m.upgrade() else { return };
+        let mut state = s.borrow_mut();
+        perform_undo(&state.empty_undo_snapshot);
+        let count = state.empty_undo_snapshot.entries.len();
+        state.empty_undo_snapshot = UndoSnapshot::default();
+        manager.set_empty_undo_available(false);
+        manager.set_status_text(format!("{count}個のウィンドウを元に戻しました。").into());
+        manager.set_status_is_warning(false);
+    });
+
+    let m = manager.as_weak();
+    let s = state.clone();
+    manager.on_cancel_registration(move || {
+        let Some(manager) = m.upgrade() else { return };
+        {
+            let mut state = s.borrow_mut();
+            state.pending_apps.clear();
+            state.editing_workset_id = None;
+            refresh_pending_apps(&manager, &state);
+            clear_pending_app_form(&manager, &mut state);
+        }
+        manager.set_registration_editing(false);
+        manager.set_registering(false);
     });
 
     let m = manager.as_weak();
@@ -1079,71 +3631,113 @@ fn wire_workset_manager(
         }
 
         let mut state = s.borrow_mut();
-        let Some((repository_path, repository_kind)) = state.picked_repository.clone() else {
-            manager.set_status_text("リポジトリフォルダーを選択してください。".into());
+        if state.pending_apps.is_empty() {
+            manager.set_status_text("アプリを1つ以上追加してください。".into());
             manager.set_status_is_warning(true);
             return;
+        }
+
+        // The set's repository is whatever its VS Code entry has open — that is
+        // the only declared input that names a repository, and it drives agent
+        // matching and the quick switcher's git status.
+        let (repository_path, repository_kind) = derive_repository(&state.pending_apps)
+            .unwrap_or_else(|| {
+                (
+                    PathBuf::new(),
+                    crate::domain::workset::RepositoryKind::Directory,
+                )
+            });
+
+        let managed_windows: Vec<crate::domain::workset::ManagedWindow> = {
+            let main_ids = c.borrow().main_monitor_ids.clone();
+            state
+                .pending_apps
+                .iter()
+                .enumerate()
+                .map(|(z_order, pending)| build_launch_app_window(pending, z_order, &main_ids))
+                .collect()
         };
 
-        let model = manager.get_candidates();
-        let checked_windows: Vec<TopLevelWindow> = state
-            .registration_candidates
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| model.row_data(*i).is_some_and(|row| row.checked))
-            .map(|(_, w)| w.clone())
-            .collect();
-        if checked_windows.is_empty() {
-            manager.set_status_text("ウィンドウを1つ以上選択してください。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        let mut managed_windows = Vec::new();
-        for (z_order, window) in checked_windows.iter().enumerate() {
-            let hwnd = HWND(window.hwnd as *mut _);
-            let show_state = match win_placement::get_show_state(hwnd) {
-                Ok(show_state) => show_state,
-                Err(err) => {
-                    tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window, failed to read show state");
-                    continue;
-                }
-            };
-            let rect = match win_placement::get_normal_rect(hwnd) {
-                Ok(rect) => rect,
-                Err(err) => {
-                    tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window, failed to read normal rect");
-                    continue;
-                }
-            };
-            match workset_service::build_managed_window(window, rect, show_state, i32::try_from(z_order).unwrap_or(i32::MAX), &state.monitors, &c.borrow().main_monitor_ids) {
-                Ok(managed_window) => managed_windows.push(managed_window),
-                Err(err) => tracing::warn!(error = %err, hwnd = window.hwnd, "registration: skipping window not on a main monitor"),
-            }
-        }
-
-        if managed_windows.is_empty() {
-            manager.set_status_text("登録できるウィンドウがありませんでした。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
         let color_hex = color_to_hex(state.selected_color);
+        let editing_id = state.editing_workset_id;
         let save_result = {
             let mut config = c.borrow_mut();
             let sort_order = i32::try_from(config.worksets.len()).unwrap_or(i32::MAX);
-            let workset = workset_service::build_workset(name, color_hex, repository_path, repository_kind, sort_order, managed_windows);
-            config.worksets.push(workset);
+            let mut workset = workset_service::build_workset(
+                name,
+                color_hex,
+                repository_path,
+                repository_kind,
+                sort_order,
+                managed_windows,
+            );
+            workset.fullscreen_when_parked = state.fullscreen_when_parked;
 
-            let errors = config.validate();
-            if !errors.is_empty() {
-                config.worksets.pop();
-                Err(errors.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" / "))
+            // 退避先: -1 = 自動, otherwise the sub-screen at that index.
+            if state.parking_selected_sub >= 0
+                && let Some(sub) = usize::try_from(state.parking_selected_sub)
+                    .ok()
+                    .and_then(|i| config.sub_screens.get(i))
+            {
+                workset.parking_policy = crate::domain::workset::ParkingPolicy::SubScreen {
+                    sub_screen_id: sub.id,
+                };
+            }
+
+            // 更新 replaces the existing set's contents in place, keeping its
+            // identity — its id, created_at, sort_order and any hotkey bound to
+            // it. Snapshot the original so a validation or save failure can put
+            // it back untouched.
+            let backup = editing_id.and_then(|id| {
+                config
+                    .worksets
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| (w.id, w.clone()))
+            });
+            match &backup {
+                Some((existing_id, _)) => {
+                    if let Some(existing) =
+                        config.worksets.iter_mut().find(|w| &w.id == existing_id)
+                    {
+                        existing.name = workset.name.clone();
+                        existing.repository_path = workset.repository_path.clone();
+                        existing.repository_kind = workset.repository_kind;
+                        existing.color = workset.color.clone();
+                        existing.parking_policy = workset.parking_policy.clone();
+                        existing.fullscreen_when_parked = workset.fullscreen_when_parked;
+                        existing.windows = workset.windows.clone();
+                        existing.updated_at = clock::now_rfc3339();
+                    }
+                }
+                None => config.worksets.push(workset),
+            }
+
+            // 同じウィンドウを複数セットに登録するのは許容なので、検証はもう
+            // それを報告しない（`validate` から撤去済み）。残る検証はすべて致命。
+            let fatal: Vec<String> = config
+                .validate()
+                .iter()
+                .map(config_validation_message)
+                .collect();
+            let restore = |config: &mut AppConfig| match &backup {
+                Some((id, original)) => {
+                    if let Some(w) = config.worksets.iter_mut().find(|w| &w.id == id) {
+                        *w = original.clone();
+                    }
+                }
+                None => {
+                    config.worksets.pop();
+                }
+            };
+            if !fatal.is_empty() {
+                restore(&mut config);
+                Err(fatal.join(" / "))
             } else {
                 match config_store::save(&dir, &config) {
                     Ok(()) => Ok(()),
                     Err(err) => {
-                        config.worksets.pop();
+                        restore(&mut config);
                         Err(err.to_string())
                     }
                 }
@@ -1153,154 +3747,2463 @@ fn wire_workset_manager(
         match save_result {
             Ok(()) => {
                 state.registering = false;
+                state.pending_apps.clear();
+                let was_editing = state.editing_workset_id.take().is_some();
+                refresh_pending_apps(&manager, &state);
+                clear_pending_app_form(&manager, &mut state);
                 manager.set_registering(false);
-                manager.set_status_text("ワークセットを登録しました。".into());
+                manager.set_registration_editing(false);
+                manager.set_status_text(
+                    if was_editing {
+                        "セットを更新しました。"
+                    } else {
+                        "ワークセットを登録しました。"
+                    }
+                    .into(),
+                );
                 manager.set_status_is_warning(false);
                 refresh_workset_summaries(&manager, &c.borrow(), &mut state);
+                refresh_selected_workset_detail(&manager, &c.borrow(), &state, &dir);
             }
             Err(message) => {
-                manager.set_status_text(format!("登録できません: {message}").into());
+                manager.set_status_text(format!("保存できません: {message}").into());
                 manager.set_status_is_warning(true);
             }
         }
     });
+}
 
-    let m = manager.as_weak();
-    let c = config.clone();
-    let s = state.clone();
-    let dir = data_dir;
-    let pid = std::process::id();
-    manager.on_rebind_requested(move |window_index| {
-        let Some(manager) = m.upgrade() else { return };
-        let state = s.borrow();
-        let Some(ws_index) = state.selected_workset_index else {
-            return;
-        };
-        let Ok(window_index) = usize::try_from(window_index) else {
-            return;
-        };
+/// Rebuilds the Quick Switcher's row list from `config.worksets` (PLAN.md
+/// §3.3 "表示内容"), mirroring `refresh_workset_summaries`'s shape, plus each
+/// row's Codex agent-status badge (PLAN.md §6, Phase 8). When `sort_mode`
+/// isn't `Manual`, status priority becomes the primary sort key (highest
+/// first), with the existing `SortMode` comparator only breaking ties within
+/// a status group — `Manual` bypasses status grouping entirely (badges still
+/// show, order never changes).
+fn refresh_quick_switcher_rows(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    let state = runtime_store::load(data_dir);
+    let current_workset_id = state.current_workset_id;
+    let filter_text = switcher.get_filter_text().to_string();
+    let mut ordered = quick_switcher_service::sorted_and_filtered(
+        &config.worksets,
+        config.settings.sort_mode,
+        &filter_text,
+    );
 
-        let managed_window_id_and_matcher = {
-            let config = c.borrow();
-            config
-                .worksets
-                .get(ws_index)
-                .and_then(|w| w.windows.get(window_index))
-                .map(|w| (w.id, w.matcher.clone(), w.z_order))
-        };
-        let Some((managed_window_id, window_matcher, z_order)) = managed_window_id_and_matcher
-        else {
-            return;
-        };
+    // どのセットが今開いているかを、切替と同じ解決ロジックで数える。全部閉じている
+    // セットはクイックスイッチャーで色を落として示す。
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        &live_windows,
+        &state.window_bindings,
+        None,
+    );
 
-        let live_windows = match enumerate::enumerate_top_level_windows(pid) {
-            Ok(windows) => windows,
-            Err(err) => {
-                manager
-                    .set_status_text(format!("ウィンドウ一覧の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
-
-        let bound_elsewhere: std::collections::HashSet<isize> = {
-            let config = c.borrow();
-            let decisions = workset_service::resolve_all_matches(&config.worksets, &live_windows);
-            decisions
+    // 「起動中のみ」トグル: 開いているウィンドウが1つも無いセット（ウィンドウ
+    // 未登録のセットも含む）を一覧から外す。
+    if switcher.get_hide_closed() {
+        ordered.retain(|workset| {
+            workset
+                .windows
                 .iter()
-                .filter(|&(id, _)| *id != managed_window_id)
-                .filter_map(|(_, decision)| {
-                    if let MatchDecision::AutoRebind { hwnd } = decision {
-                        Some(*hwnd)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
+                .any(|w| matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. })))
+        });
+    }
 
-        let decision = crate::windowing::matcher::resolve_best_match(
-            &window_matcher,
-            &live_windows,
-            &bound_elsewhere,
-        );
-        let target_hwnd = match decision {
-            MatchDecision::AutoRebind { hwnd } => Some(hwnd),
-            MatchDecision::Ambiguous { candidates } => candidates.into_iter().next(),
-            MatchDecision::Unresolved => live_windows
-                .iter()
-                .filter(|w| !bound_elsewhere.contains(&w.hwnd))
-                .max_by_key(|w| crate::windowing::matcher::score_candidate(&window_matcher, w))
-                .map(|w| w.hwnd),
-        };
+    let aggregates = agent_status_service::aggregate_all(&config.worksets, &state.agent_runs);
+    if config.settings.sort_mode != SortMode::Manual {
+        ordered.sort_by_key(|w| {
+            std::cmp::Reverse(row_display_priority(
+                aggregates
+                    .get(&w.id)
+                    .copied()
+                    .unwrap_or(AgentState::Unknown),
+            ))
+        });
+    }
 
-        let Some(target_hwnd) = target_hwnd else {
-            manager.set_status_text("再登録できる候補が見つかりませんでした。".into());
-            manager.set_status_is_warning(true);
-            return;
-        };
-        let Some(target_window) = live_windows.iter().find(|w| w.hwnd == target_hwnd) else {
-            return;
-        };
-
-        let hwnd = HWND(target_hwnd as *mut _);
-        let show_state = match win_placement::get_show_state(hwnd) {
-            Ok(s) => s,
-            Err(err) => {
-                manager.set_status_text(format!("状態の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
+    let rows: Vec<QuickSwitcherRow> = ordered
+        .iter()
+        .map(|workset| {
+            let agent_state = aggregates
+                .get(&workset.id)
+                .copied()
+                .unwrap_or(AgentState::Unknown);
+            let (_, agent_elapsed_text) =
+                agent_row_status(&state.agent_runs, workset.id, agent_state);
+            let (agent_symbol, agent_status_label) = agent_symbol_and_label(agent_state);
+            let git = cached_git_status(&workset.repository_path);
+            let gh = cached_gh_status(&workset.repository_path);
+            let unpushed_text = if git.has_upstream && git.ahead > 0 {
+                format!("↑{}未push", git.ahead)
+            } else {
+                String::new()
+            };
+            let pr_text = match (&gh.current_branch_pr, gh.open_pr_count) {
+                (Some(pr), _) => format!("PR #{}", pr.number),
+                (None, n) if n > 0 => format!("PR ×{n}"),
+                _ => String::new(),
+            };
+            use crate::application::gh_status_service::CiState;
+            let (ci_symbol, ci_text) = if gh.gh_available && gh.ci != CiState::None {
+                gh.ci.symbol_label()
+            } else {
+                ("", "")
+            };
+            // CI にかかった時間（実行中なら経過時間）。「PR後の CI が何分かかるか」
+            // を一覧で見られるようにする。
+            let ci_text = match gh.ci_minutes {
+                Some(minutes) if !ci_text.is_empty() => format!("{ci_text} {minutes}分"),
+                _ => ci_text.to_string(),
+            };
+            QuickSwitcherRow {
+                workset_id: workset.id.to_string().into(),
+                name: workset.name.clone().into(),
+                repository_name: workset
+                    .repository_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workset.repository_path.display().to_string())
+                    .into(),
+                color: hex_to_color(&workset.color),
+                is_current: Some(workset.id) == current_workset_id,
+                is_parking_target: matches!(workset.parking_policy, ParkingPolicy::Fixed { .. }),
+                windows_total: i32::try_from(workset.windows.len()).unwrap_or(0),
+                windows_open: i32::try_from(
+                    workset
+                        .windows
+                        .iter()
+                        .filter(|w| {
+                            matches!(decisions.get(&w.id), Some(MatchDecision::AutoRebind { .. }))
+                        })
+                        .count(),
+                )
+                .unwrap_or(0),
+                agent_status_color: hex_to_color(state_color(agent_state)),
+                agent_symbol: agent_symbol.into(),
+                agent_status_label: agent_status_label.into(),
+                agent_elapsed_text: agent_elapsed_text.into(),
+                // 実行中・入力待ちだけを「動作中」として目立たせる。
+                agent_is_active: matches!(
+                    agent_state,
+                    AgentState::Running | AgentState::NeedsInput
+                ),
+                branch_text: git.branch.clone().unwrap_or_default().into(),
+                changed_text: if git.is_git {
+                    format!("変更{}", git.changed_count).into()
+                } else {
+                    slint::SharedString::new()
+                },
+                last_commit_text: git
+                    .last_commit_at
+                    .as_deref()
+                    .map(format_commit_relative)
+                    .unwrap_or_default()
+                    .into(),
+                unpushed_text: unpushed_text.into(),
+                pr_text: pr_text.into(),
+                ci_symbol: ci_symbol.into(),
+                ci_text: ci_text.into(),
+                ci_color: hex_to_color(ci_state_color(gh.ci)),
             }
-        };
-        let rect = match win_placement::get_normal_rect(hwnd) {
-            Ok(r) => r,
-            Err(err) => {
-                manager.set_status_text(format!("配置の取得に失敗しました: {err}").into());
-                manager.set_status_is_warning(true);
-                return;
-            }
-        };
+        })
+        .collect();
 
-        let mut state = s.borrow_mut();
-        let rebuilt = workset_service::build_managed_window(
-            target_window,
-            rect,
-            show_state,
-            z_order,
-            &state.monitors,
-            &c.borrow().main_monitor_ids,
-        );
-        match rebuilt {
-            Ok(new_managed_window) => {
-                let mut config = c.borrow_mut();
-                if let Some(workset) = config.worksets.get_mut(ws_index)
-                    && let Some(slot) = workset.windows.get_mut(window_index)
-                {
-                    *slot = ManagedWindow {
-                        id: managed_window_id,
-                        ..new_managed_window
-                    };
-                    workset.updated_at = clock::now_rfc3339();
+    let row_count = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+    switcher.set_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    // The slot at index == row_count is the "empty the main screen" action, so
+    // it is a valid selection even when it sits one past the last workset row.
+    if switcher.get_selected_index() > row_count {
+        switcher.set_selected_index(row_count);
+    } else if switcher.get_selected_index() < 0 {
+        switcher.set_selected_index(0);
+    }
+}
+
+/// Quick Switcher status cell for an aggregate agent state: a mark plus a
+/// Japanese word, always shown (including 未実行 for Idle/Unknown, unlike the
+/// tray tooltip). `×` is U+00D7, which the UI font renders (unlike U+2715);
+/// the colour (`state_color`) carries the success/failure meaning alongside.
+fn agent_symbol_and_label(state: AgentState) -> (&'static str, &'static str) {
+    match state {
+        AgentState::Running => ("●", "実行中"),
+        AgentState::NeedsInput => ("●", "入力待ち"),
+        AgentState::Ready => ("✓", "成功"),
+        AgentState::Blocked => ("×", "失敗"),
+        AgentState::Idle | AgentState::Unknown => ("—", "未実行"),
+    }
+}
+
+/// Hex colour for a CI state's symbol in the Quick Switcher (green pass / red
+/// fail / blue running / grey none), matching the agent-status palette.
+fn ci_state_color(state: crate::application::gh_status_service::CiState) -> &'static str {
+    use crate::application::gh_status_service::CiState;
+    match state {
+        CiState::Success => "#66BB6A",
+        CiState::Failure => "#EF5350",
+        CiState::Running => "#42A5F5",
+        CiState::None | CiState::Unknown => "#9E9E9E",
+    }
+}
+
+/// Relative "最終commit" text (「18分前」) from a commit's RFC 3339 timestamp,
+/// computed fresh at display time. Empty when the timestamp can't be parsed.
+fn format_commit_relative(timestamp: &str) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return String::new();
+    };
+    let minutes = (OffsetDateTime::now_utc() - parsed).whole_minutes();
+    crate::domain::git::relative_label(minutes)
+}
+
+/// Japanese label for an aggregate agent state, shared by the Quick
+/// Switcher's row badge and the tray tooltip. Empty for `Idle`/`Unknown` —
+/// the common case shouldn't carry visual noise.
+fn agent_status_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Running => "実行中",
+        AgentState::NeedsInput => "入力待ち",
+        AgentState::Ready => "完了",
+        AgentState::Blocked => "エラー",
+        AgentState::Idle | AgentState::Unknown => "",
+    }
+}
+
+/// Finds the run(s) that actually drive a workset's aggregate `state`
+/// (matching `domain::agent::aggregate_state`'s own per-state criteria — in
+/// particular, `Ready` only counts unconfirmed runs) and formats how long
+/// ago the most recent one transitioned. Empty for `Idle`/`Unknown`, where
+/// there's no single "since when" moment worth surfacing.
+fn agent_row_status(
+    runs: &[AgentRun],
+    workset_id: uuid::Uuid,
+    state: AgentState,
+) -> (&'static str, String) {
+    if matches!(state, AgentState::Idle | AgentState::Unknown) {
+        return (agent_status_label(state), String::new());
+    }
+
+    let driving_run = runs
+        .iter()
+        .filter(|r| {
+            r.workset_id == workset_id
+                && match state {
+                    AgentState::Ready => r.state == AgentState::Ready && !r.confirmed,
+                    other => r.state == other,
                 }
-                drop(config);
+        })
+        .max_by(|a, b| a.last_transition_at.cmp(&b.last_transition_at));
 
-                if let Err(err) = config_store::save(&dir, &c.borrow()) {
-                    manager.set_status_text(format!("保存に失敗しました: {err}").into());
-                    manager.set_status_is_warning(true);
+    let elapsed = driving_run
+        .map(|r| format_elapsed(&r.last_transition_at))
+        .unwrap_or_default();
+    (agent_status_label(state), elapsed)
+}
+
+/// "3分" / "1分未満" style elapsed-time text from an RFC 3339 timestamp,
+/// computed fresh at display time rather than stored as a duration (PLAN.md
+/// §3.3's "経過時間" column).
+fn format_elapsed(timestamp: &str) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return String::new();
+    };
+    let minutes = (OffsetDateTime::now_utc() - parsed).whole_minutes();
+    if minutes < 1 {
+        "1分未満".to_string()
+    } else {
+        format!("{minutes}分")
+    }
+}
+
+/// The workset with the highest `tray_priority` aggregate state among those
+/// that aren't `Idle`/`Unknown` (PLAN.md §6.7's tray-color priority),
+/// shared by the tray-icon refresh and the tray-click row-selection logic.
+fn highest_priority_agent_workset(
+    config: &AppConfig,
+    agent_runs: &[AgentRun],
+) -> Option<(uuid::Uuid, AgentState)> {
+    let aggregates = agent_status_service::aggregate_all(&config.worksets, agent_runs);
+    config
+        .worksets
+        .iter()
+        .filter_map(|w| aggregates.get(&w.id).map(|s| (w.id, *s)))
+        .filter(|(_, s)| !matches!(s, AgentState::Idle | AgentState::Unknown))
+        .max_by_key(|(_, s)| tray_priority(*s))
+}
+
+/// Selects the row matching `workset_id`, if one is currently displayed
+/// (PLAN.md §6.7: a tray left-click that opens the Quick Switcher selects
+/// the highest-priority workset's row).
+fn select_row_for_workset(switcher: &QuickSwitcher, workset_id: uuid::Uuid) {
+    let target = workset_id.to_string();
+    let rows = switcher.get_rows();
+    for i in 0..rows.row_count() {
+        if let Some(row) = rows.row_data(i)
+            && row.workset_id == target
+        {
+            switcher.set_selected_index(i32::try_from(i).unwrap_or(0));
+            return;
+        }
+    }
+}
+
+/// Positions and shows the Quick Switcher at the configured popup location
+/// (PLAN.md §3.3), refreshing its rows first and then forcing real OS input
+/// focus onto it (needed for a `WS_EX_TOOLWINDOW` popup, which doesn't
+/// reliably grab keyboard focus on `.show()` alone).
+fn show_quick_switcher_at_cursor(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    // 絞り込みは毎回まっさらにする。閉じても残っていたため、一度何か打って閉じる
+    // と、次に開いたときも同じ絞り込みが効いたままで、一致しないセットは行ごと
+    // 消えていた（動いているセットが一覧に居ない、という形で見える）。
+    switcher.set_filter_text(slint::SharedString::new());
+    refresh_quick_switcher_rows(switcher, config, data_dir);
+    // Kick background git + GitHub refreshes; rows re-render when each
+    // completes. The switcher shows the cached (possibly stale/empty) values
+    // immediately, git fills in fast, and the slower gh (PR/CI) fills in after.
+    spawn_git_refresh(workset_repo_paths(config));
+    spawn_gh_refresh(workset_repo_paths(config));
+
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let cursor = monitor::cursor_position().unwrap_or((0, 0));
+    let size = switcher.window().size();
+    let popup_size = (
+        i32::try_from(size.width).unwrap_or(480),
+        i32::try_from(size.height).unwrap_or(560),
+    );
+    let (x, y) = popup_placement::resolve_popup_position(
+        config.settings.popup_location,
+        cursor,
+        &live_monitors,
+        &config.main_monitor_ids,
+        popup_size,
+    );
+    switcher
+        .window()
+        .set_position(slint::WindowPosition::Physical(
+            slint::PhysicalPosition::new(x, y),
+        ));
+    let _ = switcher.show();
+    // Re-applied after every `.show()`, not just once at window creation:
+    // empirically, winit's own show-window path resets `WS_EX_APPWINDOW`
+    // back on regardless of what was set beforehand, so the exclusion only
+    // sticks if it's the *last* thing touching the style bits.
+    popup_window::exclude_from_taskbar_and_alt_tab(switcher.window());
+    popup_window::force_foreground(switcher.window());
+    arm_switcher_reapply();
+}
+
+/// PLAN.md §3.3/§3.4: the hotkey and tray-icon left-click both *toggle*
+/// visibility, while the tray menu's own "クイックスイッチャーを開く" always
+/// shows it fresh — see `TrayIcon`'s doc comment on `clicked` in
+/// `ui/app-window.slint`.
+fn toggle_quick_switcher(switcher: &QuickSwitcher, config: &AppConfig, data_dir: &Path) {
+    if switcher.window().is_visible() {
+        // Hiding aborts any in-flight hold-to-cycle session (e.g. the user taps
+        // the main hotkey key while still holding the cycle modifiers): the
+        // release timer must not survive to commit an unconfirmed switch.
+        cancel_cycle_timer();
+        let _ = switcher.hide();
+        reapply_on_switcher_dismiss();
+    } else {
+        show_quick_switcher_at_cursor(switcher, config, data_dir);
+    }
+}
+
+/// Concise Japanese message for a config validation error, so the registration
+/// banner stays readable rather than dumping the `Display` form (full exe paths
+/// and window classes, which overflow the dialog).
+fn config_validation_message(error: &crate::domain::config::ConfigValidationError) -> String {
+    use crate::domain::config::ConfigValidationError as E;
+    match error {
+        E::WorksetNameLength { .. } => "セット名は1〜80文字にしてください。".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Maps each registered window's live HWND to the rect it should park into when
+/// the main screen is emptied, plus the set that additionally wants the browser
+/// full-screen keys. Two tracks (development-plan.md「退避の優先順位ルール」):
+///
+/// - **Sub-screen-designated** worksets go to their own sub cell (subdivided
+///   1→2→4 among worksets sharing that sub); full-screen when sole occupant.
+/// - **Everything else** (Auto/Fixed worksets' windows) is distributed across
+///   the *non-sub* parking screens by `distribute_parking`: emptiest screen
+///   first, each screen subdivided by its window count, never overlapping. What
+///   doesn't fit anywhere is absent here (→ minimized by the caller).
+fn compute_empty_main_destinations(
+    config: &AppConfig,
+    data_dir: &std::path::Path,
+    live_monitors: &[MonitorInfo],
+    live_windows: &[TopLevelWindow],
+) -> (
+    std::collections::HashMap<isize, crate::domain::placement::PixelRect>,
+    std::collections::HashSet<isize>,
+) {
+    use crate::application::main_placement::resolve_main_restore;
+    use crate::application::parking_placement::{ParkPlan, plan_park_into_slot};
+    use crate::application::switch_coordinator as sc;
+    use crate::domain::placement::PixelRect;
+    use crate::domain::workset::ParkingPolicy;
+
+    let runtime = runtime_store::load(data_dir);
+    let decisions = workset_service::resolve_all_matches_with_bindings(
+        &config.worksets,
+        live_windows,
+        &runtime.window_bindings,
+        None,
+    );
+
+    let mut rects = std::collections::HashMap::new();
+    let mut fullscreen = std::collections::HashSet::new();
+    // Non-designated registered windows, collected for distribution: (hwnd, its
+    // main-screen rect for aspect-preserving shrink).
+    let mut to_distribute: Vec<(isize, PixelRect)> = Vec::new();
+    // Sub-screens that actually receive a designated window this pass. Only these
+    // are withheld from general parking; an *empty* sub-screen is fair game as a
+    // parking target (「サブにウィンドウが入っているときは入れない」, 2026-07-23).
+    let mut occupied_sub_ids: std::collections::HashSet<uuid::Uuid> =
+        std::collections::HashSet::new();
+
+    for workset in &config.worksets {
+        // Resolve this workset's live on-main windows once.
+        let mut resolved: Vec<(isize, PixelRect)> = Vec::new();
+        for w in &workset.windows {
+            // 「退避せず最小化」指定のウィンドウは行き先を算出しない。行き先の
+            // 無いウィンドウは呼び出し側が最小化するので、それだけで退避OFFが
+            // メイン画面を空にする経路にも効く。
+            if w.minimize_when_parked {
+                continue;
+            }
+            if let Some(MatchDecision::AutoRebind { hwnd }) = decisions.get(&w.id)
+                && let Some(outcome) =
+                    resolve_main_restore(&w.main_placement, live_monitors, &config.main_monitor_ids)
+            {
+                resolved.push((*hwnd, outcome.rect));
+            }
+        }
+        if resolved.is_empty() {
+            continue;
+        }
+
+        let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy else {
+            // Non-designated → distribute across the non-sub parking screens.
+            to_distribute.extend(resolved);
+            continue;
+        };
+        // Designated → its own sub cell.
+        let dest = config
+            .sub_screens
+            .iter()
+            .find(|s| s.id == *sub_screen_id)
+            .and_then(|sub| {
+                // Empty-main parks every registered window, so all live sets are
+                // the "parking sharers" that divide the sub.
+                let live_ids: std::collections::HashSet<uuid::Uuid> = config
+                    .worksets
+                    .iter()
+                    .filter(|w| {
+                        w.windows.iter().any(|mw| {
+                            matches!(
+                                decisions.get(&mw.id),
+                                Some(MatchDecision::AutoRebind { .. })
+                            )
+                        })
+                    })
+                    .map(|w| w.id)
+                    .collect();
+                let slot = sc::sub_screen_slot_rect(
+                    sub,
+                    &config.worksets,
+                    workset.id,
+                    live_monitors,
+                    &live_ids,
+                )?;
+                let sole = sc::sub_screen_sharer_count(&config.worksets, *sub_screen_id) <= 1;
+                Some((
+                    slot,
+                    sole && (workset.fullscreen_when_parked || sub.fullscreen),
+                ))
+            });
+        let Some((slot, want_fullscreen)) = dest else {
+            continue;
+        };
+        // Same algorithm as a normal switch: subdivide the sub cell among the
+        // workset's windows so each fills its own flush cell (projecting the
+        // whole main layout kept the original gaps and looked broken).
+        let cells = sc::subdivide_for_count(slot, resolved.len());
+        for (i, (hwnd, main_rect)) in resolved.iter().enumerate() {
+            let Some(&cell) = cells.get(i) else {
+                continue; // beyond capacity → minimized by the caller
+            };
+            if let ParkPlan::ShrinkToFit(mapped) =
+                plan_park_into_slot(std::slice::from_ref(main_rect), cell)
+                && let Some(&rect) = mapped.first()
+            {
+                rects.insert(*hwnd, rect);
+                occupied_sub_ids.insert(*sub_screen_id);
+                if want_fullscreen {
+                    fullscreen.insert(*hwnd);
+                }
+            }
+        }
+    }
+
+    // Parking screens = live monitors that are non-main, non-excluded, and not
+    // an *occupied* sub-screen. A sub-screen only counts as reserved when a
+    // designated workset actually parked a window into it this pass; an empty
+    // sub-screen is usable as a general parking target (2026-07-23).
+    let occupied_sub_monitor_ids: std::collections::HashSet<&str> = config
+        .sub_screens
+        .iter()
+        .filter(|s| occupied_sub_ids.contains(&s.id))
+        .flat_map(|s| s.monitor_ids.iter().map(String::as_str))
+        .collect();
+    let parking_screens: Vec<PixelRect> = live_monitors
+        .iter()
+        .filter(|m| {
+            !config
+                .main_monitor_ids
+                .iter()
+                .any(|id| id == &m.device_name)
+        })
+        .filter(|m| !occupied_sub_monitor_ids.contains(m.device_name.as_str()))
+        .filter(|m| {
+            !config
+                .monitors
+                .iter()
+                .any(|s| s.stable_id == m.device_name && s.excluded)
+        })
+        .map(|m| m.work_area_px)
+        .collect();
+
+    let hwnds: Vec<isize> = to_distribute.iter().map(|(h, _)| *h).collect();
+    let main_rect_of: std::collections::HashMap<isize, PixelRect> =
+        to_distribute.into_iter().collect();
+    let (placements, _overflow) = sc::distribute_parking(&parking_screens, &hwnds);
+    for (hwnd, cell) in placements {
+        // Shrink the single window into its cell, preserving aspect; too small
+        // → left out (minimized).
+        if let Some(main_rect) = main_rect_of.get(&hwnd)
+            && let ParkPlan::ShrinkToFit(mapped) = plan_park_into_slot(&[*main_rect], cell)
+            && let Some(rect) = mapped.first()
+        {
+            rects.insert(hwnd, *rect);
+        }
+    }
+
+    (rects, fullscreen)
+}
+
+/// Single entry point for "メイン画面を空にする" shared by the tray menu, the
+/// Quick Switcher, and the Workset Manager: bring the manager to the front and
+/// trigger its empty-main modal (which runs the one real handler in
+/// `wire_workset_manager`).
+fn open_empty_main_screen(workset_manager: &WorksetManager) {
+    let _ = workset_manager.show();
+    popup_window::restore_and_foreground(workset_manager.window());
+    workset_manager.invoke_empty_main_screen_requested();
+}
+
+fn wire_quick_switcher(
+    switcher: &QuickSwitcher,
+    data_dir: PathBuf,
+    config: Rc<RefCell<AppConfig>>,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
+    settings_window: slint::Weak<AppWindow>,
+) {
+    refresh_quick_switcher_rows(switcher, &config.borrow(), &data_dir);
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_filter_changed(move |_text| {
+        let Some(switcher) = s.upgrade() else { return };
+        // `filter-text` is two-way bound to the TextInput, so it already holds
+        // the new value (including IME-composed text); just re-filter.
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    // 「起動中のみ」トグル: 状態は UI 側の hide-closed が持つので、行を作り
+    // 直すだけでよい。
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_hide_closed_toggled(move || {
+        let Some(switcher) = s.upgrade() else { return };
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    // 「×」on a row: quit that set's apps without switching to it. The set stays
+    // registered — the next switch to it relaunches everything.
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    switcher.on_close_workset_requested(move |workset_id| {
+        let Some(switcher) = s.upgrade() else { return };
+        let Ok(workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+            return;
+        };
+        let Some((name, closed)) = close_workset_windows(&c.borrow(), &d, workset_id) else {
+            return;
+        };
+
+        switcher.set_status_text(
+            if closed == 0 {
+                format!("「{name}」は開いていません。")
+            } else {
+                format!("「{name}」のウィンドウ{closed}個に終了を要求しました。")
+            }
+            .into(),
+        );
+        switcher.set_status_is_warning(false);
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+    });
+
+    // 並び替え ▲▼: 手動順を書き換えて保存し、行を再描画する。
+    for direction in [
+        quick_switcher_service::MoveDirection::Up,
+        quick_switcher_service::MoveDirection::Down,
+    ] {
+        let s = switcher.as_weak();
+        let c = config.clone();
+        let d = data_dir.clone();
+        let handler = move |workset_id: slint::SharedString| {
+            let Some(switcher) = s.upgrade() else { return };
+            let Ok(workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+                return;
+            };
+            {
+                let mut config = c.borrow_mut();
+                if !quick_switcher_service::move_workset(
+                    &mut config.worksets,
+                    workset_id,
+                    direction,
+                ) {
                     return;
                 }
+                // 並び替えは手動順でのみ意味を持つので、確実に反映させる。
+                config.settings.sort_mode = crate::domain::config::SortMode::Manual;
+            }
+            if let Err(err) = config_store::save(&d, &c.borrow()) {
+                tracing::warn!(error = %err, "failed to save workset reorder");
+            }
+            refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+        };
+        match direction {
+            quick_switcher_service::MoveDirection::Up => switcher.on_move_workset_up(handler),
+            quick_switcher_service::MoveDirection::Down => switcher.on_move_workset_down(handler),
+        }
+    }
 
-                manager.set_status_text("再登録しました。".into());
-                manager.set_status_is_warning(false);
-                refresh_workset_summaries(&manager, &c.borrow(), &mut state);
-                refresh_selected_workset_detail(&manager, &c.borrow(), &state);
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    let coord = coordinator.clone();
+    switcher.on_switch_requested(move |workset_id| {
+        let Some(switcher) = s.upgrade() else { return };
+        // A direct switch (Enter/click/number, or a hold-to-cycle commit)
+        // ends any hold session; a stale release timer must not re-fire.
+        cancel_cycle_timer();
+        // 切り替えたのだから、この後閉じても再適用はしない。
+        disarm_switcher_reapply();
+        let Ok(target_workset_id) = uuid::Uuid::parse_str(&workset_id) else {
+            return;
+        };
+
+        // 保存済みの配置を読む前に、モニターのデバイス名が入れ替わって
+        // いないか確かめる。入れ替わりは無音で起きるので、実際に配置を
+        // 使う直前に見るのがいちばん確実。
+        reconcile_monitor_identity(&d, &c, "switch");
+
+        // Pre-launch snapshot, then relaunch any closed windows of the target
+        // (switch = alive windows move, dead windows get launched).
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let pending_acquire = {
+            let config = c.borrow();
+            let runtime = runtime_store::load(&d);
+            launch_missing_for_switch(
+                &config,
+                &runtime.window_bindings,
+                &live_windows,
+                target_workset_id,
+            )
+        };
+
+        let close_after_switch = {
+            let config = c.borrow();
+            let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+
+            // 選んだ先が今いるセットそのものだった（ホールドサイクルで一周して
+            // 戻ってきた等）ときも、フォーカスだけで終わらせず配置を当て直す。
+            match coord.switch_or_reapply(SwitchRequest {
+                worksets: &config.worksets,
+                fixed_slots: &config.fixed_slots,
+                sub_screens: &config.sub_screens,
+                saved_monitors: &config.monitors,
+                main_monitor_ids: &config.main_monitor_ids,
+                live_monitors: &live_monitors,
+                live_windows: &live_windows,
+                target_workset_id,
+            }) {
+                Ok(_) => {
+                    switcher.set_status_text("".into());
+                    switcher.set_status_is_warning(false);
+                    // PLAN.md §3.3 "選択後" / ready確認処理: switching to a
+                    // workset counts as the user having seen its completed
+                    // agent runs.
+                    if let Err(err) =
+                        agent_status_service::confirm_ready_and_recompute(&d, target_workset_id)
+                    {
+                        tracing::warn!(error = %err, "failed to confirm ready agent runs after switching");
+                    }
+                    UI_CONTEXT.with(|cell| {
+                        if let Some(ctx) = &*cell.borrow() {
+                            refresh_tray_status(ctx);
+                        }
+                    });
+                    config.settings.close_after_switch
+                }
+                Err(err) => {
+                    switcher.set_status_text(format!("切替に失敗しました: {err}").into());
+                    switcher.set_status_is_warning(true);
+                    false
+                }
+            }
+        };
+
+        refresh_quick_switcher_rows(&switcher, &c.borrow(), &d);
+        // A switch can change branch/uncommitted state (e.g. worktrees) — refresh
+        // git + GitHub in the background so the next open shows current values.
+        spawn_git_refresh(workset_repo_paths(&c.borrow()));
+        spawn_gh_refresh(workset_repo_paths(&c.borrow()));
+        if close_after_switch {
+            let _ = switcher.hide();
+        }
+
+        // 閉じていたウィンドウを起動したなら、現れ次第結びつけて配置する。
+        if let Some(pending) = pending_acquire {
+            start_acquire_watch(pending, c.clone(), d.clone(), coord.clone(), false, || {});
+        }
+    });
+
+    let s = switcher.as_weak();
+    let c = config.clone();
+    let coord = coordinator.clone();
+    switcher.on_recover_requested(move || {
+        let Some(switcher) = s.upgrade() else { return };
+        // 回収した窓を、閉じた直後の再適用で退避し直してしまわないように。
+        disarm_switcher_reapply();
+        let config = c.borrow();
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        match coord.recover_all_windows(
+            &config.worksets,
+            &live_monitors,
+            &config.main_monitor_ids,
+            &live_windows,
+        ) {
+            Ok(report) => {
+                switcher.set_status_text(
+                    format!(
+                        "{}件のウィンドウをメイン画面へ回収しました。",
+                        report.recovered.len()
+                    )
+                    .into(),
+                );
+                switcher.set_status_is_warning(false);
             }
             Err(err) => {
-                manager.set_status_text(format!("再登録できません: {err}").into());
-                manager.set_status_is_warning(true);
+                switcher.set_status_text(format!("回収に失敗しました: {err}").into());
+                switcher.set_status_is_warning(true);
             }
         }
     });
+
+    let s = switcher.as_weak();
+    let settings_for_open = settings_window;
+    let c = config.clone();
+    switcher.on_settings_requested(move || {
+        // 設定を開くのは「何もせず閉じた」ではない。
+        disarm_switcher_reapply();
+        if let Some(switcher) = s.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(settings) = settings_for_open.upgrade() {
+            refresh_codex_settings_state(&settings, &c.borrow());
+            let _ = settings.show();
+        }
+    });
+
+    let s = switcher.as_weak();
+    switcher.on_close_requested(move || {
+        cancel_cycle_timer();
+        if let Some(switcher) = s.upgrade() {
+            let _ = switcher.hide();
+        }
+        reapply_on_switcher_dismiss();
+    });
+}
+
+/// Renders a hotkey as the settings window's read-only display string
+/// (e.g. `"Ctrl+Alt+W"`, `"Ctrl+Alt+Up"`), in canonical Ctrl/Alt/Shift/Win
+/// order regardless of the stored `modifiers` order.
+/// Full combo label for a cycle key, e.g. `"Ctrl+Alt+Down"` — the cycle key
+/// combined with the main hotkey's modifiers (which must be held for it).
+fn cycle_combo_label(main: &HotkeyConfig, cycle_vk: u32) -> String {
+    if win32_hotkey::virtual_key_to_label(cycle_vk).is_some() {
+        let combo = HotkeyConfig {
+            modifiers: main.modifiers.clone(),
+            virtual_key: cycle_vk,
+        };
+        hotkey_display_label(&combo)
+    } else {
+        format!("0x{cycle_vk:02X}")
+    }
+}
+
+fn hotkey_display_label(hotkey: &HotkeyConfig) -> String {
+    let mut parts: Vec<String> = [
+        (HotkeyModifier::Control, "Ctrl"),
+        (HotkeyModifier::Alt, "Alt"),
+        (HotkeyModifier::Shift, "Shift"),
+        (HotkeyModifier::Win, "Win"),
+    ]
+    .iter()
+    .filter(|(modifier, _)| hotkey.modifiers.contains(modifier))
+    .map(|(_, label)| (*label).to_string())
+    .collect();
+    parts.push(
+        win32_hotkey::virtual_key_to_label(hotkey.virtual_key)
+            .unwrap_or_else(|| format!("VK 0x{:02X}", hotkey.virtual_key)),
+    );
+    parts.join("+")
+}
+
+/// Populates the hotkey display and wires the press-to-record capture flow
+/// (PLAN.md §13 Phase 7 checklist item 4, "ホットキー設定UI"): the Slint
+/// side captures the next non-modifier key press plus whatever modifiers are
+/// held, and `on_hotkey_captured` feeds it through the same mutate →
+/// `validate()` → `config_store::save()` → rollback-on-failure template used
+/// by every other config-saving handler in this file.
+fn wire_settings(
+    window: &AppWindow,
+    data_dir: PathBuf,
+    config: Rc<RefCell<AppConfig>>,
+    hotkey_thread: Rc<HotkeyThread>,
+) {
+    window.set_hotkey_display(
+        hotkey_display_label(&config.borrow().settings.quick_switcher_hotkey).into(),
+    );
+    {
+        let cfg = config.borrow();
+        let main = &cfg.settings.quick_switcher_hotkey;
+        window.set_cycle_next_display(cycle_combo_label(main, cfg.settings.cycle_next_key).into());
+        window.set_cycle_prev_display(cycle_combo_label(main, cfg.settings.cycle_prev_key).into());
+    }
+
+    {
+        let w = window.as_weak();
+        window.on_hotkey_capture_started(move || {
+            let Some(window) = w.upgrade() else { return };
+            window.set_hotkey_status_text("".into());
+            window.set_hotkey_status_is_warning(false);
+        });
+    }
+
+    {
+        let w = window.as_weak();
+        window.on_cycle_capture_started(move |_which| {
+            let Some(window) = w.upgrade() else { return };
+            window.set_hotkey_status_text("".into());
+            window.set_hotkey_status_is_warning(false);
+        });
+    }
+
+    // Capturing a cycle key: only the key matters (its modifiers are inherited
+    // from the main hotkey), so map the pressed key, persist, and rebind.
+    {
+        let w = window.as_weak();
+        let c = config.clone();
+        let d = data_dir.clone();
+        let ht = hotkey_thread.clone();
+        window.on_cycle_captured(move |which, key_text| {
+            let Some(window) = w.upgrade() else { return };
+            let Some(vk) = win32_hotkey::slint_key_text_to_virtual_key(&key_text) else {
+                window.set_hotkey_status_text(
+                    "このキーは登録できません。別のキーを押してください。".into(),
+                );
+                window.set_hotkey_status_is_warning(true);
+                return;
+            };
+
+            let (spec, cn, cp) = {
+                let mut cfg = c.borrow_mut();
+                if which == 1 {
+                    cfg.settings.cycle_next_key = vk;
+                } else {
+                    cfg.settings.cycle_prev_key = vk;
+                }
+                (
+                    cfg.settings.quick_switcher_hotkey.clone(),
+                    cfg.settings.cycle_next_key,
+                    cfg.settings.cycle_prev_key,
+                )
+            };
+
+            match config_store::save(&d, &c.borrow()) {
+                Ok(()) => {
+                    ht.rebind(spec.clone(), cn, cp);
+                    window.set_cycle_next_display(cycle_combo_label(&spec, cn).into());
+                    window.set_cycle_prev_display(cycle_combo_label(&spec, cp).into());
+                    window.set_cycle_capturing(0);
+                    window.set_hotkey_status_text(
+                        format!(
+                            "次のセット={} / 前のセット={} を保存しました。",
+                            cycle_combo_label(&spec, cn),
+                            cycle_combo_label(&spec, cp)
+                        )
+                        .into(),
+                    );
+                    window.set_hotkey_status_is_warning(false);
+                }
+                Err(err) => {
+                    window
+                        .set_hotkey_status_text(format!("設定の保存に失敗しました: {err}").into());
+                    window.set_hotkey_status_is_warning(true);
+                }
+            }
+        });
+    }
+
+    let w = window.as_weak();
+    let c = config.clone();
+    let d = data_dir.clone();
+    let ht = hotkey_thread;
+    window.on_hotkey_captured(move |ctrl, alt, shift, meta, key_text| {
+        let Some(window) = w.upgrade() else { return };
+
+        // Rejections below deliberately leave `hotkey-capturing` true so the
+        // user can immediately press another combination.
+        let Some(virtual_key) = win32_hotkey::slint_key_text_to_virtual_key(&key_text) else {
+            window.set_hotkey_status_text(
+                "このキーは登録できません。別のキーを押してください。".into(),
+            );
+            window.set_hotkey_status_is_warning(true);
+            return;
+        };
+
+        let mut modifiers = Vec::new();
+        if ctrl {
+            modifiers.push(HotkeyModifier::Control);
+        }
+        if alt {
+            modifiers.push(HotkeyModifier::Alt);
+        }
+        if shift {
+            modifiers.push(HotkeyModifier::Shift);
+        }
+        if meta {
+            modifiers.push(HotkeyModifier::Win);
+        }
+
+        let candidate = HotkeyConfig {
+            modifiers,
+            virtual_key,
+        };
+        if candidate.modifiers.is_empty() && !candidate.allows_empty_modifiers() {
+            window.set_hotkey_status_text(
+                "修飾キーと組み合わせてください（ファンクションキーのみ単独登録可）".into(),
+            );
+            window.set_hotkey_status_is_warning(true);
+            return;
+        }
+
+        window.set_hotkey_capturing(false);
+        let mut cfg = c.borrow_mut();
+        let previous = cfg.settings.quick_switcher_hotkey.clone();
+        if previous == candidate {
+            drop(cfg);
+            window.set_hotkey_status_text("変更はありません。".into());
+            window.set_hotkey_status_is_warning(false);
+            return;
+        }
+        cfg.settings.quick_switcher_hotkey = candidate.clone();
+
+        let errors = cfg.validate();
+        if !errors.is_empty() {
+            cfg.settings.quick_switcher_hotkey = previous;
+            let message = errors
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            window.set_hotkey_status_text(format!("保存できません: {message}").into());
+            window.set_hotkey_status_is_warning(true);
+            return;
+        }
+
+        match config_store::save(&d, &cfg) {
+            Ok(()) => {
+                UI_CONTEXT.with(|cell| {
+                    if let Some(ctx) = &*cell.borrow() {
+                        *ctx.pending_hotkey_rollback.borrow_mut() = Some(previous);
+                    }
+                });
+                window.set_hotkey_display(hotkey_display_label(&candidate).into());
+                // The cycle combos inherit the main modifiers, so re-render them.
+                window.set_cycle_next_display(
+                    cycle_combo_label(&candidate, cfg.settings.cycle_next_key).into(),
+                );
+                window.set_cycle_prev_display(
+                    cycle_combo_label(&candidate, cfg.settings.cycle_prev_key).into(),
+                );
+                window.set_hotkey_status_text("保存しました。反映を確認しています…".into());
+                window.set_hotkey_status_is_warning(false);
+                ht.rebind(
+                    candidate,
+                    cfg.settings.cycle_next_key,
+                    cfg.settings.cycle_prev_key,
+                );
+            }
+            Err(err) => {
+                cfg.settings.quick_switcher_hotkey = previous;
+                window.set_hotkey_status_text(format!("設定の保存に失敗しました: {err}").into());
+                window.set_hotkey_status_is_warning(true);
+            }
+        }
+    });
+}
+
+/// Wires the settings window's "Codex連携" section (PLAN.md §6.5). Unlike
+/// `wire_settings`, nothing here is persisted to `AppConfig` — the hook
+/// path, snippet, and test-event flow are all derived fresh each time from
+/// the filesystem/process environment, not stored settings.
+fn wire_codex_settings(window: &AppWindow, config: Rc<RefCell<AppConfig>>) {
+    refresh_codex_settings_state(window, &config.borrow());
+
+    let w = window.as_weak();
+    window.on_codex_check_hook_exe_requested(move || {
+        if let Some(window) = w.upgrade() {
+            check_hook_exe(&window);
+        }
+    });
+
+    let w = window.as_weak();
+    window.on_codex_copy_snippet_requested(move || {
+        if let Some(window) = w.upgrade() {
+            copy_hook_snippet(&window, HookFlavor::Codex);
+        }
+    });
+
+    let w = window.as_weak();
+    window.on_claude_copy_snippet_requested(move || {
+        if let Some(window) = w.upgrade() {
+            copy_hook_snippet(&window, HookFlavor::ClaudeCode);
+        }
+    });
+
+    window.on_codex_open_config_folder_requested(move || {
+        let folder = codex_config_folder();
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(&folder)
+            .spawn()
+        {
+            tracing::warn!(error = %err, path = %folder.display(), "failed to open the Codex config folder");
+        }
+    });
+
+    let w = window.as_weak();
+    let c = config;
+    window.on_codex_send_test_event_requested(move || {
+        let Some(window) = w.upgrade() else { return };
+        let Some(repository_path) = c
+            .borrow()
+            .worksets
+            .first()
+            .map(|w| w.repository_path.clone())
+        else {
+            window.set_codex_status_text("先にセットを登録してください。".into());
+            window.set_codex_status_is_warning(true);
+            return;
+        };
+        let Some(hook_path) = hook_exe_path() else {
+            window.set_codex_status_text("repodeck-hook.exeが見つかりません。".into());
+            window.set_codex_status_is_warning(true);
+            return;
+        };
+
+        window.set_codex_status_text(
+            "テストイベントを送信中… クイックスイッチャーのバッジを確認してください。".into(),
+        );
+        window.set_codex_status_is_warning(false);
+        // Runs entirely on a background thread: the real feedback is the
+        // Quick Switcher badge / tray icon transitions that arrive back
+        // through the actual named pipe, exactly like a real Codex hook —
+        // this thread never touches UI state directly.
+        std::thread::spawn(move || {
+            if let Err(err) = send_test_event(&hook_path, &repository_path) {
+                tracing::warn!(error = %err, "failed to send the Codex test event sequence");
+            }
+        });
+    });
+}
+
+/// 選んだエージェント向けのフックスニペットを組み立て、プレビュー欄へ表示し、
+/// クリップボードへコピーする。両ボタンで共通。
+fn copy_hook_snippet(window: &AppWindow, flavor: HookFlavor) {
+    let Some(hook_path) = hook_exe_path() else {
+        window.set_codex_status_text(
+            "repodeck-hook.exeが見つかりません。インストール先を確認してください。".into(),
+        );
+        window.set_codex_status_is_warning(true);
+        return;
+    };
+    let label = match flavor {
+        HookFlavor::Codex => "Codex",
+        HookFlavor::ClaudeCode => "Claude Code",
+    };
+    let snippet = build_hooks_json_snippet(&hook_path, flavor);
+    window.set_codex_hook_snippet(snippet.clone().into());
+    match copy_text_to_clipboard(&snippet) {
+        Ok(()) => {
+            window.set_codex_status_text(
+                format!("{label}用スニペットをクリップボードへコピーしました。").into(),
+            );
+            window.set_codex_status_is_warning(false);
+        }
+        Err(err) => {
+            window.set_codex_status_text(format!("コピーに失敗しました: {err}").into());
+            window.set_codex_status_is_warning(true);
+        }
+    }
+}
+
+fn refresh_codex_settings_state(window: &AppWindow, config: &AppConfig) {
+    check_hook_exe(window);
+    window.set_codex_send_test_event_enabled(!config.worksets.is_empty());
+}
+
+fn check_hook_exe(window: &AppWindow) {
+    window.set_codex_hook_exe_found(hook_exe_path().is_some());
+}
+
+/// `repodeck-hook.exe` is expected to sit next to `repodeck.exe` (same
+/// install directory) — PLAN.md doesn't specify an installer, so this is
+/// the only location that's true in both a dev build (`target/debug/`) and
+/// a plain xcopy-style install.
+fn hook_exe_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let hook_path = exe.parent()?.join("repodeck-hook.exe");
+    hook_path.exists().then_some(hook_path)
+}
+
+/// どちらのエージェント向けのフックスニペットか。同じ `repodeck-hook.exe` を
+/// 呼ぶが、設定キーもイベント名も異なる（[`crate::ipc::protocol`] 参照）。
+///
+/// - **Codex**: `commandWindows` キー。入力待ちは `PermissionRequest`。
+/// - **Claude Code**: `command` キー。入力待ちは `Notification`。
+///
+/// 以前は Codex 形式だけを生成しており、そのまま Claude の `settings.json` に
+/// 貼っても——キーもイベント名も違うため——一切動かなかった。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookFlavor {
+    Codex,
+    ClaudeCode,
+}
+
+/// フックの `hooks.json`（Codex）/ `settings.json`（Claude Code）断片を組み立てる。
+/// 文字列テンプレートではなく `serde_json` で作るので、括弧やエスケープの崩れが
+/// 構造的に起きない。1 イベント 1 グループ、1 グループ 1 コマンド、2 秒タイムアウト、
+/// 空白入りパスに耐えるようコマンド文字列は絶対パスをリテラルの引用符で包む。
+fn build_hooks_json_snippet(hook_path: &Path, flavor: HookFlavor) -> String {
+    let command = format!("\"{}\"", hook_path.display());
+    let command_key = match flavor {
+        HookFlavor::Codex => "commandWindows",
+        HookFlavor::ClaudeCode => "command",
+    };
+    let hook_group = || {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                command_key: command,
+                "timeout": 2,
+            }]
+        })
+    };
+
+    // 「入力待ち」を表すイベント名だけがエージェント間で異なる。
+    let needs_input_event = match flavor {
+        HookFlavor::Codex => "PermissionRequest",
+        HookFlavor::ClaudeCode => "Notification",
+    };
+    let mut hooks = serde_json::json!({
+        "UserPromptSubmit": [hook_group()],
+        needs_input_event: [hook_group()],
+        "PostToolUse": [hook_group()],
+        "Stop": [hook_group()],
+    });
+
+    // Claude Code は選択プロンプト（AskUserQuestion）に `Notification` を撃たない。
+    // その実行直前の `PreToolUse` を、対話ツールだけに絞る `matcher` 付きで拾い、
+    // 「選択待ち（入力待ち）」を検知する。matcher でツールを限定するので、通常の
+    // ツール実行ごとに毎回フックが起動することはない。
+    if flavor == HookFlavor::ClaudeCode {
+        hooks["PreToolUse"] = serde_json::json!([{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [{
+                "type": "command",
+                command_key: command,
+                "timeout": 2,
+            }],
+        }]);
+    }
+
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap_or_default()
+}
+
+/// `%USERPROFILE%\.codex`, falling back to bare `%USERPROFILE%` if Codex
+/// hasn't created its config folder yet.
+fn codex_config_folder() -> PathBuf {
+    let base = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let codex_dir = base.join(".codex");
+    if codex_dir.exists() { codex_dir } else { base }
+}
+
+/// Fires the real `repodeck-hook.exe` through its full 4-hook lifecycle
+/// sequence (`UserPromptSubmit` → `PermissionRequest` → `PostToolUse` →
+/// `Stop`) against `repository_path`, with a short pause between each so the
+/// Quick Switcher badge/tray icon visibly transition through
+/// running→needs_input→running→ready (Phase 8 design decision 2) — this
+/// exercises the full pipe→ACL→adapter→aggregation→UI path, not an
+/// in-process shortcut.
+fn send_test_event(hook_path: &Path, repository_path: &Path) -> Result<(), String> {
+    let session_id = format!("repodeck-test-{}", uuid::Uuid::new_v4());
+    for hook_event_name in [
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+    ] {
+        send_one_test_hook_event(hook_path, repository_path, &session_id, hook_event_name)?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    Ok(())
+}
+
+fn send_one_test_hook_event(
+    hook_path: &Path,
+    repository_path: &Path,
+    session_id: &str,
+    hook_event_name: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "turn_id": "repodeck-test-turn",
+        "cwd": repository_path.to_string_lossy(),
+        "hook_event_name": hook_event_name,
+        "model": "repodeck-test",
+    })
+    .to_string();
+
+    let mut child = Command::new(hook_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open the hook process's stdin".to_string())?
+        .write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    child.wait().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Copies `text` to the clipboard as `CF_UNICODETEXT` (hardcoded as `13`
+/// rather than pulling in `Win32_System_Ole` for the constant). Ownership of
+/// the `GlobalAlloc`'d memory transfers to the clipboard on a *successful*
+/// `SetClipboardData` — it must not be freed in that case, only on failure,
+/// or the clipboard is left holding a dangling handle.
+fn copy_text_to_clipboard(text: &str) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = wide.len() * std::mem::size_of::<u16>();
+
+    // SAFETY: `hwndnewowner: None` associates the clipboard with the current
+    // task, sufficient for a one-shot copy.
+    unsafe { OpenClipboard(None) }?;
+
+    let result: windows::core::Result<()> = (|| {
+        // SAFETY: the clipboard is open (just above); this discards whatever
+        // was previously on it, which is the point of "copy".
+        unsafe { EmptyClipboard() }?;
+
+        // SAFETY: `byte_len` is nonzero (at least the NUL terminator).
+        let hglobal: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }?;
+
+        // SAFETY: `hglobal` was just allocated above with `byte_len` bytes.
+        let ptr = unsafe { GlobalLock(hglobal) };
+        if ptr.is_null() {
+            // SAFETY: `hglobal` is still owned by this function; the lock
+            // above failed, so the clipboard never took ownership of it.
+            unsafe {
+                let _ = GlobalFree(Some(hglobal));
+            }
+            return Err(windows::core::Error::from_thread());
+        }
+        // SAFETY: `ptr` is a writable buffer of `byte_len` bytes for as long
+        // as the lock above holds; unlocked immediately below.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr.cast::<u8>(), byte_len);
+        }
+        // SAFETY: unlocks the same handle locked above; a "failure" here
+        // (lock count reaching zero) is the documented normal case, not a
+        // real error, so the result is discarded.
+        let _ = unsafe { GlobalUnlock(hglobal) };
+
+        // SAFETY: `hglobal` is a valid `GMEM_MOVEABLE` handle. On success the
+        // clipboard now owns it and must not be freed here (see this
+        // function's doc comment); on failure it's still ours to free.
+        match unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hglobal.0))) } {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                unsafe {
+                    let _ = GlobalFree(Some(hglobal));
+                }
+                Err(err)
+            }
+        }
+    })();
+
+    // SAFETY: closes the clipboard opened above, regardless of the inner
+    // result.
+    unsafe {
+        let _ = CloseClipboard();
+    }
+
+    result
+}
+
+/// Wires the settings window's "バージョン情報"/"起動設定" sections (Phase 9).
+/// The registry (`windowing::autostart`) is the source of truth for whether
+/// autostart is actually enabled — `AppConfig.settings.start_with_windows` is
+/// only kept in sync as a secondary record, updated on every successful
+/// toggle here, never read to decide the checkbox's initial state.
+fn wire_about_and_autostart(window: &AppWindow, config: Rc<RefCell<AppConfig>>, data_dir: PathBuf) {
+    window.set_app_version(env!("CARGO_PKG_VERSION").into());
+    window.set_start_with_windows(autostart::is_enabled().unwrap_or(false));
+    window.set_restore_workset_on_start(config.borrow().settings.restore_workset_on_start);
+
+    // Unlike autostart (whose truth lives in the registry) this is purely a
+    // config flag, so the toggle just persists it.
+    let c = config.clone();
+    let dir = data_dir.clone();
+    window.on_restore_workset_on_start_toggled(move |enabled| {
+        let mut cfg = c.borrow_mut();
+        cfg.settings.restore_workset_on_start = enabled;
+        if let Err(err) = config_store::save(&dir, &cfg) {
+            tracing::warn!(error = %err, "failed to save restore-workset-on-start setting");
+        }
+    });
+
+    window.on_open_third_party_notices_requested(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else { return };
+        let path = dir.join("THIRD_PARTY_NOTICES.md");
+        if !path.exists() {
+            tracing::warn!(path = %path.display(), "THIRD_PARTY_NOTICES.md not found next to the executable");
+            return;
+        }
+        if let Err(err) = std::process::Command::new("explorer.exe").arg(&path).spawn() {
+            tracing::warn!(error = %err, path = %path.display(), "failed to open THIRD_PARTY_NOTICES.md");
+        }
+    });
+
+    let w = window.as_weak();
+    let c = config;
+    window.on_start_with_windows_toggled(move |enabled| {
+        let Some(window) = w.upgrade() else { return };
+        if let Err(err) = autostart::set_enabled(enabled) {
+            window.set_start_with_windows(!enabled); // revert the checkbox
+            window.set_autostart_status_text(format!("自動起動の設定に失敗しました: {err}").into());
+            window.set_autostart_status_is_warning(true);
+            return;
+        }
+
+        let mut cfg = c.borrow_mut();
+        cfg.settings.start_with_windows = enabled;
+        match config_store::save(&data_dir, &cfg) {
+            Ok(()) => {
+                window.set_autostart_status_text(
+                    if enabled {
+                        "Windows起動時の自動起動を有効にしました。"
+                    } else {
+                        "自動起動を無効にしました。"
+                    }
+                    .into(),
+                );
+                window.set_autostart_status_is_warning(false);
+            }
+            Err(err) => {
+                window.set_autostart_status_text(format!("設定の保存に失敗しました: {err}").into());
+                window.set_autostart_status_is_warning(true);
+            }
+        }
+    });
+}
+
+/// Native `MessageBoxW` confirmation for the tray's "全管理ウィンドウを回収" —
+/// a single click would otherwise move every window across every workset at
+/// once with no chance to back out.
+fn confirm_recover_all() -> bool {
+    let text = HSTRING::from("登録されている全ウィンドウをメイン画面へ回収しますか?");
+    let caption = HSTRING::from("RepoDeck");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    let result = unsafe { MessageBoxW(None, &text, &caption, MB_YESNO | MB_ICONWARNING) };
+    result == IDYES
+}
+
+/// トレイの「紐づけを点検して修復」の結果を出す。手動で押した以上、何も
+/// 起きなかったことも含めて必ず返事をする。
+///
+/// 直せない異常（互いに区別できない登録）は、放っておくと「切り替えるたびに
+/// アプリが起動し直される」という形でしか現れず、原因が設定にあることに気づけ
+/// ない。ここで名指しする。
+fn show_integrity_result(report: &integrity_service::IntegrityReport) {
+    let mut lines = Vec::new();
+
+    if report.dropped_bindings() > 0 {
+        lines.push(format!(
+            "正当化できない紐づけを {} 件外しました。次の切り替えで正しいウィンドウへ付け直します。",
+            report.dropped_bindings()
+        ));
+    }
+    if report.pruned_stale() > 0 {
+        lines.push(format!(
+            "削除済みの登録が残していた紐づけを {} 件掃除しました。",
+            report.pruned_stale()
+        ));
+    }
+
+    let unrepairable: Vec<String> = report
+        .unrepairable()
+        .filter_map(|anomaly| match anomaly {
+            integrity_service::Anomaly::IndistinguishableRegistrations {
+                executable,
+                worksets,
+                ..
+            } => {
+                let name = std::path::Path::new(executable)
+                    .file_name()
+                    .map_or_else(|| executable.clone(), |n| n.to_string_lossy().into_owned());
+                Some(format!("  {} — {}", name, worksets.join(", ")))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if !unrepairable.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "次の登録は互いに見分けがつきません(実行ファイルとウィンドウクラスしか手掛かりが無い)。\n\
+             セット管理でウィンドウの「タイトルに含む」を設定すると解消します:"
+                .to_string(),
+        );
+        lines.extend(unrepairable);
+    }
+
+    if lines.is_empty() {
+        lines.push("紐づけに異常はありませんでした。".to_string());
+    }
+
+    let text = HSTRING::from(lines.join("\n"));
+    let caption = HSTRING::from("RepoDeck — 紐づけの点検");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    unsafe { MessageBoxW(None, &text, &caption, MB_OK | MB_ICONINFORMATION) };
+}
+
+/// PLAN.md §10.3 steps 3-4: a leftover `switch-journal.json` at startup means
+/// the previous switch never finished. A single `MB_YESNOCANCEL` dialog maps
+/// onto the spec's three named choices — Yes/No/Cancel button labels are
+/// fixed by Win32, so the body text spells out what each one does.
+fn crash_recovery_dialog(affected_window_count: usize) -> JournalRecoveryChoice {
+    let text = HSTRING::from(format!(
+        "前回の切替が中断されました({affected_window_count}件のウィンドウに影響)。\n\n\
+         [はい] 元の配置に戻す\n\
+         [いいえ] 全ウィンドウをメイン画面へ回収\n\
+         [キャンセル] 何もしない(次回起動時に再度確認します)"
+    ));
+    let caption = HSTRING::from("RepoDeck — 切替の復旧");
+    // SAFETY: `text`/`caption` are valid, NUL-terminated wide strings for the
+    // duration of this call; `hwnd: None` shows an owner-less dialog.
+    let result = unsafe { MessageBoxW(None, &text, &caption, MB_YESNOCANCEL | MB_ICONWARNING) };
+    match result {
+        IDYES => JournalRecoveryChoice::RestoreOriginalPlacement,
+        IDNO => JournalRecoveryChoice::RecoverAllToMain,
+        _ => JournalRecoveryChoice::DoNothing,
+    }
+}
+
+fn hotkey_register_error_message(err: HotkeyRegisterError) -> String {
+    match err {
+        HotkeyRegisterError::AlreadyRegistered => {
+            "このホットキーは他のアプリと競合しています。元のホットキーに戻しました。".to_string()
+        }
+        HotkeyRegisterError::Other(e) => format!("ホットキーの登録に失敗しました: {e}"),
+    }
+}
+
+/// Send-safe projection of `hotkey::win32_hotkey::HotkeyEvent`, built on the
+/// hotkey thread and handled on the UI thread via
+/// `slint::invoke_from_event_loop`. Its `Rc`-based state (`AppConfig`, the
+/// pending hotkey rollback) can't cross threads directly — `Rc` isn't
+/// `Send` — so it lives in `UI_CONTEXT`, a UI-thread-local populated once in
+/// `run()` and only ever read back from a closure Slint guarantees runs on
+/// that same thread.
+enum HotkeyUiEvent {
+    Pressed,
+    /// A hold-to-cycle arrow was pressed (main modifiers + Down/Up).
+    Cycle {
+        forward: bool,
+    },
+    /// A Ctrl+Shift+MouseWheel tick — drives the switcher like `Cycle` but the
+    /// release-to-commit watches Ctrl+Shift rather than the configured hotkey.
+    WheelCycle {
+        forward: bool,
+    },
+    Registered,
+    RegisterFailed(String),
+}
+
+thread_local! {
+    /// The repeating timer that watches for the cycle modifiers being
+    /// released (Alt+Tab-style commit). Held in an `Rc<RefCell<..>>` so the
+    /// timer's own callback can drop it — the standard Slint self-stopping
+    /// timer idiom. `None` whenever no hold-to-cycle session is in flight.
+    static CYCLE_TIMER: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+
+    /// The virtual-key codes whose release commits the in-flight cycle session.
+    /// Set per gesture — the configured hotkey's modifiers for the keyboard
+    /// cycle, or Ctrl+Shift for the mouse-wheel gesture — so one release timer
+    /// serves both.
+    static CYCLE_WATCH_VKS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The Win32 virtual-key codes to poll for each configured hotkey modifier.
+/// The Win key contributes both `VK_LWIN` and `VK_RWIN` (either counts as
+/// held), so "all released" means every code here reads up.
+fn hotkey_modifier_vks(hotkey: &HotkeyConfig) -> Vec<i32> {
+    let mut vks = Vec::new();
+    for modifier in &hotkey.modifiers {
+        match modifier {
+            HotkeyModifier::Control => vks.push(0x11), // VK_CONTROL
+            HotkeyModifier::Alt => vks.push(0x12),     // VK_MENU
+            HotkeyModifier::Shift => vks.push(0x10),   // VK_SHIFT
+            HotkeyModifier::Win => {
+                vks.push(0x5B); // VK_LWIN
+                vks.push(0x5C); // VK_RWIN
+            }
+        }
+    }
+    vks
+}
+
+fn key_is_down(vk: i32) -> bool {
+    // SAFETY: `GetAsyncKeyState` is always safe to call; the high bit of the
+    // returned SHORT means the key is currently down.
+    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
+}
+
+/// True once every watched modifier of the in-flight cycle session has been
+/// released — the moment it commits. The watched set is whatever the gesture
+/// stored in `CYCLE_WATCH_VKS` (hotkey modifiers, or Ctrl+Shift for the wheel).
+fn cycle_watch_released() -> bool {
+    CYCLE_WATCH_VKS.with(|vks| {
+        let vks = vks.borrow();
+        // An empty set can't be "held"; treat as never-released so no phantom
+        // commit fires.
+        !vks.is_empty() && vks.iter().all(|&vk| !key_is_down(vk))
+    })
+}
+
+/// Moves the Quick Switcher selection one row, wrapping at either end. The slot
+/// one past the last row (index == row_count) is the "empty the main screen"
+/// action, so the cycle includes it.
+fn cycle_move_selection(switcher: &QuickSwitcher, forward: bool) {
+    let len = switcher.get_rows().row_count() + 1;
+    let current = usize::try_from(switcher.get_selected_index().max(0)).unwrap_or(0) % len;
+    let next = if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    };
+    switcher.set_selected_index(i32::try_from(next).unwrap_or(0));
+}
+
+/// Cancels any in-flight hold-to-cycle release timer (e.g. the user pressed
+/// Escape, clicked a row, or the popup lost focus before releasing).
+fn cancel_cycle_timer() {
+    CYCLE_TIMER.with(|holder| holder.borrow_mut().take());
+}
+
+/// Switches to whatever row the hold-to-cycle session left selected, then
+/// closes the switcher — the Alt+Tab-style "release to commit" action.
+fn commit_cycle_selection(ctx: &CrossThreadUiContext) {
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        let rows = switcher.get_rows();
+        let idx = switcher.get_selected_index();
+        let row_count = rows.row_count();
+        if idx >= 0 && (idx as usize) >= row_count {
+            // The slot past the last row is the "empty the main screen" action.
+            switcher.invoke_empty_main_requested();
+        } else if idx >= 0
+            && let Some(row) = rows.row_data(idx as usize)
+        {
+            // Reuses the fully-wired switch path (journal, rollback, hide).
+            switcher.invoke_switch_requested(row.workset_id);
+        }
+        let _ = switcher.hide();
+    }
+}
+
+/// Starts the release-watching timer for a hold-to-cycle session, watching
+/// `watch_vks` for release. Updates the watched set even if a timer is already
+/// running (the latest gesture defines the commit condition).
+fn start_cycle_release_timer(watch_vks: Vec<i32>) {
+    CYCLE_WATCH_VKS.with(|c| *c.borrow_mut() = watch_vks);
+    if CYCLE_TIMER.with(|holder| holder.borrow().is_some()) {
+        return;
+    }
+    let holder = CYCLE_TIMER.with(std::clone::Clone::clone);
+    let holder_for_cb = holder.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(40),
+        move || {
+            let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+                return;
+            };
+            if cycle_watch_released() {
+                // Drop the timer first so it can't re-fire while the switch runs.
+                holder_for_cb.borrow_mut().take();
+                commit_cycle_selection(&ctx);
+            }
+        },
+    );
+    *holder.borrow_mut() = Some(timer);
+}
+
+/// Shared body of the keyboard-cycle and wheel-cycle gestures: shows the
+/// switcher (preselecting the current workset on first open), moves the
+/// selection, and arms the release timer for `watch_vks`.
+fn drive_cycle(ctx: &CrossThreadUiContext, forward: bool, watch_vks: Vec<i32>) {
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        if !switcher.window().is_visible() {
+            show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+            // Start from the current workset so the first tap lands on its
+            // neighbour, exactly like Alt+Tab starting on the next window.
+            let state = runtime_store::load(&ctx.data_dir);
+            if let Some(id) = state.current_workset_id {
+                select_row_for_workset(&switcher, id);
+            }
+        }
+        cycle_move_selection(&switcher, forward);
+        start_cycle_release_timer(watch_vks);
+    }
+}
+
+struct CrossThreadUiContext {
+    config: Rc<RefCell<AppConfig>>,
+    data_dir: PathBuf,
+    coordinator: Rc<SwitchCoordinator<Win32WindowOps>>,
+    pending_hotkey_rollback: RefCell<Option<HotkeyConfig>>,
+    settings_window: slint::Weak<AppWindow>,
+    quick_switcher: slint::Weak<QuickSwitcher>,
+    tray: slint::Weak<TrayIcon>,
+    tray_icons: TrayIcons,
+    /// Codex events whose `cwd` didn't match any registered workset (PLAN.md
+    /// §6.6). In-memory only, never persisted.
+    unmatched_agent_events: RefCell<Vec<agent_status_service::UnmatchedAgentEvent>>,
+}
+
+thread_local! {
+    static UI_CONTEXT: RefCell<Option<Rc<CrossThreadUiContext>>> = const { RefCell::new(None) };
+
+    /// クイックスイッチャーを開いてから、まだ何もしていないか。表示で立て、切替や
+    /// 他の操作で下ろす。閉じるときに立ったままなら「呼んだのに切り替えずに終わった」
+    /// ので、現在セットの配置を再適用する。
+    static SWITCHER_REAPPLY_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// クイックスイッチャーを表示したので、「何もせずに終わった」判定を有効にする。
+fn arm_switcher_reapply() {
+    SWITCHER_REAPPLY_ARMED.with(|armed| armed.set(true));
+}
+
+/// 切替・メイン画面を空にする・回収・別ウィンドウを開く——何かしら実行されたので、
+/// この後閉じても再適用しない。再適用は「呼んだだけで終わった」ときのためのもので、
+/// 実行された操作をこの直後に上書きしてはいけない。
+fn disarm_switcher_reapply() {
+    SWITCHER_REAPPLY_ARMED.with(|armed| armed.set(false));
+}
+
+/// クイックスイッチャーを閉じたときに呼ぶ。何もせずに終わっていたなら、現在セットの
+/// 配置を再適用する（PLAN.md §3.3「呼んで切り替えずに終わったとき」）。
+///
+/// 印は取り出して下ろすので、Esc で閉じる → 非アクティブ化でも閉じるのように合図が
+/// 二重に来ても一度しか走らない。実際の再配置は、`WM_ACTIVATE` の中から窓を動かし
+/// 始めないようイベントループへ回す。
+fn reapply_on_switcher_dismiss() {
+    if !SWITCHER_REAPPLY_ARMED.with(|armed| armed.replace(false)) {
+        return;
+    }
+    let _ = slint::invoke_from_event_loop(reapply_current_placement);
+}
+
+/// 現在セットの配置をもう一度当てる。切替と同じ経路（ジャーナル・ロールバック込み）
+/// を通るが、対象が現在セットでも早期 return しない `switch_or_reapply` を使う。
+/// 閉じたアプリの起動はしない——これは「並びを整える」操作なので、開いていない窓を
+/// 開き直すのは行き過ぎ。
+fn reapply_current_placement() {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let Some(target_workset_id) = runtime_store::load(&ctx.data_dir).current_workset_id else {
+        return;
+    };
+
+    // 切替と同じく、保存済みの配置を使う直前にモニターの入れ替わりを見る。
+    reconcile_monitor_identity(&ctx.data_dir, &ctx.config, "reapply");
+
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+    let config = ctx.config.borrow();
+    match ctx.coordinator.switch_or_reapply(SwitchRequest {
+        worksets: &config.worksets,
+        fixed_slots: &config.fixed_slots,
+        sub_screens: &config.sub_screens,
+        saved_monitors: &config.monitors,
+        main_monitor_ids: &config.main_monitor_ids,
+        live_monitors: &live_monitors,
+        live_windows: &live_windows,
+        target_workset_id,
+    }) {
+        Ok(_) => tracing::info!(
+            target: "switch", workset = %target_workset_id,
+            "quick switcher closed without switching: re-applied the current placement"
+        ),
+        // 閉じた後なので出せるUIがない。ログだけ残す。
+        Err(err) => tracing::warn!(
+            target: "switch", error = %err,
+            "quick switcher closed without switching: re-apply failed"
+        ),
+    }
+}
+
+fn handle_hotkey_ui_event(event: HotkeyUiEvent) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    match event {
+        HotkeyUiEvent::Pressed => {
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                toggle_quick_switcher(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+            }
+        }
+        HotkeyUiEvent::Cycle { forward } => {
+            let watch = hotkey_modifier_vks(&ctx.config.borrow().settings.quick_switcher_hotkey);
+            drive_cycle(&ctx, forward, watch);
+        }
+        HotkeyUiEvent::WheelCycle { forward } => {
+            // Ctrl+Shift held during the wheel gesture — release either to commit.
+            drive_cycle(&ctx, forward, vec![0x11, 0x10]); // VK_CONTROL, VK_SHIFT
+        }
+        HotkeyUiEvent::Registered => {
+            ctx.pending_hotkey_rollback.borrow_mut().take();
+            if let Some(settings) = ctx.settings_window.upgrade() {
+                settings.set_hotkey_status_text("ホットキーを保存しました。".into());
+                settings.set_hotkey_status_is_warning(false);
+            }
+        }
+        HotkeyUiEvent::RegisterFailed(message) => {
+            if let Some(previous) = ctx.pending_hotkey_rollback.borrow_mut().take() {
+                let mut cfg = ctx.config.borrow_mut();
+                cfg.settings.quick_switcher_hotkey = previous;
+                let _ = config_store::save(&ctx.data_dir, &cfg);
+            }
+            if let Some(settings) = ctx.settings_window.upgrade() {
+                // Re-render the display from the (possibly just rolled-back)
+                // config so it never keeps showing a combo that failed to
+                // register.
+                settings.set_hotkey_display(
+                    hotkey_display_label(&ctx.config.borrow().settings.quick_switcher_hotkey)
+                        .into(),
+                );
+                settings.set_hotkey_status_text(message.into());
+                settings.set_hotkey_status_is_warning(true);
+            }
+        }
+    }
+}
+
+/// Handles one command from the env-gated test-control pipe, on the UI thread.
+///
+/// `switch <workset-uuid>` re-enters the fully-wired Quick-Switcher switch path
+/// (relaunch, journal, rollback, tray refresh) exactly as a user selection
+/// would, and `close <workset-uuid>` runs the same 「アプリを閉じる」 the manager's
+/// button does — so a soak-test driver exercises the real code paths.
+fn handle_test_control(bytes: &[u8]) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let command = text.trim();
+    let (verb, rest) = match command.split_once(' ') {
+        Some(parts) => parts,
+        None => {
+            tracing::warn!(target: "switch", command = %command, "test-control: unknown command");
+            return;
+        }
+    };
+    let id = rest.trim();
+    let Ok(workset_id) = uuid::Uuid::parse_str(id) else {
+        tracing::warn!(target: "switch", arg = %id, "test-control: arg is not a uuid");
+        return;
+    };
+
+    match verb {
+        "switch" => {
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                tracing::info!(target: "switch", workset = %id, "test-control: switch requested");
+                switcher.invoke_switch_requested(id.into());
+            }
+        }
+        "close" => {
+            tracing::info!(target: "switch", workset = %id, "test-control: close requested");
+            close_workset_windows(&ctx.config.borrow(), &ctx.data_dir, workset_id);
+        }
+        _ => tracing::warn!(target: "switch", command = %command, "test-control: unknown command"),
+    }
+}
+
+/// Send-safe projection of `ipc::named_pipe::PipeServerEvent::MessageReceived`,
+/// built on the pipe server's accept thread and handled on the UI thread via
+/// `slint::invoke_from_event_loop` — same shape as `HotkeyUiEvent`. Carries
+/// only the raw bytes (trivially `Send`); parsing and all `Rc`-based state
+/// access happen after the marshal, in `handle_agent_ui_event`.
+enum AgentUiEvent {
+    MessageReceived(Vec<u8>),
+}
+
+fn handle_agent_ui_event(event: AgentUiEvent) {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    let AgentUiEvent::MessageReceived(bytes) = event;
+
+    // `repodeck-hook.exe` already ran `ipc::protocol::parse_and_adapt` on the
+    // raw Codex hook JSON before sending it over the pipe (PLAN.md §6.4's
+    // "転送JSON" *is* the normalized wire schema) — deserializing straight to
+    // `NormalizedEvent` here, not re-adapting, is what the wire format is.
+    let normalized: protocol::NormalizedEvent = match serde_json::from_slice(&bytes) {
+        Ok(normalized) => normalized,
+        Err(err) => {
+            tracing::warn!(error = %err, "dropping malformed Codex agent event");
+            return;
+        }
+    };
+
+    {
+        let mut unmatched = ctx.unmatched_agent_events.borrow_mut();
+        let outcome = {
+            let config = ctx.config.borrow();
+            agent_status_service::apply_event(
+                &ctx.data_dir,
+                &config.worksets,
+                &mut unmatched,
+                normalized.clone(),
+            )
+        };
+        match outcome {
+            // どのセットにも一致しなかった。表示中のセットが ChatGPT アプリ入り
+            // (=「Codex を回すセット」) でまだ repository_path が空なら、この
+            // 実行フォルダをそのセットへ自動で紐づけ、同じイベントを適用し直す。
+            Ok(None) => {
+                if adopt_cwd_into_active_agent_set(&ctx, &normalized.cwd) {
+                    let config = ctx.config.borrow();
+                    if let Err(err) = agent_status_service::apply_event(
+                        &ctx.data_dir,
+                        &config.worksets,
+                        &mut unmatched,
+                        normalized,
+                    ) {
+                        tracing::warn!(error = %err, "failed to persist Codex agent status update after auto-link");
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to persist Codex agent status update");
+            }
+        }
+    }
+
+    refresh_tray_status(&ctx);
+    if let Some(switcher) = ctx.quick_switcher.upgrade() {
+        refresh_quick_switcher_rows(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+    }
+}
+
+/// どのセットにも一致しなかった Codex 実行の作業フォルダを、いま表示中の
+/// 「ChatGPT アプリ入りセット」へ自動で紐づける。紐づけたら `true`。
+///
+/// 発火条件を厳しくして誤爆を防ぐ: (1) 現在の表示セットが存在し、(2) その
+/// セットに ChatGPT/Codex デスクトップアプリが含まれ、(3) まだ
+/// `repository_path` が空 —— の3つがそろったときだけ。普通のリポジトリ
+/// セットや、無関係なセットを開いているときは何も起きない。
+///
+/// 紐づけ先はイベントの cwd の git ルート(あれば)。以後その配下の実行は
+/// 通常どおりこのセットに一致する。
+fn adopt_cwd_into_active_agent_set(ctx: &CrossThreadUiContext, cwd: &str) -> bool {
+    if cwd.is_empty() {
+        return false;
+    }
+    let Some(current_id) = runtime_store::load(&ctx.data_dir).current_workset_id else {
+        return false;
+    };
+
+    let mut config = ctx.config.borrow_mut();
+    let Some(workset) = config.worksets.iter_mut().find(|w| w.id == current_id) else {
+        return false;
+    };
+    if !workset.repository_path.as_os_str().is_empty()
+        || !workset_service::contains_chatgpt_codex_app(workset)
+    {
+        return false;
+    }
+
+    let cwd_path = PathBuf::from(cwd);
+    let repo = workset_service::find_git_root(&cwd_path).unwrap_or(cwd_path);
+    workset.repository_path = repo.clone();
+    workset.repository_kind = crate::domain::workset::RepositoryKind::Directory;
+    let set_name = workset.name.clone();
+    drop(config);
+
+    if let Err(err) = config_store::save(&ctx.data_dir, &ctx.config.borrow()) {
+        tracing::warn!(error = %err, "failed to persist the auto-linked Codex working directory");
+        return false;
+    }
+    tracing::info!(
+        target: "agents",
+        set = %set_name,
+        repo = %repo.display(),
+        "auto-linked a Codex working directory to the active ChatGPT set"
+    );
+    true
+}
+
+/// Recomputes the tray icon color/tooltip from every registered workset's
+/// aggregate agent state (PLAN.md §6.7): the highest-`tray_priority` active
+/// workset wins, or the idle icon/plain tooltip if none are active.
+fn refresh_tray_status(ctx: &CrossThreadUiContext) {
+    let Some(tray) = ctx.tray.upgrade() else {
+        return;
+    };
+    let config = ctx.config.borrow();
+    let state = runtime_store::load(&ctx.data_dir);
+
+    match highest_priority_agent_workset(&config, &state.agent_runs) {
+        Some((workset_id, agent_state)) => {
+            let name = config
+                .worksets
+                .iter()
+                .find(|w| w.id == workset_id)
+                .map(|w| w.name.as_str())
+                .unwrap_or("");
+            tray.set_icon_source(ctx.tray_icons.get(agent_state).clone());
+            tray.set_tooltip_text(
+                format!("RepoDeck — {name}: {}", agent_status_label(agent_state)).into(),
+            );
+        }
+        None => {
+            tray.set_icon_source(ctx.tray_icons.get(AgentState::Idle).clone());
+            tray.set_tooltip_text("RepoDeck".into());
+        }
+    }
+}
+
+/// The 6 agent-state tray-icon variants (PLAN.md §6.7), rendered once at
+/// startup: the bundled app icon with a colored status-dot badge painted in
+/// the corner. Rendered in memory via `resvg`/`tiny_skia` (already a
+/// dependency for `build.rs`'s own icon generation) and handed to Slint as
+/// `Image::from_rgba8_premultiplied` — no asset files or install-path
+/// lookups needed at runtime.
+struct TrayIcons {
+    idle: slint::Image,
+    running: slint::Image,
+    needs_input: slint::Image,
+    ready: slint::Image,
+    blocked: slint::Image,
+    unknown: slint::Image,
+}
+
+impl TrayIcons {
+    fn render() -> Self {
+        Self {
+            idle: render_tray_icon(state_color(AgentState::Idle)),
+            running: render_tray_icon(state_color(AgentState::Running)),
+            needs_input: render_tray_icon(state_color(AgentState::NeedsInput)),
+            ready: render_tray_icon(state_color(AgentState::Ready)),
+            blocked: render_tray_icon(state_color(AgentState::Blocked)),
+            unknown: render_tray_icon(state_color(AgentState::Unknown)),
+        }
+    }
+
+    fn get(&self, state: AgentState) -> &slint::Image {
+        match state {
+            AgentState::Idle => &self.idle,
+            AgentState::Running => &self.running,
+            AgentState::NeedsInput => &self.needs_input,
+            AgentState::Ready => &self.ready,
+            AgentState::Blocked => &self.blocked,
+            AgentState::Unknown => &self.unknown,
+        }
+    }
+}
+
+const TRAY_ICON_SVG: &[u8] = include_bytes!("../assets/repodeck-icon.svg");
+const TRAY_ICON_SIZE: u32 = 32;
+const TRAY_BADGE_RADIUS: f32 = 9.0;
+
+fn render_tray_icon(hex_color: &str) -> slint::Image {
+    let tree = resvg::usvg::Tree::from_data(TRAY_ICON_SVG, &resvg::usvg::Options::default())
+        .expect("bundled repodeck-icon.svg must parse");
+    let source_size = tree.size();
+
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(TRAY_ICON_SIZE, TRAY_ICON_SIZE).expect("nonzero icon size");
+    let scale_x = TRAY_ICON_SIZE as f32 / source_size.width();
+    let scale_y = TRAY_ICON_SIZE as f32 / source_size.height();
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale_x, scale_y),
+        &mut pixmap.as_mut(),
+    );
+
+    draw_status_badge(&mut pixmap, hex_color);
+
+    let mut buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(TRAY_ICON_SIZE, TRAY_ICON_SIZE);
+    buffer.make_mut_bytes().copy_from_slice(pixmap.data());
+    slint::Image::from_rgba8_premultiplied(buffer)
+}
+
+/// Paints a filled circle badge (with a thin dark ring for contrast against
+/// light taskbars) in the bottom-right corner, in the state's hex color.
+fn draw_status_badge(pixmap: &mut resvg::tiny_skia::Pixmap, hex_color: &str) {
+    let cx = TRAY_ICON_SIZE as f32 - TRAY_BADGE_RADIUS - 1.0;
+    let cy = TRAY_ICON_SIZE as f32 - TRAY_BADGE_RADIUS - 1.0;
+
+    let mut ring_paint = resvg::tiny_skia::Paint::default();
+    ring_paint.set_color(resvg::tiny_skia::Color::from_rgba8(15, 23, 42, 255));
+    let ring_path = resvg::tiny_skia::PathBuilder::from_circle(cx, cy, TRAY_BADGE_RADIUS + 1.5)
+        .expect("nonzero radius");
+    pixmap.fill_path(
+        &ring_path,
+        &ring_paint,
+        resvg::tiny_skia::FillRule::Winding,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+
+    let mut fill_paint = resvg::tiny_skia::Paint::default();
+    fill_paint.set_color(hex_to_tiny_skia_color(hex_color));
+    let fill_path = resvg::tiny_skia::PathBuilder::from_circle(cx, cy, TRAY_BADGE_RADIUS)
+        .expect("nonzero radius");
+    pixmap.fill_path(
+        &fill_path,
+        &fill_paint,
+        resvg::tiny_skia::FillRule::Winding,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+fn hex_to_tiny_skia_color(hex: &str) -> resvg::tiny_skia::Color {
+    let hex = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
+    let g = u8::from_str_radix(hex.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
+    let b = u8::from_str_radix(hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
+    resvg::tiny_skia::Color::from_rgba8(r, g, b, 255)
+}
+
+/// Shows the Quick Switcher in response to a second `repodeck.exe` launch
+/// (PLAN.md §3.2), via the same `UI_CONTEXT` thread-local `handle_hotkey_ui_event`
+/// uses — the listener thread that calls this (via `invoke_from_event_loop`)
+/// is, like the hotkey thread, not the UI thread.
+fn show_quick_switcher_from_context() {
+    UI_CONTEXT.with(|cell| {
+        if let Some(ctx) = &*cell.borrow()
+            && let Some(switcher) = ctx.quick_switcher.upgrade()
+        {
+            show_quick_switcher_at_cursor(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+        }
+    });
+}
+
+/// Per-repository git status, refreshed in the background (`spawn_git_refresh`)
+/// and read when building Quick Switcher rows. A process-wide cache rather than
+/// `Rc` state so the background thread can write it; the UI thread reads it.
+static GIT_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, crate::domain::git::GitStatus>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The cached git status for `path`, or the empty default until the first
+/// background refresh has populated it.
+fn cached_git_status(path: &Path) -> crate::domain::git::GitStatus {
+    GIT_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
+        .unwrap_or_default()
+}
+
+/// Fetches each repository's git status on a background thread (so `git` never
+/// blocks the switcher from opening), stores it in `GIT_CACHE`, then re-renders
+/// the Quick Switcher on the UI thread. Called when the switcher opens and after
+/// a switch — the moments its branch / change-count / last-commit can differ.
+fn spawn_git_refresh(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for path in paths {
+            let status = crate::application::git_status_service::fetch(&path);
+            if let Ok(mut cache) = GIT_CACHE.lock() {
+                cache.insert(path, status);
+            }
+        }
+        let _ = slint::invoke_from_event_loop(refresh_quick_switcher_from_context);
+    });
+}
+
+/// Per-repository GitHub status (open PRs + CI), refreshed on a background
+/// thread — `gh` talks to the network, so it must never block the switcher.
+/// Read when building rows; the empty default shows until the first refresh.
+static GH_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, crate::application::gh_status_service::GhStatus>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn cached_gh_status(path: &Path) -> crate::application::gh_status_service::GhStatus {
+    GH_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
+        .unwrap_or_default()
+}
+
+/// Fetches each repo's GitHub status (PRs + CI) on a background thread, storing
+/// it in `GH_CACHE` and re-rendering the switcher as each repo resolves (gh is
+/// slow, so rows fill in progressively rather than waiting for the whole set).
+/// Uses each repo's cached git branch to find that branch's PR and scope CI.
+fn spawn_gh_refresh(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for path in paths {
+            let branch = cached_git_status(&path).branch;
+            let status = crate::application::gh_status_service::fetch(&path, branch.as_deref());
+            if let Ok(mut cache) = GH_CACHE.lock() {
+                cache.insert(path, status);
+            }
+            let _ = slint::invoke_from_event_loop(refresh_quick_switcher_from_context);
+        }
+    });
+}
+
+/// The distinct repository paths of all worksets — the work list for
+/// `spawn_git_refresh`.
+fn workset_repo_paths(config: &AppConfig) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = config
+        .worksets
+        .iter()
+        .map(|w| w.repository_path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Re-renders the Quick Switcher's rows from the UI-thread context (used as the
+/// background git refresh's completion callback).
+fn refresh_quick_switcher_from_context() {
+    UI_CONTEXT.with(|cell| {
+        if let Some(ctx) = &*cell.borrow()
+            && let Some(switcher) = ctx.quick_switcher.upgrade()
+        {
+            refresh_quick_switcher_rows(&switcher, &ctx.config.borrow(), &ctx.data_dir);
+        }
+    });
+}
+
+/// How long to let the display topology settle before re-checking whether a
+/// software re-detect actually brought the missing monitors back (PLAN.md §4.6).
+/// The retry cadence uses a [`slint::Timer`] so the UI thread is never blocked.
+const RECOVERY_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// Snapshots the live monitors' `device_name`s — the plain-data input the pure
+/// [`display_recovery_service`] compares against the saved topology.
+fn live_device_names() -> Vec<String> {
+    monitor::enumerate_monitors()
+        .map(|monitors| monitors.into_iter().map(|m| m.device_name).collect())
+        .unwrap_or_default()
+}
+
+/// 紐づけ表を点検し、正当化できない紐づけを捨てて保存する。
+///
+/// 起動時に自動で1回、トレイの「紐づけを点検して修復」からいつでも手動で走る。
+/// 捨てるだけで付け直しはしない——次の切り替えの解決が、根拠のある窓へ付け直すか、
+/// 見つからなければセット自身のアプリを起動し直す。
+///
+/// 実機（2026-07-29）はこれが無かったために、OS 再起動直後に確定した誤バインドが
+/// `runtime.json` に焼き付いたまま戻らなくなった。`repodeck` セットが「02_求解・
+/// 高速化」の窓を、`エンジン` セットが「repodeck」の窓を握り、1枚の Brave を
+/// 4セットが同時に握っていた。
+fn run_integrity_check(
+    data_dir: &Path,
+    config: &Rc<RefCell<AppConfig>>,
+    reason: &str,
+) -> integrity_service::IntegrityReport {
+    let live_windows =
+        enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+    let mut runtime = runtime_store::load(data_dir);
+
+    let report = {
+        let cfg = config.borrow();
+        integrity_service::check_and_repair(
+            &cfg.worksets,
+            &live_windows,
+            &mut runtime.window_bindings,
+        )
+    };
+
+    integrity_service::log_report(&report, reason);
+
+    if report.repair.touched_anything()
+        && let Err(err) = runtime_store::save(data_dir, &runtime)
+    {
+        tracing::warn!(error = %err, reason, "failed to persist the repaired window bindings");
+    }
+
+    report
+}
+
+/// Runs the [`display_reset`] side effect once and logs its outcome. Shared by the
+/// manual tray trigger ("モニターを再検出") and the automatic resume path.
+fn run_display_reset(reason: &str) {
+    match display_reset::reapply_display_topology() {
+        Ok(outcome) => {
+            tracing::info!(?outcome, reason, "display re-detect completed");
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, reason, "display re-detect failed");
+        }
+    }
+}
+
+/// One automatic-recovery cycle: read the saved topology and the setting, ask the
+/// pure [`display_recovery_service::decide_recovery`] what to do, and act on it.
+///
+/// On [`RecoveryDecision::Recover`] it fires the side effect and schedules a
+/// re-check after [`RECOVERY_SETTLE_DELAY`] via `timer`, forming a bounded retry
+/// loop (the pure decision function enforces the retry budget, so this can never
+/// spin forever). All other decisions just log and stop.
+fn attempt_auto_recovery(
+    config: &Rc<RefCell<AppConfig>>,
+    attempts: &Rc<Cell<u32>>,
+    timer: &Rc<Timer>,
+) {
+    let (saved_monitors, enabled) = {
+        let config = config.borrow();
+        (
+            config.monitors.clone(),
+            config.settings.auto_display_recovery,
+        )
+    };
+    let live = live_device_names();
+
+    match display_recovery_service::decide_recovery(&saved_monitors, &live, attempts.get(), enabled)
+    {
+        RecoveryDecision::Recover { missing, attempt } => {
+            tracing::warn!(
+                ?missing,
+                attempt,
+                "resume: saved monitors missing from the live topology; attempting software re-detect"
+            );
+            attempts.set(attempt);
+            run_display_reset("resume auto-recovery");
+
+            // Re-check after the display settles; if monitors are still missing and
+            // budget remains, this reschedules, otherwise the next decision stops it.
+            let config = config.clone();
+            let attempts = attempts.clone();
+            let timer_for_retry = timer.clone();
+            timer.start(TimerMode::SingleShot, RECOVERY_SETTLE_DELAY, move || {
+                attempt_auto_recovery(&config, &attempts, &timer_for_retry);
+            });
+        }
+        RecoveryDecision::GiveUp { missing } => {
+            tracing::warn!(
+                ?missing,
+                attempts = attempts.get(),
+                "resume: retry budget exhausted; giving up on display re-detect until next resume"
+            );
+        }
+        RecoveryDecision::UpToDate => {
+            tracing::info!(
+                "resume: live display topology already matches saved monitors; no recovery needed"
+            );
+        }
+        RecoveryDecision::Disabled => {
+            tracing::debug!("resume: automatic display recovery is disabled by the user setting");
+        }
+        RecoveryDecision::NoSavedTopology => {
+            tracing::debug!("resume: no saved monitors yet; skipping display recovery");
+        }
+    }
+}
+
+/// 現在つながっているモニターを、同一性判定に必要な形
+/// ([`LiveMonitor`]) で読み出す。
+fn live_monitor_identities() -> Vec<LiveMonitor> {
+    monitor::enumerate_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| LiveMonitor {
+            device_path: monitor::device_interface_path(&m.device_name),
+            device_name: m.device_name,
+            bounds_px: m.bounds_px,
+        })
+        .collect()
+}
+
+/// `\\.\DISPLAYn` と物理モニターの対応が入れ替わっていないか確かめ、
+/// 入れ替わっていれば保存済み設定のデバイス名参照をまとめて付け替える
+/// (`application::monitor_identity` のモジュールドキュメントを参照)。
+///
+/// [`attempt_auto_recovery`] とは別物であることに注意: あちらは「保存済み
+/// モニターが live から消えた」ケースを直す。こちらは「7枚とも居るのに
+/// 名前だけ入れ替わった」ケースを直す。後者は解像度も配置も変わらないため
+/// `WM_DISPLAYCHANGE` すら飛ばず、イベント任せでは検知できない。だから
+/// 配置を実際に使う直前 (起動時・復帰時・各切り替えの直前) に呼ぶ。
+///
+/// 何も入れ替わっていなければモニターの列挙だけで戻る安価な処理。
+fn reconcile_monitor_identity(data_dir: &Path, config: &Rc<RefCell<AppConfig>>, reason: &str) {
+    let live = live_monitor_identities();
+    if live.is_empty() {
+        return;
+    }
+
+    let mut cfg = config.borrow_mut();
+    let renames = monitor_identity::plan_remap(&cfg.monitors, &live);
+    let mut config_changed = false;
+
+    if !renames.is_empty() {
+        let mut runtime = runtime_store::load(data_dir);
+        let rewritten = monitor_identity::apply_remap(
+            &mut cfg,
+            &mut runtime.auto_slot_assignments,
+            &mut runtime.last_seen_monitor_fingerprint,
+            &renames,
+        );
+        tracing::warn!(
+            target: "monitors",
+            reason,
+            ?renames,
+            rewritten,
+            "モニターのデバイス名が入れ替わっていたので保存済みの参照を付け替えた"
+        );
+        if let Err(err) = runtime_store::save(data_dir, &runtime) {
+            tracing::warn!(error = %err, "failed to persist remapped slot assignments");
+        }
+        config_changed = true;
+    }
+
+    // 付け替えの有無にかかわらず、次回はハードウェア由来の同一性で
+    // 判定できるよう device_path を焼き直しておく。空欄を埋めるだけで、
+    // 食い違う行は上書きせず報告する（付け替えを断念した状態でここを素通し
+    // すると、旧名に別の物理モニターの path を焼き付けてしまう）。
+    let refreshed = monitor_identity::refresh_device_paths(&mut cfg, &live);
+    if !refreshed.conflicting.is_empty() {
+        tracing::warn!(
+            target: "monitors",
+            reason,
+            conflicting = ?refreshed.conflicting,
+            "保存済みの device_path と実機が食い違っている。名前と物理モニターの対応がねじれたままなので上書きしない"
+        );
+    }
+    config_changed |= refreshed.changed();
+
+    if config_changed && let Err(err) = config_store::save(data_dir, &cfg) {
+        tracing::warn!(error = %err, "failed to persist the monitor identity remap");
+    }
+}
+
+thread_local! {
+    /// Per-resume retry counter and the settle-delay timer for automatic display
+    /// recovery. UI-thread-only (the suspend/resume callback marshals here before
+    /// touching them), so plain `thread_local` `Rc`s need no synchronization.
+    static RECOVERY_ATTEMPTS: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    static RECOVERY_TIMER: Rc<Timer> = Rc::new(Timer::default());
+}
+
+/// UI-thread handler for a resume-from-sleep event (marshaled from the
+/// suspend/resume callback). Resets the retry budget and kicks off one recovery
+/// cycle against the current saved topology.
+fn handle_resume_ui_event() {
+    let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+        return;
+    };
+    tracing::info!("system resume detected; evaluating display recovery");
+    reconcile_monitor_identity(&ctx.data_dir, &ctx.config, "resume");
+    let attempts = RECOVERY_ATTEMPTS.with(std::clone::Clone::clone);
+    let timer = RECOVERY_TIMER.with(std::clone::Clone::clone);
+    // Each resume starts a fresh retry budget.
+    attempts.set(0);
+    attempt_auto_recovery(&ctx.config, &attempts, &timer);
 }
 
 pub fn run() -> Result<()> {
@@ -1315,6 +6218,7 @@ pub fn run() -> Result<()> {
     })?;
 
     let _log_guard: WorkerGuard = logging::init(&data_dir)?;
+    logging::enforce_retention(&logging::log_dir(&data_dir));
 
     let Some(_instance_mutex) = acquire_single_instance()? else {
         tracing::info!(
@@ -1329,17 +6233,211 @@ pub fn run() -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "RepoDeck starting");
 
     let config = Rc::new(RefCell::new(load_or_default_config(&data_dir)));
+    // 前回終了中にモニターのデバイス名が入れ替わっていることがあるので、
+    // 保存済みの配置を使い始める前に付け替える。
+    reconcile_monitor_identity(&data_dir, &config, "startup");
     let layout_studio_state = Rc::new(RefCell::new(LayoutStudioState::new()));
     let workset_manager_state = Rc::new(RefCell::new(WorksetManagerState::new()));
 
-    let window = AppWindow::new().context("failed to create the RepoDeck main window")?;
+    // Constructed here (rather than just before `wire_quick_switcher`, as in
+    // earlier phases) so the startup crash-recovery pass below can also use
+    // it for the "全てメインへ回収" choice.
+    let coordinator = Rc::new(SwitchCoordinator::new(Win32WindowOps, data_dir.clone()));
+
+    // PLAN.md §10.3: a leftover `switch-journal.json` means the previous
+    // switch never finished (RepoDeck crashed or was killed mid-switch).
+    // Runs before any window is shown.
+    if let Some(journal) = journal_store::load(&data_dir).unwrap_or(None) {
+        let runtime = runtime_store::load(&data_dir);
+        if crash_recovery::already_succeeded(&journal, runtime.current_workset_id) {
+            // The switch itself completed; only the journal-clear step was
+            // interrupted. Nothing to recover, nothing to ask the user.
+            let _ = journal_store::clear(&data_dir);
+        } else {
+            match crash_recovery_dialog(journal.windows.len()) {
+                JournalRecoveryChoice::RestoreOriginalPlacement => {
+                    let live_windows = enumerate::enumerate_top_level_windows(std::process::id())
+                        .unwrap_or_default();
+                    let report = crash_recovery::restore_original_placement(
+                        &Win32WindowOps,
+                        &config.borrow().worksets,
+                        &live_windows,
+                        &journal,
+                    );
+                    tracing::info!(
+                        recovered = report.recovered.len(),
+                        skipped = report.skipped.len(),
+                        "restored original placement after an interrupted switch"
+                    );
+                    let _ = journal_store::clear(&data_dir);
+                }
+                JournalRecoveryChoice::RecoverAllToMain => {
+                    let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+                    let live_windows = enumerate::enumerate_top_level_windows(std::process::id())
+                        .unwrap_or_default();
+                    let cfg = config.borrow();
+                    match coordinator.recover_all_windows(
+                        &cfg.worksets,
+                        &live_monitors,
+                        &cfg.main_monitor_ids,
+                        &live_windows,
+                    ) {
+                        Ok(report) => tracing::info!(
+                            recovered = report.recovered.len(),
+                            skipped = report.skipped.len(),
+                            "recovered all windows after an interrupted switch"
+                        ),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "failed to persist runtime state during startup recovery"
+                        ),
+                    }
+                    drop(cfg);
+                    let _ = journal_store::clear(&data_dir);
+                }
+                JournalRecoveryChoice::DoNothing => {
+                    // Leave the journal in place; the same dialog reappears
+                    // next launch (PLAN.md §10.3 step 5: only a real
+                    // selection resolves it).
+                }
+            }
+        }
+    }
+
+    // Diagnostic bookkeeping only — the journal's presence, not this flag,
+    // is what gates recovery above, so a plain crash outside any switch
+    // never triggers a false recovery prompt.
+    {
+        let mut runtime = runtime_store::load(&data_dir);
+        runtime.last_clean_shutdown = false;
+        // Discard session HWND bindings from a previous OS boot: after a reboot
+        // those HWND numbers are reassigned and would point at unrelated
+        // windows (PLAN.md §5.4 extension). Bindings survive a RepoDeck-only
+        // restart (same boot session), so switching still re-finds windows.
+        if !crate::windowing::session::is_same_session(runtime.window_binding_session) {
+            runtime.window_bindings.clear();
+            runtime.window_binding_session = Some(crate::windowing::session::boot_session_token());
+        }
+        let _ = runtime_store::save(&data_dir, &runtime);
+    }
+
+    // 前回の実行が残した紐づけを、使い始める前に点検する。RepoDeck だけの再起動
+    // では紐づけは持ち越されるので、前回焼き付いた誤りもそのまま持ち越される。
+    // ここで捨てておけば、最初の切り替えから正しいウィンドウに付き直せる。
+    run_integrity_check(&data_dir, &config, "startup");
+
+    // `window` is the repurposed settings surface (PLAN.md §13 Phase 7
+    // checklist item 4) — see the doc comment on `AppWindow` in
+    // `ui/app-window.slint` for why.
+    let window = AppWindow::new().context("failed to create the RepoDeck settings window")?;
     apply_glass_backdrop(window.window());
+
+    // Monitor-change recovery (Phase 9): RepoDeck 自前の不可視ウィンドウで
+    // `WM_DISPLAYCHANGE` を受ける。以前は設定ウィンドウを subclass していたが、
+    // 一度も開かれていない Slint ウィンドウには HWND が無く、登録が黙って
+    // 失敗し続けていた (`windowing::display_watch` のモジュールドキュメント)。
+    let config_for_display = config.clone();
+    let data_dir_for_display = data_dir.clone();
+    let _display_change_watch = display_watch::watch_display_changes(move || {
+        reconcile_monitor_identity(&data_dir_for_display, &config_for_display, "display change");
+
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let fingerprint = monitor_watch_service::compute_fingerprint(&live_monitors);
+
+        let mut runtime = runtime_store::load(&data_dir_for_display);
+        if runtime.last_seen_monitor_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            tracing::debug!(target: "monitors", "WM_DISPLAYCHANGE with unchanged topology (e.g. DPI-only); ignoring");
+            return; // e.g. a DPI-only change also fires WM_DISPLAYCHANGE
+        }
+
+        // A real topology change — including a Remote Desktop connect/disconnect,
+        // which swaps the physical monitors for the RDP virtual display and back.
+        // Log the before/after so a "windows went weird over RDP" report can be
+        // traced to exactly which monitors appeared/disappeared and which windows
+        // it stranded.
+        tracing::info!(
+            target: "monitors",
+            previous = runtime.last_seen_monitor_fingerprint.as_deref().unwrap_or("(none)"),
+            live = ?live_monitors
+                .iter()
+                .map(|m| (m.device_name.clone(), m.bounds_px.x, m.bounds_px.y, m.bounds_px.width, m.bounds_px.height))
+                .collect::<Vec<_>>(),
+            "monitor topology changed (WM_DISPLAYCHANGE)"
+        );
+
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        let offscreen = {
+            let config = config_for_display.borrow();
+            monitor_watch_service::find_now_offscreen_windows(
+                &config.worksets,
+                &live_windows,
+                &live_monitors,
+            )
+        };
+        if !offscreen.is_empty() {
+            tracing::info!(
+                target: "monitors",
+                count = offscreen.len(),
+                "minimizing windows left offscreen by a monitor configuration change"
+            );
+        }
+        for hwnd in &offscreen {
+            let rect = live_windows
+                .iter()
+                .find(|w| w.hwnd == *hwnd)
+                .map(|w| (w.rect_px.x, w.rect_px.y, w.rect_px.width, w.rect_px.height));
+            let title = live_windows
+                .iter()
+                .find(|w| w.hwnd == *hwnd)
+                .map(|w| w.title.clone())
+                .unwrap_or_default();
+            tracing::info!(target: "monitors", hwnd, ?rect, %title, "minimizing offscreen window");
+            Win32WindowOps.minimize(*hwnd);
+        }
+
+        runtime.last_seen_monitor_fingerprint = Some(fingerprint);
+        let _ = runtime_store::save(&data_dir_for_display, &runtime);
+    });
+    if _display_change_watch.is_none() {
+        // `reconcile_monitor_identity` が切り替えのたびに拾い直すので致命的では
+        // ないが、黙って監視なしになるのが今回の原因だったので必ず残す。
+        tracing::warn!(
+            target: "monitors",
+            "could not create the WM_DISPLAYCHANGE watch window; \
+             monitor changes are only picked up on the next switch"
+        );
+    }
+
+    // Automatic display recovery: register a window-free suspend/resume callback
+    // (see `power_watch` for why a window subclass can't work at startup) and, on
+    // each resume, run a bounded, self-healing software re-detect if (and only if)
+    // saved monitors have gone missing (PLAN.md §4.6, Phase 9). The callback fires
+    // on a system thread, so it only marshals onto the UI thread; all the real
+    // work — and all the "should we?" logic in the pure `display_recovery_service`
+    // — happens there via `handle_resume_ui_event`.
+    let _power_watch = power_watch::watch_power_resume(|| {
+        let _ = slint::invoke_from_event_loop(handle_resume_ui_event);
+    });
+    if _power_watch.is_none() {
+        tracing::warn!(
+            "could not register the suspend/resume notification; automatic display recovery on resume is disabled"
+        );
+    }
+
     let tray = TrayIcon::new().context("failed to create the RepoDeck tray icon")?;
     let layout_studio = LayoutStudio::new().context("failed to create the Layout Studio window")?;
     apply_glass_backdrop(layout_studio.window());
     let workset_manager =
         WorksetManager::new().context("failed to create the Workset Manager window")?;
     apply_glass_backdrop(workset_manager.window());
+    let quick_switcher =
+        QuickSwitcher::new().context("failed to create the Quick Switcher window")?;
+    apply_glass_backdrop(quick_switcher.window());
+    quick_switcher.set_translucent(transparency_effects_enabled());
+    // Must run before the window's first `.show()` — Explorer's taskbar
+    // often needs a hide/show cycle to notice a style change otherwise.
+    popup_window::exclude_from_taskbar_and_alt_tab(quick_switcher.window());
 
     wire_layout_studio(
         &layout_studio,
@@ -1347,17 +6445,216 @@ pub fn run() -> Result<()> {
         config.clone(),
         layout_studio_state,
     );
-    wire_workset_manager(&workset_manager, data_dir, config, workset_manager_state);
+    wire_workset_manager(
+        &workset_manager,
+        data_dir.clone(),
+        config.clone(),
+        workset_manager_state,
+        coordinator.clone(),
+    );
 
-    // Left-click on the tray icon or "RepoDeckを開く" in its menu (both wired to
-    // `open-requested` in app-window.slint) bring the main window back. Closing
-    // the window (the X button) only hides it by default
-    // (`CloseRequestResponse::HideWindow`); the tray icon keeps the event loop
-    // alive, so the process stays resident until "RepoDeckを終了" is chosen.
-    let window_for_open = window.as_weak();
-    tray.on_open_requested(move || {
-        if let Some(window) = window_for_open.upgrade() {
-            let _ = window.show();
+    wire_quick_switcher(
+        &quick_switcher,
+        data_dir.clone(),
+        config.clone(),
+        coordinator.clone(),
+        window.as_weak(),
+    );
+
+    // "メイン画面を空にする" from the Quick Switcher: hide it, open the Workset
+    // Manager and trigger its empty-main modal.
+    let workset_manager_for_qs_empty = workset_manager.as_weak();
+    let switcher_for_qs_empty = quick_switcher.as_weak();
+    quick_switcher.on_empty_main_requested(move || {
+        // 空にした直後に再適用が走ると、退避したはずの窓を並べ直してしまう。
+        disarm_switcher_reapply();
+        if let Some(switcher) = switcher_for_qs_empty.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(workset_manager) = workset_manager_for_qs_empty.upgrade() {
+            open_empty_main_screen(&workset_manager);
+        }
+    });
+
+    // "セット管理" from the Quick Switcher: hide it and bring the Workset Manager
+    // to the front (the standard place to register a set and launch its apps).
+    let workset_manager_for_qs_manage = workset_manager.as_weak();
+    let switcher_for_qs_manage = quick_switcher.as_weak();
+    quick_switcher.on_manager_requested(move || {
+        // セット管理を開くのは「何もせず閉じた」ではない。
+        disarm_switcher_reapply();
+        if let Some(switcher) = switcher_for_qs_manage.upgrade() {
+            let _ = switcher.hide();
+        }
+        if let Some(workset_manager) = workset_manager_for_qs_manage.upgrade() {
+            let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
+        }
+    });
+
+    // Populates the cross-thread context the hotkey thread, the pipe-server
+    // thread, and the second-instance listener thread reach
+    // `config`/`quick_switcher`/`tray` through: none of them can capture an
+    // `Rc` directly (it isn't `Send`), so each only ever calls a plain-fn/
+    // zero-capture closure via `slint::invoke_from_event_loop`, which looks
+    // the real state up here — safe because Slint guarantees that closure
+    // runs on this same (UI) thread that populated it.
+    UI_CONTEXT.with(|cell| {
+        *cell.borrow_mut() = Some(Rc::new(CrossThreadUiContext {
+            config: config.clone(),
+            data_dir: data_dir.clone(),
+            coordinator: coordinator.clone(),
+            pending_hotkey_rollback: RefCell::new(None),
+            settings_window: window.as_weak(),
+            quick_switcher: quick_switcher.as_weak(),
+            tray: tray.as_weak(),
+            tray_icons: TrayIcons::render(),
+            unmatched_agent_events: RefCell::new(Vec::new()),
+        }));
+    });
+
+    // Restore the last workset, if asked to. Deferred onto the event loop so it
+    // runs once the UI is up: after a reboot this relaunches that set's apps and
+    // places them, which is the whole point — one step back to where you were.
+    if config.borrow().settings.restore_workset_on_start
+        && let Some(workset_id) = runtime_store::load(&data_dir).current_workset_id
+    {
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ctx) = UI_CONTEXT.with(|cell| cell.borrow().clone()) else {
+                return;
+            };
+            if let Some(switcher) = ctx.quick_switcher.upgrade() {
+                tracing::info!(target: "switch", workset = %workset_id, "startup: restoring last workset");
+                // Reuses the fully-wired switch path (relaunch, journal, rollback).
+                switcher.invoke_switch_requested(workset_id.to_string().into());
+            }
+        });
+    }
+
+    // Codex agent-event named pipe server (PLAN.md §6.4, §9.1). A failure to
+    // bind (e.g. another process already squatting the pipe name) disables
+    // Codex integration for this session rather than the whole app.
+    let _pipe_server = match NamedPipeServer::spawn(|event| match event {
+        PipeServerEvent::MessageReceived(bytes) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                handle_agent_ui_event(AgentUiEvent::MessageReceived(bytes));
+            });
+        }
+        PipeServerEvent::MessageTooLarge => {
+            tracing::warn!("dropped an oversized Codex agent event");
+        }
+        PipeServerEvent::ConnectionError(message) => {
+            tracing::warn!(error = %message, "Codex agent-event pipe connection error");
+        }
+    }) {
+        Ok(server) => Some(server),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start the Codex agent-event named pipe server");
+            None
+        }
+    };
+
+    // Env-gated test-control pipe: only bound when `REPODECK_TEST_CONTROL` is
+    // set, letting an external soak-test driver command switches by workset id
+    // through the fully-wired switch path (journal, relaunch, rollback) without
+    // the UI. Never active in normal operation.
+    let _test_control_server = if std::env::var_os("REPODECK_TEST_CONTROL").is_some() {
+        match NamedPipeServer::spawn_on(named_pipe::TEST_CONTROL_PIPE_NAME, |event| {
+            if let PipeServerEvent::MessageReceived(bytes) = event {
+                let _ = slint::invoke_from_event_loop(move || handle_test_control(&bytes));
+            }
+        }) {
+            Ok(server) => {
+                tracing::info!(target: "switch", pipe = named_pipe::TEST_CONTROL_PIPE_NAME, "test-control pipe active");
+                Some(server)
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to start the test-control pipe");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let hotkey_thread = Rc::new(HotkeyThread::spawn(
+        config.borrow().settings.quick_switcher_hotkey.clone(),
+        config.borrow().settings.cycle_next_key,
+        config.borrow().settings.cycle_prev_key,
+        move |event| {
+            let ui_event = match event {
+                HotkeyEvent::Pressed => HotkeyUiEvent::Pressed,
+                HotkeyEvent::CyclePressed { forward } => HotkeyUiEvent::Cycle { forward },
+                HotkeyEvent::Registered => HotkeyUiEvent::Registered,
+                HotkeyEvent::RegisterFailed(err) => {
+                    HotkeyUiEvent::RegisterFailed(hotkey_register_error_message(err))
+                }
+            };
+            let _ = slint::invoke_from_event_loop(move || handle_hotkey_ui_event(ui_event));
+        },
+    ));
+
+    // Ctrl+Shift+MouseWheel opens and drives the Quick Switcher system-wide.
+    // Kept alive for the process lifetime; its `Drop` unhooks and stops the
+    // thread. Each wheel tick marshals onto the UI thread like the hotkey.
+    let _mouse_wheel_hook = MouseWheelHook::spawn(move |forward| {
+        let _ = slint::invoke_from_event_loop(move || {
+            handle_hotkey_ui_event(HotkeyUiEvent::WheelCycle { forward });
+        });
+    });
+
+    wire_settings(&window, data_dir.clone(), config.clone(), hotkey_thread);
+    wire_codex_settings(&window, config.clone());
+    wire_about_and_autostart(&window, config.clone(), data_dir.clone());
+
+    // PLAN.md §3.3's `close_on_focus_loss` setting: Slint has no public API
+    // for window-deactivation, so this reaches the popup's raw HWND
+    // directly. `WM_ACTIVATE` runs on the UI thread itself (unlike
+    // `WM_HOTKEY`), so this closure can capture `Rc`s normally.
+    let c = config.clone();
+    let s = quick_switcher.as_weak();
+    let _deactivation_watch =
+        popup_window::watch_deactivation(quick_switcher.window(), move || {
+            if !c.borrow().settings.close_on_focus_loss {
+                return;
+            }
+            // Focus loss also aborts a hold-to-cycle session mid-flight.
+            cancel_cycle_timer();
+            if let Some(switcher) = s.upgrade() {
+                let _ = switcher.hide();
+            }
+            reapply_on_switcher_dismiss();
+        });
+
+    // --- Tray wiring (PLAN.md §3.4) ---
+    let switcher_for_tray = quick_switcher.as_weak();
+    let config_for_tray = config.clone();
+    let data_dir_for_tray = data_dir.clone();
+    tray.on_toggle_quick_switcher_requested(move || {
+        let Some(switcher) = switcher_for_tray.upgrade() else {
+            return;
+        };
+        let was_visible = switcher.window().is_visible();
+        let config = config_for_tray.borrow();
+        toggle_quick_switcher(&switcher, &config, &data_dir_for_tray);
+        // PLAN.md §6.7: opening (not closing) via the tray selects the
+        // highest-priority agent workset's row, if any is active.
+        if !was_visible {
+            let state = runtime_store::load(&data_dir_for_tray);
+            if let Some((workset_id, _)) =
+                highest_priority_agent_workset(&config, &state.agent_runs)
+            {
+                select_row_for_workset(&switcher, workset_id);
+            }
+        }
+    });
+
+    let switcher_for_menu = quick_switcher.as_weak();
+    let config_for_menu = config.clone();
+    let data_dir_for_menu = data_dir.clone();
+    tray.on_quick_switcher_requested(move || {
+        if let Some(switcher) = switcher_for_menu.upgrade() {
+            show_quick_switcher_at_cursor(&switcher, &config_for_menu.borrow(), &data_dir_for_menu);
         }
     });
 
@@ -1365,37 +6662,125 @@ pub fn run() -> Result<()> {
     tray.on_layout_studio_requested(move || {
         if let Some(layout_studio) = layout_studio_for_open.upgrade() {
             let _ = layout_studio.show();
+            popup_window::restore_and_foreground(layout_studio.window());
         }
     });
 
-    let workset_manager_for_open = workset_manager.as_weak();
-    tray.on_workset_manager_requested(move || {
-        if let Some(workset_manager) = workset_manager_for_open.upgrade() {
+    let workset_manager_for_register = workset_manager.as_weak();
+    tray.on_register_workset_requested(move || {
+        if let Some(workset_manager) = workset_manager_for_register.upgrade() {
             let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
         }
     });
 
-    // The main window also carries its own shortcuts to the two secondary
-    // windows, mirroring the tray menu entries.
+    // "メイン画面を空にする" now lives in the Workset Manager's registration
+    // flow: open it, start registration, and trigger the empty-main modal.
+    let workset_manager_for_empty = workset_manager.as_weak();
+    tray.on_empty_main_screen_requested(move || {
+        if let Some(workset_manager) = workset_manager_for_empty.upgrade() {
+            open_empty_main_screen(&workset_manager);
+        }
+    });
+
+    let config_for_recover = config.clone();
+    let coordinator_for_recover = coordinator.clone();
+    tray.on_recover_all_requested(move || {
+        if !confirm_recover_all() {
+            return;
+        }
+        let config = config_for_recover.borrow();
+        let live_monitors = monitor::enumerate_monitors().unwrap_or_default();
+        let live_windows =
+            enumerate::enumerate_top_level_windows(std::process::id()).unwrap_or_default();
+        match coordinator_for_recover.recover_all_windows(
+            &config.worksets,
+            &live_monitors,
+            &config.main_monitor_ids,
+            &live_windows,
+        ) {
+            Ok(report) => tracing::info!(
+                recovered = report.recovered.len(),
+                skipped = report.skipped.len(),
+                "recovered all managed windows from the tray menu"
+            ),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to persist runtime state after recovering all windows");
+            }
+        }
+    });
+
+    // Manual trigger: run the software display re-detect unconditionally, exactly as
+    // the user asked (no gating on the saved-vs-live comparison).
+    tray.on_reconnect_monitors_requested(|| {
+        tracing::info!("manual monitor re-detect requested from the tray menu");
+        run_display_reset("manual tray trigger");
+    });
+
+    let config_for_integrity = config.clone();
+    let data_dir_for_integrity = data_dir.clone();
+    tray.on_check_integrity_requested(move || {
+        tracing::info!("manual integrity check requested from the tray menu");
+        let report = run_integrity_check(
+            &data_dir_for_integrity,
+            &config_for_integrity,
+            "manual tray trigger",
+        );
+        show_integrity_result(&report);
+    });
+
+    let window_for_settings = window.as_weak();
+    let config_for_settings = config.clone();
+    // Installed on first show: the Settings window's HWND only exists once
+    // shown, and suppressing Alt menu-mode there lets Alt-based hotkeys be
+    // captured (see `popup_window::suppress_system_menu_key`).
+    let sysmenu_suppression: RefCell<Option<popup_window::SysMenuSuppression>> = RefCell::new(None);
+    tray.on_settings_requested(move || {
+        if let Some(window) = window_for_settings.upgrade() {
+            refresh_codex_settings_state(&window, &config_for_settings.borrow());
+            let _ = window.show();
+            popup_window::restore_and_foreground(window.window());
+            if sysmenu_suppression.borrow().is_none() {
+                *sysmenu_suppression.borrow_mut() =
+                    popup_window::suppress_system_menu_key(window.window());
+            }
+        }
+    });
+
+    let data_dir_for_log = data_dir.clone();
+    tray.on_open_log_folder_requested(move || {
+        let log_dir = logging::log_dir(&data_dir_for_log);
+        if let Err(err) = std::process::Command::new("explorer.exe")
+            .arg(&log_dir)
+            .spawn()
+        {
+            tracing::warn!(error = %err, path = %log_dir.display(), "failed to open the log folder");
+        }
+    });
+
+    // The settings window also carries its own shortcuts to the two
+    // secondary windows, mirroring the tray menu entries.
     let layout_studio_for_main_window = layout_studio.as_weak();
     window.on_open_layout_studio_requested(move || {
         if let Some(layout_studio) = layout_studio_for_main_window.upgrade() {
             let _ = layout_studio.show();
+            popup_window::restore_and_foreground(layout_studio.window());
         }
     });
     let workset_manager_for_main_window = workset_manager.as_weak();
     window.on_open_workset_manager_requested(move || {
         if let Some(workset_manager) = workset_manager_for_main_window.upgrade() {
             let _ = workset_manager.show();
+            popup_window::restore_and_foreground(workset_manager.window());
         }
     });
 
     // Re-launching repodeck.exe while an instance is already running (e.g. a
     // taskbar-pinned icon click) signals this event instead of starting a second
     // process (PLAN.md §3.2). A dedicated thread blocks on it and marshals the
-    // show request onto the Slint UI thread.
+    // show request onto the Slint UI thread via the same `UI_CONTEXT` the
+    // hotkey thread uses.
     let show_request_event = SendHandle(open_show_request_event()?);
-    let window_for_show_request = window.as_weak();
     std::thread::spawn(move || {
         // Force the whole `SendHandle` to be captured, not just its `.0` field
         // (Rust 2021 disjoint closure capture would otherwise capture the bare,
@@ -1410,12 +6795,7 @@ pub fn run() -> Result<()> {
                 break;
             }
 
-            let window_for_show_request = window_for_show_request.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window_for_show_request.upgrade() {
-                    let _ = window.show();
-                }
-            });
+            let _ = slint::invoke_from_event_loop(show_quick_switcher_from_context);
         }
     });
 
@@ -1424,9 +6804,9 @@ pub fn run() -> Result<()> {
         let _ = slint::quit_event_loop();
     });
 
-    window
-        .show()
-        .context("failed to show the RepoDeck main window")?;
+    // Unlike earlier phases, startup no longer force-shows any window (PLAN.md
+    // §13 Phase 7 completion condition "GUI非表示でもプロセス継続") — the tray
+    // icon alone keeps the process resident.
     tray.show()
         .context("failed to show the RepoDeck tray icon")?;
     if std::env::var_os("REPODECK_DEBUG_OPEN_LAYOUT_STUDIO").is_some() {
@@ -1439,9 +6819,89 @@ pub fn run() -> Result<()> {
             .show()
             .context("failed to show Workset Manager")?;
     }
+    if std::env::var_os("REPODECK_DEBUG_OPEN_QUICK_SWITCHER").is_some() {
+        quick_switcher
+            .show()
+            .context("failed to show the Quick Switcher")?;
+    }
+    if std::env::var_os("REPODECK_DEBUG_OPEN_SETTINGS").is_some() {
+        window.show().context("failed to show Settings")?;
+    }
 
     slint::run_event_loop().context("RepoDeck event loop failed")?;
 
+    {
+        let mut runtime = runtime_store::load(&data_dir);
+        runtime.last_clean_shutdown = true;
+        let _ = runtime_store::save(&data_dir, &runtime);
+    }
+
     tracing::info!("RepoDeck exiting");
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_snippet_tests {
+    use std::path::Path;
+
+    use super::{HookFlavor, build_hooks_json_snippet};
+
+    /// Codexスニペットは `commandWindows` キーと `PermissionRequest` を使う。
+    #[test]
+    fn codex_snippet_uses_command_windows_and_permission_request() {
+        let s = build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::Codex);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let hooks = &v["hooks"];
+        assert!(hooks.get("PermissionRequest").is_some());
+        assert!(hooks.get("Notification").is_none());
+        let cmd = &hooks["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(cmd["commandWindows"], r#""C:\x\repodeck-hook.exe""#);
+        assert!(cmd.get("command").is_none());
+        assert_eq!(cmd["timeout"], 2);
+    }
+
+    /// Claude Codeスニペットは `command` キーと `Notification` を使い、選択待ち
+    /// 検知用の `PreToolUse`（対話ツールに絞る matcher 付き）を含む。
+    #[test]
+    fn claude_snippet_uses_command_notification_and_pretooluse() {
+        let s =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::ClaudeCode);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let hooks = &v["hooks"];
+        assert!(hooks.get("Notification").is_some());
+        assert!(hooks.get("PermissionRequest").is_none());
+        let cmd = &hooks["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(cmd["command"], r#""C:\x\repodeck-hook.exe""#);
+        assert!(cmd.get("commandWindows").is_none());
+        // PreToolUse は対話ツールだけに絞る matcher 付き。
+        assert_eq!(
+            hooks["PreToolUse"][0]["matcher"],
+            "AskUserQuestion|ExitPlanMode"
+        );
+    }
+
+    /// Codexは4イベント、Claude Codeは選択待ち検知用のPreToolUseを加えた5イベント。
+    #[test]
+    fn each_flavor_covers_its_lifecycle_events() {
+        let codex =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::Codex);
+        let codex: serde_json::Value = serde_json::from_str(&codex).unwrap();
+        assert_eq!(codex["hooks"].as_object().unwrap().len(), 4);
+        assert!(codex["hooks"].get("PreToolUse").is_none());
+
+        let claude =
+            build_hooks_json_snippet(Path::new(r"C:\x\repodeck-hook.exe"), HookFlavor::ClaudeCode);
+        let claude: serde_json::Value = serde_json::from_str(&claude).unwrap();
+        let hooks = claude["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 5);
+        for k in [
+            "UserPromptSubmit",
+            "Notification",
+            "PostToolUse",
+            "Stop",
+            "PreToolUse",
+        ] {
+            assert!(hooks.contains_key(k), "missing {k}");
+        }
+    }
 }

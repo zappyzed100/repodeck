@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::monitor::SavedMonitor;
-use crate::domain::workset::{FixedParkingSlot, ParkingPolicy, Workset};
+use crate::domain::workset::{FixedParkingSlot, LaunchApp, ParkingPolicy, Workset};
 
 /// `config.json`'s current schema version (PLAN.md §7.6). Bump this, and add a
 /// migration in `persistence::migrations`, whenever a field is added or changed.
@@ -21,8 +21,42 @@ pub struct AppConfig {
     pub settings: UserSettings,
     pub monitors: Vec<SavedMonitor>,
     pub main_monitor_ids: Vec<String>,
+    /// User-named parking areas (サブA・サブB…), each a set of monitors defined
+    /// in Layout Studio, analogous to `main_monitor_ids`. A workset parks onto
+    /// one of these via [`ParkingPolicy::SubScreen`]. `#[serde(default)]` keeps
+    /// pre-existing configs loadable.
+    #[serde(default)]
+    pub sub_screens: Vec<SubScreen>,
     pub worksets: Vec<Workset>,
+    /// Apps the user has registered as launch candidates. Worksets attach one of
+    /// these rather than naming an executable directly, so the same app can be
+    /// reused across sets and re-pointed in one place if it moves.
+    #[serde(default)]
+    pub launch_apps: Vec<LaunchApp>,
     pub fixed_slots: Vec<FixedParkingSlot>,
+}
+
+/// A named parking area (PLAN.md §2.4 extension). Either a whole area spanning
+/// one or more monitors (`split == One`, using the union of the monitors), or a
+/// fraction of a single monitor (`split == TwoColumns`/`FourGrid` + `cell_index`
+/// picks the half/quarter of the first assigned monitor).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubScreen {
+    pub id: Uuid,
+    pub name: String,
+    pub monitor_ids: Vec<String>,
+    /// How the area is carved out. `One` = the whole union of `monitor_ids`;
+    /// `TwoColumns`/`FourGrid` = a half/quarter cell of the first monitor.
+    #[serde(default)]
+    pub split: crate::domain::monitor::AutoSplit,
+    /// Which cell of `split` (reading order) when `split != One`.
+    #[serde(default)]
+    pub cell_index: usize,
+    /// Maximize (full-screen) any workset parked into this area, e.g. a video
+    /// kept full-screen on a secondary monitor. `#[serde(default)]` keeps
+    /// pre-existing configs loadable.
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 impl AppConfig {
@@ -35,7 +69,9 @@ impl AppConfig {
             settings: UserSettings::default(),
             monitors: Vec::new(),
             main_monitor_ids: Vec::new(),
+            sub_screens: Vec::new(),
             worksets: Vec::new(),
+            launch_apps: Vec::new(),
             fixed_slots: Vec::new(),
         }
     }
@@ -49,7 +85,9 @@ impl AppConfig {
             errors.push(ConfigValidationError::NoMainMonitor);
         }
 
-        if self.settings.quick_switcher_hotkey.modifiers.is_empty() {
+        if self.settings.quick_switcher_hotkey.modifiers.is_empty()
+            && !self.settings.quick_switcher_hotkey.allows_empty_modifiers()
+        {
             errors.push(ConfigValidationError::HotkeyMissingModifier {
                 context: "settings.quick_switcher_hotkey".to_string(),
             });
@@ -57,7 +95,6 @@ impl AppConfig {
 
         let mut seen_workset_ids: HashSet<Uuid> = HashSet::new();
         let mut seen_window_ids: HashSet<Uuid> = HashSet::new();
-        let mut seen_matchers: HashSet<(PathBuf, String, String)> = HashSet::new();
 
         for workset in &self.worksets {
             if !seen_workset_ids.insert(workset.id) {
@@ -71,7 +108,11 @@ impl AppConfig {
                 });
             }
 
-            if !workset.repository_path.is_absolute() {
+            // An empty path means "no repository" (worksets can be registered
+            // without one); only a non-empty path must be absolute.
+            if !workset.repository_path.as_os_str().is_empty()
+                && !workset.repository_path.is_absolute()
+            {
                 errors.push(ConfigValidationError::RepositoryPathNotAbsolute {
                     path: workset.repository_path.clone(),
                 });
@@ -79,6 +120,7 @@ impl AppConfig {
 
             if let Some(hotkey) = &workset.direct_hotkey
                 && hotkey.modifiers.is_empty()
+                && !hotkey.allows_empty_modifiers()
             {
                 errors.push(ConfigValidationError::HotkeyMissingModifier {
                     context: format!("workset {} direct_hotkey", workset.id),
@@ -102,23 +144,24 @@ impl AppConfig {
                 }
             }
 
+            if let ParkingPolicy::SubScreen { sub_screen_id } = &workset.parking_policy
+                && !self.sub_screens.iter().any(|s| s.id == *sub_screen_id)
+            {
+                errors.push(ConfigValidationError::MissingSubScreen {
+                    workset_id: workset.id,
+                    sub_screen_id: *sub_screen_id,
+                });
+            }
+
             for window in &workset.windows {
                 if !seen_window_ids.insert(window.id) {
                     errors.push(ConfigValidationError::DuplicateManagedWindowId { id: window.id });
                 }
 
-                let matcher_key = (
-                    window.matcher.executable_path.clone(),
-                    window.matcher.window_class.clone(),
-                    window.matcher.registered_title.clone(),
-                );
-                if !seen_matchers.insert(matcher_key) {
-                    errors.push(ConfigValidationError::DuplicateWindowMatcher {
-                        executable_path: window.matcher.executable_path.display().to_string(),
-                        window_class: window.matcher.window_class.clone(),
-                        registered_title: window.matcher.registered_title.clone(),
-                    });
-                }
+                // 同じウィンドウ（同一 matcher）が複数のセットに登録されるのは
+                // 設計上許容。切り替え時に、そのウィンドウは最初に要求したセットへ
+                // 解決され、アクティブなセットに追従する。ブラウザや VS Code を
+                // 複数セットで共有する通常の使い方なので、重複は検証しない。
 
                 if let Some(pattern) = &window.matcher.title_regex
                     && let Err(source) = regex::Regex::new(pattern)
@@ -165,6 +208,44 @@ pub struct UserSettings {
     pub notify_needs_input: bool,
     pub notify_ready: bool,
     pub start_with_windows: bool,
+    /// When `true`, RepoDeck switches to the workset that was current when it
+    /// last ran as soon as it starts — which, after a reboot, relaunches that
+    /// set's apps and restores their placement in one step. Off by default:
+    /// moving windows unprompted at login is surprising unless asked for.
+    #[serde(default)]
+    pub restore_workset_on_start: bool,
+    /// When `true` (default), RepoDeck automatically attempts a software display
+    /// re-detect after a resume-from-sleep if saved monitors are missing from the
+    /// live topology (PLAN.md §4.6, Phase 9 resilience). The manual tray trigger
+    /// ("モニターを再検出") works regardless of this flag. `#[serde(default)]` keeps
+    /// configs written before this field was added loadable.
+    #[serde(default = "default_auto_display_recovery")]
+    pub auto_display_recovery: bool,
+    /// Virtual-key for the "next set" hold-to-cycle hotkey, combined with
+    /// `quick_switcher_hotkey`'s modifiers (Alt+Tab style: hold the modifiers,
+    /// tap this key to advance, release to commit). Default `VK_DOWN` (0x28).
+    #[serde(default = "default_cycle_next_key")]
+    pub cycle_next_key: u32,
+    /// Virtual-key for the "previous set" hold-to-cycle hotkey. Default
+    /// `VK_UP` (0x26).
+    #[serde(default = "default_cycle_prev_key")]
+    pub cycle_prev_key: u32,
+}
+
+/// serde default for [`UserSettings::auto_display_recovery`]: auto-recovery is ON
+/// unless a config explicitly disables it.
+fn default_auto_display_recovery() -> bool {
+    true
+}
+
+/// serde/UI default for the "next set" cycle key: `VK_DOWN`.
+pub fn default_cycle_next_key() -> u32 {
+    0x28
+}
+
+/// serde/UI default for the "previous set" cycle key: `VK_UP`.
+pub fn default_cycle_prev_key() -> u32 {
+    0x26
 }
 
 impl Default for UserSettings {
@@ -173,7 +254,7 @@ impl Default for UserSettings {
         Self {
             quick_switcher_hotkey: HotkeyConfig {
                 modifiers: vec![HotkeyModifier::Control, HotkeyModifier::Alt],
-                virtual_key: u32::from(b'R'),
+                virtual_key: u32::from(b'W'),
             },
             popup_location: PopupLocation::CursorMonitorCenter,
             close_on_focus_loss: true,
@@ -183,6 +264,10 @@ impl Default for UserSettings {
             notify_needs_input: true,
             notify_ready: true,
             start_with_windows: false,
+            restore_workset_on_start: false,
+            auto_display_recovery: default_auto_display_recovery(),
+            cycle_next_key: default_cycle_next_key(),
+            cycle_prev_key: default_cycle_prev_key(),
         }
     }
 }
@@ -191,6 +276,17 @@ impl Default for UserSettings {
 pub struct HotkeyConfig {
     pub modifiers: Vec<HotkeyModifier>,
     pub virtual_key: u32,
+}
+
+impl HotkeyConfig {
+    /// Whether this hotkey is valid with an empty `modifiers` list. Only
+    /// function keys (`VK_F1`..`VK_F24`, `0x70..=0x87`) qualify: registering
+    /// a bare letter/digit/arrow/space system-wide would steal that key from
+    /// normal typing in every application, while F13-F24 (and unused
+    /// F1-F12) exist precisely for dedicated bindings.
+    pub fn allows_empty_modifiers(&self) -> bool {
+        (0x70..=0x87).contains(&self.virtual_key)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,14 +330,6 @@ pub enum ConfigValidationError {
     DuplicateWorksetId { id: Uuid },
     #[error("duplicate managed window id: {id}")]
     DuplicateManagedWindowId { id: Uuid },
-    #[error(
-        "window matcher registered to more than one workset: {executable_path} / {window_class} / {registered_title}"
-    )]
-    DuplicateWindowMatcher {
-        executable_path: String,
-        window_class: String,
-        registered_title: String,
-    },
     #[error("duplicate fixed parking slot: monitor {monitor_id} grid {grid:?} cell {cell_index}")]
     DuplicateFixedSlot {
         monitor_id: String,
@@ -250,6 +338,11 @@ pub enum ConfigValidationError {
     },
     #[error("workset {workset_id} references missing fixed parking slot {slot_id}")]
     MissingFixedSlot { workset_id: Uuid, slot_id: Uuid },
+    #[error("workset {workset_id} references missing sub-screen {sub_screen_id}")]
+    MissingSubScreen {
+        workset_id: Uuid,
+        sub_screen_id: Uuid,
+    },
     #[error("fixed parking slot {slot_id} is assigned to missing workset {workset_id}")]
     MissingAssignedWorkset { slot_id: Uuid, workset_id: Uuid },
     #[error(
@@ -269,7 +362,7 @@ pub enum ConfigValidationError {
         #[source]
         source: regex::Error,
     },
-    #[error("hotkey must have at least one modifier ({context})")]
+    #[error("hotkey must have at least one modifier unless the key is a function key ({context})")]
     HotkeyMissingModifier { context: String },
 }
 
@@ -307,5 +400,40 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ConfigValidationError::HotkeyMissingModifier { .. }))
         );
+    }
+
+    #[test]
+    fn function_key_hotkey_without_modifiers_is_accepted() {
+        let mut config = AppConfig::new_empty();
+        config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        config.settings.quick_switcher_hotkey.modifiers.clear();
+
+        for vk in [0x70, 0x7B, 0x7C, 0x87] {
+            // VK_F1, VK_F12, VK_F13, VK_F24.
+            config.settings.quick_switcher_hotkey.virtual_key = vk;
+            assert!(
+                config.validate().is_empty(),
+                "VK 0x{vk:02X} should be registrable without modifiers"
+            );
+        }
+    }
+
+    #[test]
+    fn non_function_key_hotkey_without_modifiers_is_rejected() {
+        let mut config = AppConfig::new_empty();
+        config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        config.settings.quick_switcher_hotkey.modifiers.clear();
+
+        for vk in [0x26, 0x6F, 0x88] {
+            // VK_UP, VK_DIVIDE (just below VK_F1), one past VK_F24.
+            config.settings.quick_switcher_hotkey.virtual_key = vk;
+            let errors = config.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ConfigValidationError::HotkeyMissingModifier { .. })),
+                "VK 0x{vk:02X} should require a modifier"
+            );
+        }
     }
 }

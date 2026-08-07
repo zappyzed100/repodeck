@@ -1,5 +1,5 @@
-import { LineEdit, ScrollView } from "std-widgets.slint";
-import { GlassButton, GlassCheckbox, Theme } from "theme.slint";
+import { ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { GlassButton, GlassCheckbox, StatusBanner, Theme } from "theme.slint";
 
 export struct WorksetSummary {
     name: string,
@@ -7,18 +7,38 @@ export struct WorksetSummary {
     window_count: int,
     color: color,
     status_label: string,
+    parking_label: string,
 }
 
 export struct ManagedWindowSummary {
     title: string,
     status_label: string,
     status_is_warning: bool,
+    // 退避時に移動せず最小化する（ManagedWindow::minimize_when_parked）。
+    minimize_when_parked: bool,
+}
+
+/// 配置プレビュー用の1枚のメイン画面。位置とサイズは、全メイン画面を囲む矩形を
+/// 1×1 に正規化した値。実際の並び（左右・上下・解像度差）をそのまま縮小して描く。
+export struct PlacementMonitorTile {
+    label: string,
+    nx: float,
+    ny: float,
+    nw: float,
+    nh: float,
 }
 
 export struct RegistrationCandidate {
     title: string,
     process_name: string,
     checked: bool,
+}
+
+/// One row of the 起動候補 registry (`AppConfig.launch_apps`).
+export struct LaunchAppSummary {
+    name: string,
+    program: string,
+    args: string,
 }
 
 component GlassPanel inherits Rectangle {
@@ -44,7 +64,7 @@ export component WorksetManager inherits Window {
     // would otherwise shrink the whole OS window to the narrower branch's
     // minimum size when it became active.
     width: 920px;
-    height: 620px;
+    height: 760px;
     background: transparent;
     default-font-family: Theme.font-text;
 
@@ -53,26 +73,133 @@ export component WorksetManager inherits Window {
     in property <[ManagedWindowSummary]> selected-workset-windows: [];
 
     in property <bool> registering: false;
-    in property <string> picked-folder-label: "（未選択）";
-    in property <string> resolved-repo-label: "";
-    in property <[RegistrationCandidate]> candidates: [];
     in property <[color]> color-choices: [#0a84ff, #30d158, #ff9f0a, #ff453a, #bf5af2, #64d2ff];
     in property <color> selected-color: #0a84ff;
+    in-out property <bool> fullscreen-when-parked: false;
+
+    // 退避先: pick where this workset parks when it isn't current — 自動 or one
+    // of the named sub-screens defined in Layout Studio.
+    in property <[string]> parking-subs: [];
+    in-out property <int> parking-selected-sub: -1;
+
+    // True when the registration view is changing an existing set rather than
+    // creating one: the form is pre-filled and 登録 becomes 更新.
+    in property <bool> registration-editing: false;
+    in-out property <string> registration-name: "";
 
     in property <string> status-text: "";
     in property <bool> status-is-warning: false;
 
+    // "メイン画面を空にする" (moved here from Layout Studio): minimize the
+    // unregistered windows currently sitting on the main screen. Reached from
+    // the set list — it is a housekeeping action on the live desktop, not part
+    // of defining a set.
+    in property <bool> empty-screen-panel-visible: false;
+    in property <[RegistrationCandidate]> main-screen-candidates: [];
+    in property <bool> empty-undo-available: false;
+
+    in property <int> selected-missing-count: 0;
+
     callback refresh-requested();
     callback workset-selected(index: int);
     callback delete-workset-requested();
-    callback rebind-requested(window-index: int);
+    callback reopen-closed-requested();
+    /// Ask the selected set's live windows to close (the set stays registered).
+    callback close-workset-windows-requested();
+    /// Load the selected set back into the registration view to change it.
+    callback edit-workset-requested();
+    /// 選択セットのウィンドウ（index番目）の「退避せず最小化」を切り替える。
+    callback toggle-window-minimize-when-parked(index: int);
 
     callback start-registration();
     callback cancel-registration();
-    callback pick-folder-requested();
-    callback candidate-toggled(index: int);
     callback color-selected(color: color);
+    callback fullscreen-toggled();
+    callback parking-sub-selected(index: int);
     callback register-requested(name: string);
+
+    // --- UI 2: セットに紐づけ ---
+    // A set is *declared*, not captured: pick one of the registered launch apps
+    // (UI 1 below), fill in the one input that app needs (folder/workspace for
+    // VS Code, URL for a browser, arguments otherwise), and say which screen it
+    // opens on. The picked apps queue up in `pending-apps` and are attached
+    // when the set is registered, so they exist from the set's very first save.
+    in property <[string]> app-catalog: [];
+    in-out property <int> app-selected-index: -1;
+    in property <string> app-kind-label: "";
+    in property <string> app-input-label: "";
+    in property <string> app-input-placeholder: "";
+    in property <bool> app-input-visible: false;
+    in property <bool> app-input-is-path: false;
+    in-out property <string> app-input-text: "";
+    /// ウィンドウごとの起動引数。アプリ選択時に登録済みの既定引数が入る。
+    in-out property <string> app-args-text: "";
+    in property <[string]> pending-apps: [];
+    /// 上のフォームで編集中の `pending-apps` の行。-1 なら新規追加。
+    in property <int> pending-edit-index: -1;
+    callback app-selected(index: int);
+    // VS Code takes either a folder or a `.code-workspace` file. They get a
+    // button each: one picker that guessed which you meant (file dialog first,
+    // folder dialog on cancel) made picking a folder look like a cancelled
+    // dialog.
+    callback app-pick-folder-requested();
+    callback app-pick-workspace-requested();
+    callback add-app-confirmed();
+    callback pending-app-removed(index: int);
+    /// 追加済みの行をフォームへ読み戻して編集する。
+    callback pending-app-edit-requested(index: int);
+    /// 編集をやめてフォームを空に戻す（行はそのまま）。
+    callback pending-app-edit-cancelled();
+
+    // 起動時の画面表示: which main monitor the app opens on, how that monitor is
+    // split, and which cell of that split it takes. Cell order is reading order
+    // (左上→右下), matching Layout Studio's fixed parking slots.
+    in property <[string]> placement-monitors: [];
+    in-out property <int> placement-monitor-index: 0;
+    in property <[string]> placement-splits: ["1分割（全画面）", "2分割（左右）", "4分割"];
+    in-out property <int> placement-split-index: 0;
+    in property <[string]> placement-cells: ["全画面"];
+    in-out property <int> placement-cell-index: 0;
+    callback placement-split-selected(index: int);
+
+    // 配置プレビュー：メイン画面を実際の並びどおりに描き、分割セルを選ばせる。
+    in property <[PlacementMonitorTile]> placement-monitor-tiles: [];
+    // 分割（0=1分割 / 1=2分割（左右） / 2=4分割）に対応する列数・行数。
+    // セル番号は読み順なので、列 = mod(i, cols)、行 = floor(i / cols)。
+    property <int> cell-cols: root.placement-split-index == 0 ? 1 : 2;
+    property <int> cell-rows: root.placement-split-index == 2 ? 2 : 1;
+
+    // --- UI 1: 起動候補を登録 ---
+    // A standalone panel (over both the list and the registration view) where
+    // an app is registered once — by name and path, by browsing, or by picking
+    // a Start Menu entry, which fills both — into `AppConfig.launch_apps`.
+    in property <bool> managing-apps: false;
+    in property <[string]> start-menu-catalog: [];
+    in-out property <int> registry-catalog-index: -1;
+    in-out property <string> registry-search: "";
+    in property <string> registry-catalog-count: "";
+    in-out property <string> registry-name: "";
+    in-out property <string> registry-path: "";
+    // Carried from the picked catalogue entry, not user-editable: a wrapper
+    // shortcut's own flags and a packaged app's AUMID both have to survive
+    // registration, but they are noise in the form. Empty means "none".
+    in-out property <string> registry-args: "";
+    in-out property <string> registry-aumid: "";
+    in property <[LaunchAppSummary]> registered-apps: [];
+    callback open-app-registry();
+    callback close-app-registry();
+    callback registry-catalog-refresh-requested();
+    callback registry-search-changed(query: string);
+    callback registry-catalog-selected(index: int);
+    callback registry-browse-requested();
+    callback registry-save-requested();
+    callback registry-delete-requested(index: int);
+
+    callback empty-main-screen-requested();
+    callback empty-candidate-toggled(index: int);
+    callback confirm-empty-main-screen();
+    callback cancel-empty-main-screen();
+    callback undo-empty-main-screen();
 
     backdrop := Rectangle {
         x: 0;
@@ -88,7 +215,7 @@ export component WorksetManager inherits Window {
         padding: Theme.space-md;
         spacing: Theme.space-sm;
 
-        if !root.registering: HorizontalLayout {
+        if !root.registering && !root.managing-apps: HorizontalLayout {
             spacing: Theme.space-sm;
 
             // Left: workset list
@@ -113,7 +240,7 @@ export component WorksetManager inherits Window {
                         VerticalLayout {
                             spacing: Theme.space-xs;
                             for w[i] in root.worksets: Rectangle {
-                                height: 58px;
+                                height: 72px;
                                 background: root.selected-workset-index == i ? Theme.glass-selected : Theme.glass-panel-soft;
                                 border-radius: Theme.radius-md;
                                 border-width: 2px;
@@ -124,6 +251,7 @@ export component WorksetManager inherits Window {
                                     padding: Theme.space-xs;
                                     Text { text: w.name; font-size: 12px; font-weight: 700; color: Theme.text-primary; }
                                     Text { text: w.repository_path; font-size: 10px; color: Theme.text-tertiary; wrap: no-wrap; overflow: elide; }
+                                    Text { text: w.parking_label; font-size: 10px; font-weight: 600; color: Theme.accent; }
                                     Text { text: w.status_label; font-size: 10px; color: Theme.text-secondary; }
                                 }
 
@@ -133,9 +261,22 @@ export component WorksetManager inherits Window {
                     }
 
                     GlassButton {
-                        text: "+ 現在の配置をセットとして登録";
+                        text: "+ 新しいセットを作る";
                         primary: true;
                         clicked => { root.start-registration(); }
+                    }
+                    GlassButton {
+                        text: "起動候補を登録";
+                        clicked => { root.open-app-registry(); }
+                    }
+                    GlassButton {
+                        text: "メイン画面を空にする";
+                        clicked => { root.empty-main-screen-requested(); }
+                    }
+                    GlassButton {
+                        text: "最小化したウィンドウを戻す";
+                        enabled: root.empty-undo-available;
+                        clicked => { root.undo-empty-main-screen(); }
                     }
                 }
             }
@@ -152,6 +293,24 @@ export component WorksetManager inherits Window {
                         spacing: Theme.space-xs;
                         SectionLabel { text: "ウィンドウ一覧"; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
+                        GlassButton {
+                            text: root.selected-missing-count > 0
+                                ? "閉じたアプリを開き直す (" + root.selected-missing-count + ")"
+                                : "閉じたアプリを開き直す";
+                            primary: root.selected-missing-count > 0;
+                            enabled: root.selected-missing-count > 0;
+                            clicked => { root.reopen-closed-requested(); }
+                        }
+                        GlassButton {
+                            text: "ウィンドウを閉じる";
+                            enabled: root.selected-workset-index >= 0;
+                            clicked => { root.close-workset-windows-requested(); }
+                        }
+                        GlassButton {
+                            text: "編集";
+                            enabled: root.selected-workset-index >= 0;
+                            clicked => { root.edit-workset-requested(); }
+                        }
                         GlassButton {
                             text: "このセットを削除";
                             enabled: root.selected-workset-index >= 0;
@@ -180,25 +339,39 @@ export component WorksetManager inherits Window {
                                             color: w.status_is_warning ? Theme.danger : Theme.success;
                                         }
                                     }
-                                    GlassButton {
-                                        text: "このウィンドウを再登録";
-                                        clicked => { root.rebind-requested(i); }
+
+                                    // 退避せず最小化するか。オフ=退避（別画面へ移動）、
+                                    // オン=最小化。ブラウザなど移動より最小化が好ましい窓向け。
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        spacing: Theme.space-xs;
+                                        Text {
+                                            text: "退避せず最小化";
+                                            font-size: 11px;
+                                            color: Theme.text-secondary;
+                                            vertical-alignment: center;
+                                        }
+                                        GlassCheckbox {
+                                            checked: w.minimize_when_parked;
+                                            toggled => { root.toggle-window-minimize-when-parked(i); }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
                 }
             }
         }
 
-        if root.registering: GlassPanel {
+        if root.registering && !root.managing-apps: GlassPanel {
             VerticalLayout {
                 padding: Theme.space-lg;
                 spacing: Theme.space-sm;
 
                 Text {
-                    text: "新しいワークセットを登録";
+                    text: root.registration-editing ? "セットを編集" : "新しいワークセットを登録";
                     font-family: Theme.font-display;
                     font-size: 18px;
                     font-weight: 600;
@@ -206,18 +379,12 @@ export component WorksetManager inherits Window {
                     color: Theme.text-primary;
                 }
 
-                HorizontalLayout {
-                    spacing: Theme.space-xs;
-                    GlassButton {
-                        text: "リポジトリフォルダーを選択";
-                        clicked => { root.pick-folder-requested(); }
-                    }
-                    Text { text: root.picked-folder-label; font-size: 12px; color: Theme.text-secondary; vertical-alignment: center; }
-                }
-                Text { text: root.resolved-repo-label; font-size: 11px; color: Theme.text-tertiary; wrap: word-wrap; }
-
                 SectionLabel { text: "名前"; }
-                name-input := LineEdit { placeholder-text: "ワークセット名"; }
+                name-input := LineEdit {
+                    height: 36px;
+                    placeholder-text: "ワークセット名";
+                    text <=> root.registration-name;
+                }
 
                 SectionLabel { text: "色"; }
                 HorizontalLayout {
@@ -234,26 +401,277 @@ export component WorksetManager inherits Window {
                     }
                 }
 
-                SectionLabel { text: "候補ウィンドウ（メイン画面上で検出）"; }
-                ScrollView {
-                    height: 160px;
-                    VerticalLayout {
-                        spacing: 2px;
-                        for candidate[i] in root.candidates: HorizontalLayout {
-                            spacing: Theme.space-xs;
-                            height: 26px;
-                            GlassCheckbox {
-                                checked: candidate.checked;
-                                toggled => { root.candidate-toggled(i); }
-                            }
-                            Text {
-                                text: candidate.title + "  (" + candidate.process_name + ")";
-                                font-size: 12px;
-                                color: Theme.text-secondary;
-                                vertical-alignment: center;
+                // UI 2 — the set's contents. A set is a list of apps plus, for
+                // each, where it opens: pick the app, fill in its one input,
+                // choose the screen, then 追加.
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    SectionLabel { text: "このセットのアプリ"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.app-kind-label;
+                        font-size: 11px;
+                        color: Theme.text-tertiary;
+                        vertical-alignment: center;
+                    }
+                    GlassButton {
+                        text: "起動候補を登録…";
+                        clicked => { root.open-app-registry(); }
+                    }
+                }
+                Text {
+                    text: "セットに切り替えると、ここに並べたアプリが指定の画面に開きます。既に起動していればその窓を動かし、閉じていれば起動します。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
+                }
+                if root.app-catalog.length == 0: Text {
+                    text: "起動候補がまだありません。「起動候補を登録…」でアプリを登録すると、ここから選べます。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
+                }
+                // Every control below is pinned to the standard 36px control
+                // height: without it the layout hands its slack to whichever
+                // row can grow, and the app picker balloons.
+                if root.app-catalog.length > 0: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    ComboBox {
+                        model: root.app-catalog;
+                        current-index <=> root.app-selected-index;
+                        selected => { root.app-selected(self.current-index); }
+                        horizontal-stretch: 1;
+                    }
+                }
+                if root.app-input-visible: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text {
+                        text: root.app-input-label;
+                        font-size: 11px;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: root.app-input-placeholder;
+                        text <=> root.app-input-text;
+                        horizontal-stretch: 1;
+                    }
+                    if root.app-input-is-path: GlassButton {
+                        text: "フォルダーを選択";
+                        clicked => { root.app-pick-folder-requested(); }
+                    }
+                    if root.app-input-is-path: GlassButton {
+                        text: "ワークスペースを選択";
+                        clicked => { root.app-pick-workspace-requested(); }
+                    }
+                }
+
+                // 引数はウィンドウごとに指定する。起動候補の既定引数を初期値として
+                // 入れておくので「何が付くのか」が見えるし、ここで変えられる。
+                // ブラウザーを用途別に分ける --user-data-dir もここに書く。
+                if root.app-input-visible: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text {
+                        text: "引数";
+                        font-size: 11px;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: "例: --user-data-dir=\"D:\\BraveData\\開発\"";
+                        text <=> root.app-args-text;
+                        horizontal-stretch: 1;
+                    }
+                }
+                // 配置プレビュー：画面名だけでは配置が分からないので、メイン画面を
+                // 実際の並び・比率のまま全部描き、分割セルを直接クリックで選べる。
+                if root.app-catalog.length > 0 && root.placement-monitor-tiles.length > 0: Rectangle {
+                    height: 150px;
+                    background: Theme.glass-panel-soft;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.hairline;
+
+                    preview := Rectangle {
+                        x: Theme.space-sm;
+                        y: Theme.space-sm;
+                        width: parent.width - 2 * Theme.space-sm;
+                        height: parent.height - 2 * Theme.space-sm;
+
+                        for tile[ti] in root.placement-monitor-tiles: Rectangle {
+                            x: preview.width * tile.nx;
+                            y: preview.height * tile.ny;
+                            width: preview.width * tile.nw;
+                            height: preview.height * tile.nh;
+
+                            monitor-box := Rectangle {
+                                width: parent.width - 4px;
+                                height: parent.height - 4px;
+                                border-radius: Theme.radius-sm;
+                                background: Theme.glass-panel;
+                                border-width: 1px;
+                                border-color: Theme.hairline-bright;
+
+                                // 分割セル。読み順で番号が振られる。
+                                for cell[ci] in root.placement-cells: Rectangle {
+                                    x: monitor-box.width * Math.mod(ci, root.cell-cols) / root.cell-cols;
+                                    y: monitor-box.height * Math.floor(ci / root.cell-cols) / root.cell-rows;
+                                    width: monitor-box.width / root.cell-cols;
+                                    height: monitor-box.height / root.cell-rows;
+
+                                    cell-box := Rectangle {
+                                        width: parent.width - 3px;
+                                        height: parent.height - 3px;
+                                        border-radius: 4px;
+                                        background: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                            ? Theme.accent
+                                            : (cell-touch.has-hover ? Theme.glass-hover : Theme.glass-panel-soft);
+                                        border-width: 1px;
+                                        border-color: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                            ? Theme.accent
+                                            : Theme.hairline;
+                                        animate background { duration: Theme.duration-fast; easing: ease-out; }
+
+                                        Text {
+                                            text: cell;
+                                            font-size: 10px;
+                                            color: ti == root.placement-monitor-index && ci == root.placement-cell-index
+                                                ? Theme.text-primary
+                                                : Theme.text-tertiary;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+
+                                        cell-touch := TouchArea {
+                                            clicked => {
+                                                root.placement-monitor-index = ti;
+                                                root.placement-cell-index = ci;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 画面名は左上に小さく重ねる（セルの邪魔をしない）。
+                                Text {
+                                    x: 4px;
+                                    y: 2px;
+                                    text: tile.label;
+                                    font-size: 10px;
+                                    font-weight: 600;
+                                    color: ti == root.placement-monitor-index ? Theme.accent : Theme.text-secondary;
+                                }
                             }
                         }
                     }
+                }
+
+                if root.app-catalog.length > 0: HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    Text { text: "画面"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-monitors;
+                        current-index <=> root.placement-monitor-index;
+                        horizontal-stretch: 1;
+                    }
+                    Text { text: "分割"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-splits;
+                        current-index <=> root.placement-split-index;
+                        selected => { root.placement-split-selected(self.current-index); }
+                    }
+                    Text { text: "位置"; font-size: 11px; color: Theme.text-secondary; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.placement-cells;
+                        current-index <=> root.placement-cell-index;
+                        enabled: root.placement-cells.length > 1;
+                    }
+                    // 編集中は同じフォームがその行を書き換える（追加ではなく更新）。
+                    if root.pending-edit-index >= 0: GlassButton {
+                        text: "変更をやめる";
+                        clicked => { root.pending-app-edit-cancelled(); }
+                    }
+                    GlassButton {
+                        text: root.pending-edit-index >= 0 ? "この内容で更新" : "追加";
+                        primary: true;
+                        enabled: root.app-selected-index >= 0;
+                        clicked => { root.add-app-confirmed(); }
+                    }
+                }
+                // Takes the layout's leftover space so the fixed-height rows
+                // above keep their natural size.
+                ScrollView {
+                    vertical-stretch: 1;
+                    min-height: 90px;
+                    VerticalLayout {
+                        spacing: 2px;
+                        // 行の高さは `GlassButton` の 36px に合わせる。26px だった
+                        // ときは、ボタンが行からはみ出して上下の行と重なり、隣の行の
+                        // ボタンを押してしまう当たり判定になっていた。
+                        for entry[i] in root.pending-apps: HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            height: 36px;
+                            Text {
+                                // 編集中の行は色を変えて、上のフォームがどの行を
+                                // 書き換えるところなのかを示す。
+                                text: root.pending-edit-index == i ? "編集中: " + entry : entry;
+                                font-size: 11px;
+                                color: root.pending-edit-index == i ? Theme.accent : Theme.text-secondary;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            GlassButton {
+                                text: "編集";
+                                clicked => { root.pending-app-edit-requested(i); }
+                            }
+                            GlassButton {
+                                text: "削除";
+                                clicked => { root.pending-app-removed(i); }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    GlassCheckbox {
+                        checked: root.fullscreen-when-parked;
+                        toggled => { root.fullscreen-toggled(); }
+                    }
+                    Text {
+                        text: "退避後に全画面表示にする（動画などを退避先モニターで最大化）";
+                        font-size: 12px;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    SectionLabel { text: "退避先"; vertical-alignment: center; }
+                    GlassButton {
+                        text: "自動";
+                        primary: root.parking-selected-sub == -1;
+                        clicked => { root.parking-sub-selected(-1); }
+                    }
+                    for name[i] in root.parking-subs: GlassButton {
+                        text: name;
+                        primary: root.parking-selected-sub == i;
+                        clicked => { root.parking-sub-selected(i); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.parking-subs.length == 0: Text {
+                    text: "サブ画面が未作成です。レイアウトスタジオで作成すると退避先に選べます。";
+                    font-size: 10px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
                 }
 
                 HorizontalLayout {
@@ -264,7 +682,7 @@ export component WorksetManager inherits Window {
                         clicked => { root.cancel-registration(); }
                     }
                     GlassButton {
-                        text: "登録";
+                        text: root.registration-editing ? "更新" : "登録";
                         primary: true;
                         clicked => { root.register-requested(name-input.text); }
                     }
@@ -272,11 +690,203 @@ export component WorksetManager inherits Window {
             }
         }
 
-        Text {
+        // UI 1 — 起動候補を登録. Sits over whichever view opened it; closing
+        // returns there, so it can be reached mid-registration.
+        if root.managing-apps: GlassPanel {
+            VerticalLayout {
+                padding: Theme.space-lg;
+                spacing: Theme.space-sm;
+
+                Text {
+                    text: "起動候補を登録";
+                    font-family: Theme.font-display;
+                    font-size: 18px;
+                    font-weight: 600;
+                    letter-spacing: -0.2px;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "ここで登録したアプリを、ワークセットの登録画面から選んでセットに紐づけます。ウィンドウが開いていないアプリ（常駐アプリなど）もこの経路で登録できます。";
+                    font-size: 11px;
+                    color: Theme.text-tertiary;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    SectionLabel { text: "スタートメニューから選ぶ（名称とパスを自動入力）"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.registry-catalog-count;
+                        font-size: 11px;
+                        color: Theme.text-tertiary;
+                        vertical-alignment: center;
+                    }
+                    GlassButton {
+                        text: "一覧を更新";
+                        clicked => { root.registry-catalog-refresh-requested(); }
+                    }
+                }
+                // Typing filters the list: a Start Menu has a few hundred
+                // entries, which is far too many to scroll through.
+                LineEdit {
+                    height: 36px;
+                    placeholder-text: "アプリ名で絞り込み（例: code）";
+                    text <=> root.registry-search;
+                    edited(text) => { root.registry-search-changed(text); }
+                }
+                ComboBox {
+                    height: 36px;
+                    model: root.start-menu-catalog;
+                    current-index <=> root.registry-catalog-index;
+                    selected => { root.registry-catalog-selected(self.current-index); }
+                }
+
+                SectionLabel { text: "名称"; }
+                LineEdit {
+                    height: 36px;
+                    placeholder-text: "例: CodexBar Desktop";
+                    text <=> root.registry-name;
+                }
+
+                SectionLabel { text: "パス"; }
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    height: 36px;
+                    LineEdit {
+                        placeholder-text: "例: C:\\Program Files\\App\\app.exe";
+                        text <=> root.registry-path;
+                        horizontal-stretch: 1;
+                    }
+                    GlassButton {
+                        text: "参照";
+                        clicked => { root.registry-browse-requested(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    GlassButton {
+                        text: "この内容で登録";
+                        primary: true;
+                        clicked => { root.registry-save-requested(); }
+                    }
+                }
+
+                SectionLabel { text: "登録済みの起動候補"; }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: Theme.space-xs;
+                        for app[i] in root.registered-apps: Rectangle {
+                            height: 46px;
+                            background: Theme.glass-panel-soft;
+                            border-radius: Theme.radius-md;
+
+                            HorizontalLayout {
+                                padding: Theme.space-xs;
+                                spacing: Theme.space-xs;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    Text { text: app.name; font-size: 12px; color: Theme.text-primary; overflow: elide; }
+                                    Text {
+                                        text: app.args == "" ? app.program : app.program + "  " + app.args;
+                                        font-size: 10px;
+                                        color: Theme.text-tertiary;
+                                        wrap: no-wrap;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    GlassButton {
+                                        text: "削除";
+                                        clicked => { root.registry-delete-requested(i); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    GlassButton {
+                        text: "閉じる";
+                        clicked => { root.close-app-registry(); }
+                    }
+                }
+            }
+        }
+
+        StatusBanner {
             text: root.status-text;
-            font-size: 12px;
-            color: root.status-is-warning ? Theme.danger : Theme.text-tertiary;
-            wrap: word-wrap;
+            is-warning: root.status-is-warning;
+        }
+    }
+
+    // --- "メイン画面を空にする" confirmation modal (moved from Layout Studio) ---
+    if root.empty-screen-panel-visible: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(0, 0, 0, 0.55);
+
+        TouchArea { }
+
+        GlassPanel {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: 360px;
+
+            VerticalLayout {
+                padding: Theme.space-md;
+                spacing: Theme.space-sm;
+
+                Text {
+                    text: "メイン画面上の未登録ウィンドウ — 最小化するものにチェックしてください";
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    wrap: word-wrap;
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 2px;
+                        for candidate[i] in root.main-screen-candidates: HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            height: 26px;
+                            GlassCheckbox {
+                                checked: candidate.checked;
+                                toggled => { root.empty-candidate-toggled(i); }
+                            }
+                            Text {
+                                text: candidate.title + "  (" + candidate.process_name + ")";
+                                font-size: 12px;
+                                color: Theme.text-secondary;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-xs;
+                    Rectangle { horizontal-stretch: 1; }
+                    GlassButton {
+                        text: "キャンセル";
+                        clicked => { root.cancel-empty-main-screen(); }
+                    }
+                    GlassButton {
+                        text: "確定して最小化";
+                        primary: true;
+                        clicked => { root.confirm-empty-main-screen(); }
+                    }
+                }
+            }
         }
     }
 }
