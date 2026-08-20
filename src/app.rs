@@ -263,14 +263,14 @@ fn load_or_default_config(data_dir: &Path) -> AppConfig {
                 );
             }
             let mut config = result.config;
-            // 宣言時にアプリ名を針にしていた古い VS Code エントリを、開いている
-            // フォルダ名の針へ移行する。保存に失敗しても今回の起動には効いている
-            // ので、次回また移行するだけ。
+            // 宣言時にアプリ名を針にしていた古い VS Code / Cursor エントリを、
+            // 開いているフォルダ名の針（と VS Code 系の起動種別）へ移行する。
+            // 保存に失敗しても今回の起動には効いているので、次回また移行するだけ。
             let retitled = launch_service::retitle_declared_vscode_windows(&mut config.worksets);
             if retitled > 0 {
                 tracing::info!(
                     retitled,
-                    "migrated declared VS Code windows to a folder title needle"
+                    "migrated declared VS Code / Cursor windows to a folder title needle"
                 );
                 if let Err(err) = config_store::save(data_dir, &config) {
                     tracing::warn!(error = %err, "failed to save the migrated config");
@@ -1583,10 +1583,10 @@ fn build_launch_app_window(
             window_class: String::new(),
             registered_title: app.name.clone(),
             // 保存する価値があるのは、そのアプリの *他の* ウィンドウと区別できる
-            // 針だけ。VS Code はタイトルに開いたフォルダ名を出すので、1 セットに
-            // VS Code が 2 つあっても見分けがつく。アプリ名そのものだと開くすべて
-            // のウィンドウに一致してしまい、閉じたブラウザのエントリが無関係な同じ
-            // ブラウザの窓を取り込む原因になっていた。
+            // 針だけ。VS Code / Cursor はタイトルに開いたフォルダ名を出すので、
+            // 1 セットにエディタが 2 つあっても見分けがつく。アプリ名そのものだと
+            // 開くすべてのウィンドウに一致してしまい、閉じたブラウザのエントリが
+            // 無関係な同じブラウザの窓を取り込む原因になっていた。
             title_contains: launch_service::declared_title_needle(kind, input),
             title_regex: None,
         },
@@ -1723,12 +1723,18 @@ fn apply_app_selection(manager: &WorksetManager, app: Option<&crate::domain::wor
 
     let (kind_label, input_label, placeholder, is_path) =
         match launch_service::classify(&app.program) {
-            LaunchKind::VsCode => (
-                "VS Code",
-                "フォルダー / ワークスペース",
-                "例: C:\\code\\myrepo（または .code-workspace）",
-                true,
-            ),
+            LaunchKind::VsCode => {
+                let is_cursor = app
+                    .program
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("cursor.exe"));
+                (
+                    if is_cursor { "Cursor" } else { "VS Code" },
+                    "フォルダー / ワークスペース",
+                    "例: C:\\code\\myrepo（または .code-workspace）",
+                    true,
+                )
+            }
             LaunchKind::Browser => ("ブラウザー", "URL", "例: https://example.com", false),
             LaunchKind::Generic => ("アプリ", "追加の引数（任意）", "例: --flag", false),
         };
@@ -1782,13 +1788,13 @@ fn refresh_color_choices(
 }
 
 /// The repository a declared set describes: the folder or `.code-workspace`
-/// its VS Code entry opens.
+/// its VS Code / Cursor entry opens.
 ///
 /// The registration screen has no repository picker — a set is a list of apps,
-/// and the only one of them that names a repository is VS Code. Resolving it
-/// here keeps `repository_path` (agent matching, the quick switcher's git
+/// and the only one of them that names a repository is the editor. Resolving
+/// it here keeps `repository_path` (agent matching, the quick switcher's git
 /// status) working without asking the user for the same path twice. `None`
-/// when the set has no VS Code entry, or its folder is blank or relative.
+/// when the set has no editor entry, or its folder is blank or relative.
 fn derive_repository(
     pending: &[PendingApp],
 ) -> Option<(PathBuf, crate::domain::workset::RepositoryKind)> {
@@ -1860,7 +1866,9 @@ fn refresh_workset_summaries(
                             _ => (auto, needs + 1),
                         }
                     });
-            let status_label = if needs_attention == 0 {
+            let status_label = if workset.windows.is_empty() {
+                "アプリなし".to_string()
+            } else if needs_attention == 0 {
                 format!("{auto}/{}件 自動再バインド", workset.windows.len())
             } else {
                 format!(
@@ -2109,6 +2117,9 @@ struct Launched {
     id: uuid::Uuid,
     exe: PathBuf,
     class: String,
+    /// 登録時のタイトル根拠。スクリプトホストから別プロセスへ渡った UI を
+    /// 起動直後に特定するため、`WindowMatcher` ごと保持する。
+    matcher: crate::domain::workset::WindowMatcher,
     /// ブラウザを用途別に分ける `--user-data-dir=...`（あれば）。同時に複数の
     /// プロファイルを起動しても取り違えないよう、コマンドラインで特定する。
     identity: Option<String>,
@@ -2161,6 +2172,7 @@ fn launch_missing_for_switch(
                         id: w.id,
                         exe: spec.program.clone(),
                         class: w.matcher.window_class.clone(),
+                        matcher: w.matcher.clone(),
                         identity: launch_service::browser_identity_arg(&spec.args).cloned(),
                     });
                 }
@@ -2249,6 +2261,14 @@ fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
                 &launched.exe,
                 &launched.class,
             )
+        }).or_else(|| {
+            launch_service::find_launcher_handoff_window(
+                &after,
+                &pending.before,
+                &pending.claimed,
+                &launched.exe,
+                &launched.matcher,
+            )
         }) else {
             return true; // まだ現れていない。次のポーリングで見る。
         };
@@ -2259,6 +2279,7 @@ fn bind_appeared_windows(pending: &mut PendingAcquire) -> bool {
                 id: launched.id,
                 exe: launched.exe.clone(),
                 class: launched.class.clone(),
+                matcher: launched.matcher.clone(),
                 identity: launched.identity.clone(),
             },
             hwnd: w.hwnd,
@@ -2308,6 +2329,7 @@ fn drop_vanished_bindings(pending: &mut PendingAcquire) -> bool {
             id: b.launched.id,
             exe: b.launched.exe.clone(),
             class: b.launched.class.clone(),
+            matcher: b.launched.matcher.clone(),
             identity: b.launched.identity.clone(),
         });
         vanished = true;
@@ -2415,6 +2437,7 @@ fn bind_already_running_windows(
                 id: launched.id,
                 exe: launched.exe.clone(),
                 class: launched.class.clone(),
+                matcher: launched.matcher.clone(),
                 identity: launched.identity.clone(),
             },
             hwnd: only.hwnd,
@@ -3631,15 +3654,10 @@ fn wire_workset_manager(
         }
 
         let mut state = s.borrow_mut();
-        if state.pending_apps.is_empty() {
-            manager.set_status_text("アプリを1つ以上追加してください。".into());
-            manager.set_status_is_warning(true);
-            return;
-        }
-
-        // The set's repository is whatever its VS Code entry has open — that is
-        // the only declared input that names a repository, and it drives agent
-        // matching and the quick switcher's git status.
+        // アプリは任意。名前だけの空セットも登録でき、あとから編集で足せる。
+        // The set's repository is whatever its VS Code / Cursor entry has open
+        // — that is the only declared input that names a repository, and it
+        // drives agent matching and the quick switcher's git status.
         let (repository_path, repository_kind) = derive_repository(&state.pending_apps)
             .unwrap_or_else(|| {
                 (

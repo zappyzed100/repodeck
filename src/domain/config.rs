@@ -109,7 +109,8 @@ impl AppConfig {
             }
 
             // An empty path means "no repository" (worksets can be registered
-            // without one); only a non-empty path must be absolute.
+            // without one); only a non-empty path must be absolute. Windows
+            // are likewise optional — a name-only set is a valid placeholder.
             if !workset.repository_path.as_os_str().is_empty()
                 && !workset.repository_path.is_absolute()
             {
@@ -385,6 +386,29 @@ mod tests {
     fn config_with_main_monitor_and_default_settings_has_no_errors() {
         let mut config = AppConfig::new_empty();
         config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn a_workset_with_no_apps_is_valid() {
+        use crate::domain::workset::{ParkingPolicy, RepositoryKind, Workset};
+
+        let mut config = AppConfig::new_empty();
+        config.main_monitor_ids.push("\\\\.\\DISPLAY1".to_string());
+        config.worksets.push(Workset {
+            id: Uuid::new_v4(),
+            name: "placeholder".to_string(),
+            repository_path: PathBuf::new(),
+            repository_kind: RepositoryKind::Directory,
+            color: "#2563eb".to_string(),
+            sort_order: 0,
+            direct_hotkey: None,
+            parking_policy: ParkingPolicy::Auto,
+            fullscreen_when_parked: false,
+            windows: Vec::new(),
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+            updated_at: "2026-08-20T00:00:00Z".to_string(),
+        });
         assert!(config.validate().is_empty());
     }
 

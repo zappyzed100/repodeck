@@ -300,13 +300,48 @@ fn find_by_launch_identity(
         .map(|w| w.hwnd)
 }
 
+/// Resolves a script-host registration to the single visible UI window it
+/// launched in another process (for example `wscript.exe` → Brave).
+///
+/// This bridge is deliberately narrower than the normal matcher: it only
+/// applies to known launcher executables, requires a title rooted in the
+/// registered app name, excludes windows already claimed by another entry,
+/// and refuses to guess when more than one browser window qualifies.
+fn launcher_handoff_decision(
+    managed: &ManagedWindow,
+    live_windows: &[TopLevelWindow],
+    bound: &HashSet<isize>,
+) -> Option<MatchDecision> {
+    if !matcher::is_launcher_executable(&managed.matcher.executable_path) {
+        return None;
+    }
+
+    let candidates: Vec<isize> = live_windows
+        .iter()
+        .filter(|window| !bound.contains(&window.hwnd))
+        .filter(|window| {
+            window.executable_path.as_deref().is_some_and(|path| {
+                !matcher::same_executable(path, &managed.matcher.executable_path)
+            })
+        })
+        .filter(|window| matcher::launcher_title_matches(&managed.matcher, window))
+        .map(|window| window.hwnd)
+        .collect();
+
+    match candidates.as_slice() {
+        [] => None,
+        [hwnd] => Some(MatchDecision::AutoRebind { hwnd: *hwnd }),
+        _ => Some(MatchDecision::Ambiguous { candidates }),
+    }
+}
+
 fn binding_still_valid(matcher: &WindowMatcher, live: &TopLevelWindow) -> bool {
     let same_app = live
         .executable_path
         .as_deref()
         .is_some_and(|p| matcher::same_executable(p, &matcher.executable_path));
     if !same_app {
-        return false;
+        return matcher::launcher_title_matches(matcher, live);
     }
 
     // 実行ファイルだけでは「そのアプリの窓」しか言えない。登録が自分の窓を
@@ -411,6 +446,15 @@ pub fn resolve_all_matches_with_bindings(
                             results.insert(window.id, MatchDecision::AutoRebind { hwnd });
                             continue;
                         }
+                        if let Some(decision) =
+                            launcher_handoff_decision(window, live_windows, &bound)
+                        {
+                            if let MatchDecision::AutoRebind { hwnd } = &decision {
+                                bound.insert(*hwnd);
+                            }
+                            results.insert(window.id, decision);
+                            continue;
+                        }
                         // バインドが指す窓が消えている＝閉じられた。再発見は許すが
                         // 「同じアプリの別窓」で妥協させてはいけないので、登録数に
                         // 関わらずタイトルの根拠を要求する。
@@ -432,12 +476,15 @@ pub fn resolve_all_matches_with_bindings(
                 }
             }
 
-            let decision = matcher::resolve_best_match(
-                &window.matcher,
-                live_windows,
-                &bound,
-                titleless_policy(&per_exe, window),
-            );
+            let decision =
+                launcher_handoff_decision(window, live_windows, &bound).unwrap_or_else(|| {
+                    matcher::resolve_best_match(
+                        &window.matcher,
+                        live_windows,
+                        &bound,
+                        titleless_policy(&per_exe, window),
+                    )
+                });
             if let MatchDecision::AutoRebind { hwnd } = &decision {
                 bound.insert(*hwnd);
             }
@@ -1094,6 +1141,82 @@ mod tests {
         let bindings: HashMap<Uuid, isize> = [(managed.id, 10)].into_iter().collect();
 
         let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(decisions[&managed.id], MatchDecision::Unresolved);
+    }
+
+    #[test]
+    fn a_script_launcher_adopts_the_browser_window_it_started() {
+        let managed = declared_window(
+            r"C:\Windows\System32\wscript.exe",
+            "DeepSeek Harness Web UI",
+        );
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            31,
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            "Chrome_WidgetWin_1",
+            "テスト — DeepSeek Harness - Brave",
+        )];
+
+        let decisions = resolve_all_matches(&[set], &live);
+
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 31 }
+        );
+    }
+
+    #[test]
+    fn a_script_launcher_does_not_steal_the_same_repos_editor_window() {
+        // 実機（2026-08-20）: Web UI セットの登録タイトルは "DeepSeek Harness Web UI"、
+        // 針は無し。単語ごとにバラすと Cursor の `deepseek-harness` 窓まで掴み、
+        // 同じ HWND を二つのセットが奪い合って切り替えが壊れた。
+        let mut managed = declared_window(
+            r"C:\Windows\System32\wscript.exe",
+            "DeepSeek Harness Web UI",
+        );
+        managed.matcher.title_contains = None;
+        let set = single_set(vec![managed.clone()]);
+        let live = [
+            window_with(
+                11,
+                r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe",
+                "Chrome_WidgetWin_1",
+                "deepseek-harness - Cursor",
+            ),
+            window_with(
+                31,
+                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                "Chrome_WidgetWin_1",
+                "ヘルスチェックページの実装 — DeepSeek Harness - Brave",
+            ),
+        ];
+
+        let decisions = resolve_all_matches(&[set], &live);
+
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 31 }
+        );
+    }
+
+    #[test]
+    fn a_script_launcher_stays_unresolved_when_only_the_editor_window_is_open() {
+        let mut managed = declared_window(
+            r"C:\Windows\System32\wscript.exe",
+            "DeepSeek Harness Web UI",
+        );
+        managed.matcher.title_contains = None;
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            11,
+            r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe",
+            "Chrome_WidgetWin_1",
+            "deepseek-harness - Cursor",
+        )];
+
+        let decisions = resolve_all_matches(&[set], &live);
+
         assert_eq!(decisions[&managed.id], MatchDecision::Unresolved);
     }
 

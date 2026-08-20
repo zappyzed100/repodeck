@@ -22,7 +22,9 @@ pub fn classify(executable: &Path) -> LaunchKind {
         return LaunchKind::Generic;
     };
     match name.as_str() {
-        "code.exe" | "code - insiders.exe" | "codium.exe" => LaunchKind::VsCode,
+        // Cursor is a VS Code fork: same `-n <folder>` CLI, same title shape
+        // (`<file> - <folder> - Cursor`), same shared-process windows.
+        "code.exe" | "code - insiders.exe" | "codium.exe" | "cursor.exe" => LaunchKind::VsCode,
         "chrome.exe" | "msedge.exe" | "firefox.exe" | "brave.exe" | "opera.exe" | "vivaldi.exe" => {
             LaunchKind::Browser
         }
@@ -266,8 +268,8 @@ pub fn build_launch_spec(
 /// 登録アプリから宣言したウィンドウの `title_contains`：起動入力のうち、実際に
 /// ウィンドウタイトルへ現れ、かつそのアプリの他のウィンドウと区別できる部分。
 ///
-/// VS Code のタイトルは開いているフォルダ（またはワークスペース）名を含むので
-/// その stem が使える。ブラウザのタイトルは *ページ* のもので起動 URL とは無関係、
+/// VS Code / Cursor のタイトルは開いているフォルダ（またはワークスペース）名を
+/// 含むのでその stem が使える。ブラウザのタイトルは *ページ* のもので起動 URL とは無関係、
 /// 汎用アプリの引数もタイトルではない。どちらも `None` にする——アプリのどの
 /// ウィンドウにも一致してしまう針を入れるくらいなら、針なしのほうがよい。
 pub fn declared_title_needle(kind: LaunchKind, input: &str) -> Option<String> {
@@ -280,12 +282,16 @@ pub fn declared_title_needle(kind: LaunchKind, input: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 既存セットの VS Code エントリの `title_contains` を、アプリ名から開いている
-/// フォルダ名へ入れ替える。入れ替えた数を返す。
+/// 既存セットの VS Code / Cursor エントリを、フォルダ名の針と
+/// [`LaunchKind::VsCode`] へ揃える。直した数を返す。
 ///
 /// 登録アプリからの宣言は当初アプリ名をそのまま針にしていた。これだと 1 セットに
 /// VS Code が 2 つあっても——別セットの VS Code とすら——見分けがつかない。起動
 /// 引数には開くフォルダが入っているので、そこから本来の針を復元できる。
+///
+/// Cursor は後から同じ扱いにしたので、以前 `Generic` で保存されたエントリは
+/// ここで昇格する。フォルダ引数があるのに `-n` が無いものは付け、既に開いている
+/// 窓へフォーカスするだけで新しい窓を出さない挙動を止める。
 ///
 /// ブラウザや汎用アプリの針は触らない。タイトルから復元できる識別子が無く、
 /// 針を外すと点数が閾値に届かず「起動中の窓を取り込む」動作まで失われるため。
@@ -295,25 +301,44 @@ pub fn retitle_declared_vscode_windows(worksets: &mut [crate::domain::workset::W
     let mut changed = 0;
     for workset in worksets.iter_mut() {
         for window in &mut workset.windows {
-            let matcher = &window.matcher;
-            // アプリ名がそのまま針になっているもの＝宣言時の既定値のままのもの。
-            if matcher.title_contains.as_deref() != Some(matcher.registered_title.as_str()) {
+            let matcher_is_family = classify(&window.matcher.executable_path) == LaunchKind::VsCode;
+            let is_family = window.launch_spec.as_ref().is_some_and(|spec| {
+                spec.kind == LaunchKind::VsCode
+                    || classify(&spec.program) == LaunchKind::VsCode
+                    || matcher_is_family
+            });
+            if !is_family {
                 continue;
             }
-            let Some(spec) = &window.launch_spec else {
+
+            let Some(spec) = window.launch_spec.as_mut() else {
                 continue;
             };
+            let mut window_changed = false;
             if spec.kind != LaunchKind::VsCode {
-                continue;
+                spec.kind = LaunchKind::VsCode;
+                let has_folder = spec.args.iter().any(|a| !a.starts_with('-'));
+                if has_folder && !spec.args.iter().any(|a| a == "-n") {
+                    spec.args.insert(0, "-n".to_string());
+                }
+                window_changed = true;
             }
-            let Some(folder) = spec.args.iter().find(|a| !a.starts_with('-')) else {
-                continue;
-            };
-            let Some(needle) = declared_title_needle(LaunchKind::VsCode, folder) else {
-                continue;
-            };
-            window.matcher.title_contains = Some(needle);
-            changed += 1;
+
+            let app_name_needle = window.matcher.title_contains.as_deref()
+                == Some(window.matcher.registered_title.as_str());
+            if app_name_needle {
+                let folder = spec.args.iter().find(|a| !a.starts_with('-')).cloned();
+                if let Some(folder) = folder
+                    && let Some(needle) = declared_title_needle(LaunchKind::VsCode, &folder)
+                {
+                    window.matcher.title_contains = Some(needle);
+                    window_changed = true;
+                }
+            }
+
+            if window_changed {
+                changed += 1;
+            }
         }
     }
     changed
@@ -365,6 +390,41 @@ pub fn find_launched_window<'a>(
         .find(|w| fresh(w) && same_exe(w) && !class.is_empty() && w.window_class == class)
         .or_else(|| after.iter().find(|w| fresh(w) && same_exe(w)))
         .or_else(|| after.iter().find(|w| fresh(w) && same_name(w)))
+}
+
+/// Finds the single new UI window created by a script-host launcher.
+///
+/// `wscript.exe`/`powershell.exe` may be the registered launch target while
+/// the visible window belongs to a browser process. The title bridge is only
+/// enabled for known launcher hosts and remains conservative when multiple
+/// windows qualify.
+pub fn find_launcher_handoff_window<'a>(
+    after: &'a [TopLevelWindow],
+    before: &HashSet<isize>,
+    claimed: &HashSet<isize>,
+    launcher_exe: &Path,
+    matcher: &crate::domain::workset::WindowMatcher,
+) -> Option<&'a TopLevelWindow> {
+    if !crate::windowing::matcher::is_launcher_executable(launcher_exe) {
+        return None;
+    }
+
+    let candidates: Vec<&TopLevelWindow> = after
+        .iter()
+        .filter(|window| !before.contains(&window.hwnd) && !claimed.contains(&window.hwnd))
+        .filter(|window| {
+            window
+                .executable_path
+                .as_deref()
+                .is_some_and(|path| !crate::windowing::matcher::same_executable(path, launcher_exe))
+        })
+        .filter(|window| crate::windowing::matcher::launcher_title_matches(matcher, window))
+        .collect();
+
+    match candidates.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// 「いま別のエントリが握っている」窓の集合。[`resolve_already_running_window`] の
@@ -439,7 +499,8 @@ pub fn resolve_already_running_window<'a>(
             before.contains(&w.hwnd)
                 && !claimed.contains(&w.hwnd)
                 && !bound_elsewhere.contains(&w.hwnd)
-                && crate::windowing::matcher::has_title_evidence(matcher, w)
+                && (crate::windowing::matcher::has_title_evidence(matcher, w)
+                    || crate::windowing::matcher::launcher_title_matches(matcher, w))
                 && identity_ok(w)
         })
         .collect();
@@ -453,21 +514,35 @@ pub fn resolve_already_running_window<'a>(
                 .is_some_and(|p| crate::windowing::matcher::same_executable(p, exe))
         })
         .collect();
-    let candidates = if exact.is_empty() {
-        eligible
-            .iter()
-            .copied()
-            .filter(|w| {
-                file_name(exe).is_some_and(|wanted| {
-                    w.executable_path
-                        .as_deref()
-                        .and_then(file_name)
-                        .is_some_and(|got| got == wanted)
-                })
+    let same_name: Vec<&TopLevelWindow> = eligible
+        .iter()
+        .copied()
+        .filter(|w| {
+            file_name(exe).is_some_and(|wanted| {
+                w.executable_path
+                    .as_deref()
+                    .and_then(file_name)
+                    .is_some_and(|got| got == wanted)
             })
-            .collect()
-    } else {
+        })
+        .collect();
+    let launcher_handoff: Vec<&TopLevelWindow> = eligible
+        .iter()
+        .copied()
+        .filter(|w| {
+            w.executable_path
+                .as_deref()
+                .is_some_and(|path| !crate::windowing::matcher::same_executable(path, exe))
+        })
+        .filter(|w| crate::windowing::matcher::launcher_title_matches(matcher, w))
+        .collect();
+    let candidates = if !exact.is_empty() {
         exact
+    } else if crate::windowing::matcher::is_launcher_executable(exe) && !launcher_handoff.is_empty()
+    {
+        launcher_handoff
+    } else {
+        same_name
     };
 
     match candidates[..] {
@@ -498,6 +573,12 @@ mod tests {
     #[test]
     fn classify_detects_vscode_and_browsers_case_insensitively() {
         assert_eq!(classify(Path::new(r"C:\VS\Code.exe")), LaunchKind::VsCode);
+        assert_eq!(
+            classify(Path::new(
+                r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe"
+            )),
+            LaunchKind::VsCode
+        );
         assert_eq!(
             classify(Path::new(r"C:\ch\CHROME.EXE")),
             LaunchKind::Browser
@@ -533,6 +614,17 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_relaunched_like_vscode() {
+        let spec = build_launch_spec(
+            Path::new(r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe"),
+            Some(Path::new(r"D:\repo")),
+            None,
+        );
+        assert_eq!(spec.kind, LaunchKind::VsCode);
+        assert_eq!(spec.args, vec!["-n".to_string(), r"D:\repo".to_string()]);
+    }
+
+    #[test]
     fn vscode_spec_takes_a_code_workspace_file_too() {
         let spec = build_launch_spec(
             Path::new(r"C:\VS\Code.exe"),
@@ -557,6 +649,10 @@ mod tests {
         assert!(vscode_folder_matches_title(
             r"C:\code\test\repo01",
             "repo01 - Visual Studio Code"
+        ));
+        assert!(vscode_folder_matches_title(
+            r"C:\code\test\repo01",
+            "repo01 - Cursor"
         ));
         // Workspace window: title shows the workspace stem, not the file name.
         assert!(vscode_folder_matches_title(
@@ -758,6 +854,27 @@ mod tests {
     }
 
     #[test]
+    fn launcher_handoff_finds_a_new_browser_window() {
+        let launcher = Path::new(r"C:\Windows\System32\wscript.exe");
+        let matcher = declared_matcher(launcher.to_str().unwrap(), "DeepSeek Harness Web UI");
+        let after = vec![titled(
+            21,
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            "テスト — DeepSeek Harness - Brave",
+        )];
+
+        let found = find_launcher_handoff_window(
+            &after,
+            &HashSet::new(),
+            &HashSet::new(),
+            launcher,
+            &matcher,
+        );
+
+        assert_eq!(found.map(|w| w.hwnd), Some(21));
+    }
+
+    #[test]
     fn store_app_falls_back_to_the_file_name_when_the_version_directory_moved() {
         // AUMID 起動なので、窓のプロセスは更新後の versioned な WindowsApps に居る。
         let registered = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.4045.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
@@ -811,6 +928,26 @@ mod tests {
         );
 
         assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 11));
+    }
+
+    #[test]
+    fn already_running_launcher_resolves_its_browser_child_window() {
+        let launcher = r"C:\Windows\System32\wscript.exe";
+        let browser = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe";
+        let live = vec![titled(31, browser, "テスト — DeepSeek Harness - Brave")];
+        let before: HashSet<isize> = [31].into_iter().collect();
+
+        let found = resolve_already_running_window(
+            &live,
+            &before,
+            &HashSet::new(),
+            &HashSet::new(),
+            &declared_matcher(launcher, "DeepSeek Harness Web UI"),
+            Path::new(launcher),
+            |_| true,
+        );
+
+        assert!(matches!(found, AlreadyRunning::Only(w) if w.hwnd == 31));
     }
 
     #[test]
@@ -1039,6 +1176,63 @@ mod tests {
         assert_eq!(windows[2].matcher.title_contains.as_deref(), Some("Brave"));
 
         // 二度目は何も変えない（移行済みの針を上書きしない）。
+        assert_eq!(retitle_declared_vscode_windows(&mut worksets), 0);
+    }
+
+    #[test]
+    fn migration_promotes_a_generic_cursor_entry_to_the_vscode_family() {
+        use crate::domain::workset::{ManagedWindow, RepositoryKind, WindowMatcher};
+
+        let cursor = PathBuf::from(r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe");
+        let managed = ManagedWindow {
+            id: uuid::Uuid::new_v4(),
+            matcher: WindowMatcher {
+                executable_path: cursor.clone(),
+                process_name: "Cursor.exe".to_string(),
+                window_class: String::new(),
+                registered_title: "Cursor".to_string(),
+                title_contains: Some("Cursor".to_string()),
+                title_regex: None,
+            },
+            main_placement: crate::domain::placement::SavedPlacement {
+                monitor_id: "A".to_string(),
+                main_monitor_index: 0,
+                normalized_rect: crate::domain::placement::NormalizedRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                physical_rect_at_capture: crate::domain::placement::PixelRect::new(0, 0, 0, 0),
+                show_state: crate::domain::placement::SavedShowState::Normal,
+            },
+            z_order: 0,
+            launch_spec: Some(LaunchSpec {
+                program: cursor,
+                args: vec![r"C:\code\portfolio\repodeck".to_string()],
+                kind: LaunchKind::Generic,
+                aumid: None,
+            }),
+            minimize_when_parked: false,
+        };
+        let mut worksets = vec![crate::application::workset_service::build_workset(
+            "S".to_string(),
+            "#fff".to_string(),
+            PathBuf::from(r"D:\s"),
+            RepositoryKind::Git,
+            0,
+            vec![managed],
+        )];
+
+        assert_eq!(retitle_declared_vscode_windows(&mut worksets), 1);
+        let window = &worksets[0].windows[0];
+        let spec = window.launch_spec.as_ref().expect("launch spec");
+        assert_eq!(spec.kind, LaunchKind::VsCode);
+        assert_eq!(
+            spec.args,
+            vec!["-n".to_string(), r"C:\code\portfolio\repodeck".to_string()]
+        );
+        assert_eq!(window.matcher.title_contains.as_deref(), Some("repodeck"));
         assert_eq!(retitle_declared_vscode_windows(&mut worksets), 0);
     }
 
