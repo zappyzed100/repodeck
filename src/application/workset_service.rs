@@ -1167,6 +1167,60 @@ mod tests {
     }
 
     #[test]
+    fn a_script_launcher_does_not_steal_the_same_repos_editor_window() {
+        // 実機（2026-08-20）: Web UI セットの登録タイトルは "DeepSeek Harness Web UI"、
+        // 針は無し。単語ごとにバラすと Cursor の `deepseek-harness` 窓まで掴み、
+        // 同じ HWND を二つのセットが奪い合って切り替えが壊れた。
+        let mut managed = declared_window(
+            r"C:\Windows\System32\wscript.exe",
+            "DeepSeek Harness Web UI",
+        );
+        managed.matcher.title_contains = None;
+        let set = single_set(vec![managed.clone()]);
+        let live = [
+            window_with(
+                11,
+                r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe",
+                "Chrome_WidgetWin_1",
+                "deepseek-harness - Cursor",
+            ),
+            window_with(
+                31,
+                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                "Chrome_WidgetWin_1",
+                "ヘルスチェックページの実装 — DeepSeek Harness - Brave",
+            ),
+        ];
+
+        let decisions = resolve_all_matches(&[set], &live);
+
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 31 }
+        );
+    }
+
+    #[test]
+    fn a_script_launcher_stays_unresolved_when_only_the_editor_window_is_open() {
+        let mut managed = declared_window(
+            r"C:\Windows\System32\wscript.exe",
+            "DeepSeek Harness Web UI",
+        );
+        managed.matcher.title_contains = None;
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            11,
+            r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe",
+            "Chrome_WidgetWin_1",
+            "deepseek-harness - Cursor",
+        )];
+
+        let decisions = resolve_all_matches(&[set], &live);
+
+        assert_eq!(decisions[&managed.id], MatchDecision::Unresolved);
+    }
+
+    #[test]
     fn a_closed_vscode_window_is_still_re_found_by_its_folder_in_the_title() {
         // 一方、タイトルで自分だと分かるものは内容マッチでの再発見を許す：
         // ユーザーが同じフォルダを開き直した VS Code は取り込んでよい。

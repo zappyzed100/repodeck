@@ -43,40 +43,58 @@ const GENERIC_LAUNCHER_TITLE_TOKENS: &[&str] = &[
     "windows",
 ];
 
-fn title_tokens(title: &str) -> Vec<String> {
-    let mut current = String::new();
-    let mut tokens = Vec::new();
-    for ch in normalize_title(title).chars() {
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+/// VS Code 系はスクリプトホストが開く UI ではなく、同じリポジトリ名をタイトルに
+/// 出すだけなので、ランチャー引き継ぎの対象にしない。
+fn is_editor_executable(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "code.exe" | "code - insiders.exe" | "codium.exe" | "cursor.exe"
+            )
+        })
 }
 
-fn meaningful_title_tokens(title: &str) -> Vec<String> {
-    title_tokens(title)
-        .into_iter()
-        .filter(|token| {
+/// 登録タイトルから汎用語を除いた、照合に使う連続フレーズ。
+///
+/// 単語ごとにバラすと `deepseek-harness - Cursor` が `DeepSeek Harness Web UI`
+/// に一致してしまう。空白区切りのフレーズとして残し、ハイフン連結のフォルダ名は
+/// 別物とみなす。
+fn meaningful_title_phrase(title: &str) -> Option<String> {
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .filter(|word| {
             !GENERIC_LAUNCHER_TITLE_TOKENS
                 .iter()
-                .any(|generic| token == generic)
+                .any(|generic| word == generic)
         })
-        .collect()
+        .collect();
+    if words.len() < 2 {
+        return None;
+    }
+    Some(words.join(" "))
 }
 
 /// ランチャーが作った別プロセスの UI を、登録タイトルを根拠に引き継げるか。
 ///
 /// `registered_title` だけでなく、明示的な title needle/regex も利用する。
-/// フォールバックのトークン照合は、汎用語を除いた登録タイトルの意味語を
-/// **2語以上すべて**含む場合に限定し、ブラウザの無関係なタブを掴まない。
+/// フォールバックは汎用語を除いた登録タイトルの連続フレーズが候補タイトルに
+/// 含まれるときだけ。エディタ窓は対象外。
 pub fn launcher_title_matches(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> bool {
     if !is_launcher_executable(&matcher.executable_path) {
+        return false;
+    }
+    if candidate
+        .executable_path
+        .as_deref()
+        .is_some_and(is_editor_executable)
+    {
         return false;
     }
 
@@ -92,14 +110,10 @@ pub fn launcher_title_matches(matcher: &WindowMatcher, candidate: &TopLevelWindo
         return true;
     }
 
-    let hint_tokens = meaningful_title_tokens(&matcher.registered_title);
-    if hint_tokens.len() < 2 {
+    let Some(phrase) = meaningful_title_phrase(&matcher.registered_title) else {
         return false;
-    }
-    let candidate_tokens = title_tokens(&candidate.title);
-    hint_tokens
-        .iter()
-        .all(|token| candidate_tokens.iter().any(|candidate| candidate == token))
+    };
+    candidate.title.to_lowercase().contains(&phrase)
 }
 
 const AUTO_REBIND_THRESHOLD: i32 = 75;
@@ -444,6 +458,29 @@ mod tests {
         let mut normal = m;
         normal.executable_path = PathBuf::from(r"C:\Tools\deepseek-harness.exe");
         assert!(!launcher_title_matches(&normal, &unrelated));
+    }
+
+    #[test]
+    fn launcher_handoff_does_not_steal_an_editor_window_for_the_same_repo() {
+        let m = launcher_matcher();
+        let cursor = candidate(
+            1,
+            Some(r"C:\Users\me\AppData\Local\Programs\cursor\Cursor.exe"),
+            "Chrome_WidgetWin_1",
+            "deepseek-harness - Cursor",
+        );
+        assert!(!launcher_title_matches(&m, &cursor));
+
+        let hyphenated_browser = candidate(
+            2,
+            Some(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            "Chrome_WidgetWin_1",
+            "deepseek-harness - Brave",
+        );
+        assert!(
+            !launcher_title_matches(&m, &hyphenated_browser),
+            "hyphenated folder names are not the spaced app title"
+        );
     }
 
     #[test]
