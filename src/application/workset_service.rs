@@ -1126,6 +1126,30 @@ mod tests {
     }
 
     #[test]
+    fn a_store_app_binding_survives_a_package_version_update() {
+        let mut managed = declared_window(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.810.7004.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            "ChatGPT",
+        );
+        managed.matcher.process_name = "ChatGPT.exe".to_string();
+        managed.matcher.window_class = "Chrome_WidgetWin_1".to_string();
+        let set = single_set(vec![managed.clone()]);
+        let live = [window_with(
+            42,
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.818.2441.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            "Chrome_WidgetWin_1",
+            "ChatGPT",
+        )];
+        let bindings: HashMap<Uuid, isize> = [(managed.id, 42)].into_iter().collect();
+
+        let decisions = resolve_all_matches_with_bindings(&[set], &live, &bindings, None);
+        assert_eq!(
+            decisions[&managed.id],
+            MatchDecision::AutoRebind { hwnd: 42 }
+        );
+    }
+
+    #[test]
     fn a_closed_browser_does_not_adopt_another_window_of_the_same_browser() {
         // Brave を閉じたのに、別の Brave ウィンドウへ紐づき直してしまい
         // 「開き直せる閉じたアプリはありませんでした」になっていた。

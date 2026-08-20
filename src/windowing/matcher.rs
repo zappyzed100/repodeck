@@ -17,7 +17,57 @@ use crate::windowing::enumerate::TopLevelWindow;
 /// 検証で落ち、「閉じる」の対象からも外れていた。
 pub fn same_executable(a: &Path, b: &Path) -> bool {
     let key = |p: &Path| p.as_os_str().to_string_lossy().to_ascii_lowercase();
-    key(a) == key(b)
+    if key(a) == key(b) {
+        return true;
+    }
+
+    // Packaged (MSIX/Store) applications live below a versioned directory:
+    // `WindowsApps\OpenAI.Codex_26.810.7004.0_x64__...\app\ChatGPT.exe`.
+    // The directory changes on every update, while the package family and the
+    // path inside the package stay stable. Treat those two stable parts as the
+    // executable identity so a saved Codex window survives an app update.
+    match (store_app_identity(a), store_app_identity(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Returns the version-independent identity of an executable inside a
+/// `WindowsApps` package: package family plus the path within that package.
+fn store_app_identity(path: &Path) -> Option<(String, String)> {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if !component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+        {
+            continue;
+        }
+
+        let package_dir = components.next()?.as_os_str().to_string_lossy();
+        let (name_and_version, publisher_id) = package_dir.rsplit_once("__")?;
+        let package_name = name_and_version.split('_').next()?;
+        if package_name.is_empty() || publisher_id.is_empty() {
+            return None;
+        }
+
+        let relative_path = components
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\\")
+            .to_ascii_lowercase();
+        if relative_path.is_empty() {
+            return None;
+        }
+
+        return Some((
+            format!("{package_name}_{publisher_id}").to_ascii_lowercase(),
+            relative_path,
+        ));
+    }
+
+    None
 }
 
 /// Windows のスクリプトホストは、起動したアプリの窓を自分では持たず、
@@ -566,6 +616,51 @@ mod tests {
         );
         // 実行ファイル 50 + クラス 25 で自動再バインドの閾値に届く。
         assert_eq!(score_candidate(&m, &c), 75);
+    }
+
+    #[test]
+    fn store_app_paths_match_across_package_updates() {
+        let registered = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.810.7004.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        let running = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.818.2441.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        assert!(same_executable(registered, running));
+        assert!(!same_executable(
+            registered,
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.818.2441.0_x64__different\app\ChatGPT.exe",
+            )
+        ));
+        assert!(!same_executable(
+            registered,
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.818.2441.0_x64__2p2nqsd0c76g0\other\ChatGPT.exe",
+            )
+        ));
+    }
+
+    #[test]
+    fn codex_window_rebinds_when_the_store_package_version_changed() {
+        let m = WindowMatcher {
+            executable_path: PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.810.7004.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            ),
+            process_name: "ChatGPT.exe".to_string(),
+            window_class: "Chrome_WidgetWin_1".to_string(),
+            registered_title: "ChatGPT".to_string(),
+            title_contains: None,
+            title_regex: None,
+        };
+        let running_path = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.818.2441.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let window = candidate(1, Some(running_path), "Chrome_WidgetWin_1", "ChatGPT");
+
+        assert_eq!(score_candidate(&m, &window), 95);
+        assert_eq!(
+            resolve_best_match(&m, &[window], &HashSet::new(), TitlelessMatch::Accept),
+            MatchDecision::AutoRebind { hwnd: 1 }
+        );
     }
 
     #[test]
