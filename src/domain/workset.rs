@@ -113,6 +113,8 @@ pub struct LaunchSpec {
 pub enum LaunchKind {
     #[default]
     Generic,
+    /// VS Code and forks that share its CLI and window-title conventions
+    /// (Cursor, VSCodium, Insiders).
     VsCode,
     Browser,
 }

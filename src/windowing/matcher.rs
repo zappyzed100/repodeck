@@ -20,20 +20,104 @@ pub fn same_executable(a: &Path, b: &Path) -> bool {
     key(a) == key(b)
 }
 
+/// Windows のスクリプトホストは、起動したアプリの窓を自分では持たず、
+/// Brave/Chrome など別プロセスへ UI を引き渡すことがある。
+pub fn is_launcher_executable(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        file_name.to_ascii_lowercase().as_str(),
+        "wscript.exe" | "cscript.exe" | "cmd.exe" | "powershell.exe" | "pwsh.exe"
+    )
+}
+
+const GENERIC_LAUNCHER_TITLE_TOKENS: &[&str] = &[
+    "web",
+    "ui",
+    "app",
+    "application",
+    "desktop",
+    "launcher",
+    "windows",
+];
+
+fn title_tokens(title: &str) -> Vec<String> {
+    let mut current = String::new();
+    let mut tokens = Vec::new();
+    for ch in normalize_title(title).chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn meaningful_title_tokens(title: &str) -> Vec<String> {
+    title_tokens(title)
+        .into_iter()
+        .filter(|token| {
+            !GENERIC_LAUNCHER_TITLE_TOKENS
+                .iter()
+                .any(|generic| token == generic)
+        })
+        .collect()
+}
+
+/// ランチャーが作った別プロセスの UI を、登録タイトルを根拠に引き継げるか。
+///
+/// `registered_title` だけでなく、明示的な title needle/regex も利用する。
+/// フォールバックのトークン照合は、汎用語を除いた登録タイトルの意味語を
+/// **2語以上すべて**含む場合に限定し、ブラウザの無関係なタブを掴まない。
+pub fn launcher_title_matches(matcher: &WindowMatcher, candidate: &TopLevelWindow) -> bool {
+    if !is_launcher_executable(&matcher.executable_path) {
+        return false;
+    }
+
+    let contains_ok = matcher
+        .title_contains
+        .as_deref()
+        .is_some_and(|needle| !needle.is_empty() && candidate.title.contains(needle));
+    let regex_ok = matcher.title_regex.as_deref().is_some_and(|pattern| {
+        !pattern.is_empty()
+            && regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&candidate.title))
+    });
+    if contains_ok || regex_ok {
+        return true;
+    }
+
+    let hint_tokens = meaningful_title_tokens(&matcher.registered_title);
+    if hint_tokens.len() < 2 {
+        return false;
+    }
+    let candidate_tokens = title_tokens(&candidate.title);
+    hint_tokens
+        .iter()
+        .all(|token| candidate_tokens.iter().any(|candidate| candidate == token))
+}
+
 const AUTO_REBIND_THRESHOLD: i32 = 75;
 const AUTO_REBIND_MARGIN: i32 = 20;
 const TITLE_SIMILARITY_THRESHOLD: f64 = 0.8;
-const VSCODE_TITLE_SUFFIX: &str = "- Visual Studio Code";
+const EDITOR_TITLE_SUFFIXES: &[&str] = &["- Visual Studio Code", "- Cursor"];
 
 /// Normalizes a window title for comparison (PLAN.md §5.5):
-/// strips VS Code's unsaved-changes marker and its dynamic `- Visual Studio
-/// Code` suffix, collapses whitespace, and lowercases the result.
+/// strips the unsaved-changes marker and the dynamic editor suffix
+/// (`- Visual Studio Code` / `- Cursor`), collapses whitespace, and
+/// lowercases the result.
 pub fn normalize_title(title: &str) -> String {
     let without_marker = title.replace('●', "");
     let trimmed = without_marker.trim();
-    let without_suffix = trimmed
-        .strip_suffix(VSCODE_TITLE_SUFFIX)
-        .map_or(trimmed, str::trim_end);
+    let without_suffix = EDITOR_TITLE_SUFFIXES
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix).map(str::trim_end))
+        .unwrap_or(trimmed);
 
     without_suffix
         .split_whitespace()
@@ -309,13 +393,57 @@ mod tests {
         }
     }
 
+    fn launcher_matcher() -> WindowMatcher {
+        WindowMatcher {
+            executable_path: PathBuf::from(r"C:\Windows\System32\wscript.exe"),
+            process_name: "wscript.exe".to_string(),
+            window_class: String::new(),
+            registered_title: "DeepSeek Harness Web UI".to_string(),
+            title_contains: None,
+            title_regex: None,
+        }
+    }
+
     #[test]
     fn normalize_title_strips_marker_suffix_and_case() {
         assert_eq!(
             normalize_title("● main.rs - repodeck - Visual Studio Code"),
             "main.rs - repodeck"
         );
+        assert_eq!(
+            normalize_title("● main.rs - repodeck - Cursor"),
+            "main.rs - repodeck"
+        );
         assert_eq!(normalize_title("  Foo   Bar  "), "foo bar");
+    }
+
+    #[test]
+    fn launcher_can_handoff_to_a_browser_window_with_the_app_title() {
+        let m = launcher_matcher();
+        let c = candidate(
+            1,
+            Some(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            "Chrome_WidgetWin_1",
+            "テスト — DeepSeek Harness - Brave",
+        );
+
+        assert!(launcher_title_matches(&m, &c));
+    }
+
+    #[test]
+    fn launcher_handoff_rejects_unrelated_titles_and_normal_apps() {
+        let m = launcher_matcher();
+        let unrelated = candidate(
+            1,
+            Some(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            "Chrome_WidgetWin_1",
+            "GitHub - Brave",
+        );
+        assert!(!launcher_title_matches(&m, &unrelated));
+
+        let mut normal = m;
+        normal.executable_path = PathBuf::from(r"C:\Tools\deepseek-harness.exe");
+        assert!(!launcher_title_matches(&normal, &unrelated));
     }
 
     #[test]
